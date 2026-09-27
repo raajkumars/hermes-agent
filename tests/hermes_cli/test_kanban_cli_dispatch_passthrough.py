@@ -72,6 +72,48 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     assert captured.get("max_in_progress_per_profile") == 2
 
 
+def test_resolve_worker_cli_toolsets_prefers_kanban_worker_override(monkeypatch):
+    """``kanban.worker_toolsets`` must win over ``platform_toolsets.cli`` so an
+    operator can trim what a throwaway <=5-turn worker loads at spawn without
+    narrowing the same profile's interactive CLI/WebUI toolset."""
+    import contextlib
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    fake_config = {
+        "kanban": {"worker_toolsets": ["terminal", "file", "kanban"]},
+        "platform_toolsets": {"cli": ["terminal", "file", "kanban", "browser", "tts", "vision"]},
+    }
+    monkeypatch.setattr(kbd, "_worker_profile_scope", lambda home, **kw: contextlib.nullcontext())
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+
+    toolsets = kbd._resolve_worker_cli_toolsets("/fake/home")
+
+    assert toolsets == ["file", "kanban", "terminal"], (
+        f"worker_toolsets override must be used verbatim (sorted), not merged with "
+        f"platform_toolsets.cli; got {toolsets!r}"
+    )
+
+
+def test_resolve_worker_cli_toolsets_falls_back_to_platform_cli(monkeypatch):
+    """With no ``kanban.worker_toolsets`` set, behavior is unchanged: the
+    worker gets the profile's ``platform_toolsets.cli`` list, same as before
+    this override existed."""
+    import contextlib
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    fake_config = {"platform_toolsets": {"cli": ["terminal", "file", "kanban"]}}
+    monkeypatch.setattr(kbd, "_worker_profile_scope", lambda home, **kw: contextlib.nullcontext())
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+
+    toolsets = kbd._resolve_worker_cli_toolsets("/fake/home")
+
+    assert toolsets == ["file", "kanban", "terminal"], (
+        f"with no worker override, must fall back to platform_toolsets.cli; got {toolsets!r}"
+    )
+
+
 def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypatch):
     """--max on the CLI takes precedence over kanban.max_spawn in config.
     The CLI flag is the explicit operator signal; config is the default."""
