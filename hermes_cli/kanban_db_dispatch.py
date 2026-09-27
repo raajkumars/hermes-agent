@@ -2615,13 +2615,22 @@ def _worker_profile_scope(hermes_home: str, *, bind_home: bool = True):
 
 
 def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
-    """Return the assigned profile's effective CLI toolsets for a worker.
+    """Return the effective CLI toolsets a kanban worker should spawn with.
 
     Resolved at dispatch time and passed as an explicit ``--toolsets`` pin so
     worker startup cannot fall back to a stale root/active-profile config or a
     profile whose top-level ``toolsets`` is only the kanban orchestrator
     surface. ``model_tools`` still appends the task-scoped kanban lifecycle
     tools when ``HERMES_KANBAN_TASK`` is set.
+
+    ``kanban.worker_toolsets`` (a list of toolset names) takes priority when
+    set, so a fleet operator can trim what a throwaway worker session loads
+    at spawn — every tool's schema is prompt-cache-written fresh per worker
+    process, and a <=5-turn worker never reuses that cache — independent of
+    ``platform_toolsets.cli``, which also governs interactive CLI/WebUI
+    sessions for the same profile and must not be narrowed as a side effect.
+    Falls back to ``platform_toolsets.cli`` (the pre-existing behavior) when
+    the profile has not set an explicit worker override.
     """
     if not hermes_home:
         return None
@@ -2631,7 +2640,11 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 
         with _worker_profile_scope(hermes_home):
             cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            worker_override = (cfg.get("kanban") or {}).get("worker_toolsets")
+            if isinstance(worker_override, list) and worker_override:
+                toolsets = sorted({str(t) for t in worker_override if t})
+            else:
+                toolsets = sorted(_get_platform_tools(cfg, "cli"))
         return toolsets or None
     except Exception as exc:
         _kb._log.debug(
