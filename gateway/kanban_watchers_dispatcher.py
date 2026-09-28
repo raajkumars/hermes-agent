@@ -43,6 +43,9 @@ class _DispatcherSettings:
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
     stale_waiting_timeout_seconds: int = 0
+    stale_waiting_escalation_limit: int = 0
+    stale_waiting_escalation_manager_map: Optional[dict] = None
+    stale_waiting_escalation_manager: Optional[str] = None
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -103,6 +106,19 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
                        "disabling review/blocked staleness escalation", raw_stale_waiting)
         stale_waiting_timeout_seconds = 0
 
+    # 0 disables bounded-retry -> manager escalation entirely (config, never a
+    # hardcoded org chart -- see kanban_db_dispatch._resolve_escalation_manager).
+    raw_escalation_limit = kanban_cfg.get("stale_review_escalation_limit", 0)
+    try:
+        stale_waiting_escalation_limit = int(raw_escalation_limit or 0)
+    except (TypeError, ValueError):
+        logger.warning("kanban dispatcher: invalid kanban.stale_review_escalation_limit=%r; "
+                       "disabling manager escalation", raw_escalation_limit)
+        stale_waiting_escalation_limit = 0
+    raw_manager_map = kanban_cfg.get("escalation_manager_map")
+    stale_waiting_escalation_manager_map = raw_manager_map if isinstance(raw_manager_map, dict) else None
+    stale_waiting_escalation_manager = (kanban_cfg.get("escalation_manager") or "").strip() or None
+
     # Fallback profile for tasks created without an assignee (e.g. via the
     # dashboard). Empty (the schema default) keeps skipping them.
     # When set, the dispatcher applies it to unassigned ready tasks instead of skipping them indefinitely
@@ -127,6 +143,9 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
         stale_waiting_timeout_seconds=stale_waiting_timeout_seconds,
+        stale_waiting_escalation_limit=stale_waiting_escalation_limit,
+        stale_waiting_escalation_manager_map=stale_waiting_escalation_manager_map,
+        stale_waiting_escalation_manager=stale_waiting_escalation_manager,
     )
 
 

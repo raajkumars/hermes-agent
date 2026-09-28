@@ -404,7 +404,11 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     children = kb.child_ids(conn, task.id)
     return {
         **_fields(task, _TASK_SUMMARY_FIELDS), "parents": parents, "children": children,
-        "parent_count": len(parents), "child_count": len(children)}
+        "parent_count": len(parents), "child_count": len(children),
+        # Request-level view distinct from the raw orchestration `status`
+        # (owner, verified_outcome, open_spawned_children, blocker_age_seconds,
+        # next_action) — see kanban_db.compute_request_view.
+        **kb.compute_request_view(conn, task)}
 
 
 # --- Goal-mode judge gate ---
@@ -607,6 +611,9 @@ def _handle_show(args: dict, **kw) -> str:
         task = _existing_task(kb, conn, tid)
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
+            # owner, verified_outcome, open_spawned_children, blocker_age_seconds,
+            # next_action — request-level status distinct from raw `status`.
+            "request_view": kb.compute_request_view(conn, task),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
             # gate is not holding it and kanban_complete will refuse.

@@ -2225,6 +2225,78 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     return [(row["id"], row["status"]) for row in rows]
 
 
+# Status -> the task_events "kind" that marks entry into it, for a
+# human-facing wait status (no worker running; only a reviewer/operator
+# resolves it). Shared by detect_stale_waiting (kanban_db_dispatch.py) and
+# compute_request_view's blocker-age field, so there is one source of truth
+# for "when did this task start waiting".
+WAIT_STATUS_ENTRY_EVENT_KINDS = {"review": "review_requested", "blocked": "blocked"}
+
+
+def status_entry_age_seconds(conn: sqlite3.Connection, task_id: str, status: str) -> Optional[int]:
+    """Seconds since ``task_id`` last entered ``status`` (per
+    :data:`WAIT_STATUS_ENTRY_EVENT_KINDS`), or ``None`` when the status has
+    no tracked entry kind or no such event exists. Read-only."""
+    entry_kind = WAIT_STATUS_ENTRY_EVENT_KINDS.get(status)
+    if not entry_kind:
+        return None
+    row = conn.execute(
+        "SELECT created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1", (task_id, entry_kind),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(time.time()) - int(row["created_at"])
+
+
+def compute_request_view(conn: sqlite3.Connection, task: "Task") -> dict:
+    """Request-level view distinct from the raw orchestration ``status``:
+    owner, a verified outcome that does not just mirror ``status`` for a
+    decomposed-but-undelivered task, blocker age, and next action. Every
+    field is derived from durable DB state -- no invented ETAs. See
+    ``unsatisfied_decomposed_children`` for why ``open_spawned_children``
+    excludes a dependency-linked release child.
+    """
+    open_children = unsatisfied_decomposed_children(conn, task.id)
+    if task.status == "done" and open_children:
+        # The orchestration step (this task) finished, but the delivery
+        # work it fanned out has not -- the exact falsely-completed-parent
+        # shape this whole feature exists to surface, not hide.
+        verified_outcome = "orchestration_done_delivery_pending"
+    elif task.status == "done":
+        verified_outcome = "delivered"
+    elif task.status == "archived":
+        verified_outcome = "archived"
+    elif task.status in ("review", "blocked", "triage", "todo"):
+        verified_outcome = "waiting"
+    elif task.status in ("running", "ready"):
+        verified_outcome = "in_progress"
+    else:
+        verified_outcome = task.status
+
+    if open_children:
+        detail = ", ".join(f"{cid} ({status})" for cid, status in open_children)
+        next_action = f"waiting on spawned children: {detail}"
+    elif task.status == "blocked":
+        next_action = "needs a human to unblock (see the last `blocked` event's reason)"
+    elif task.status == "review":
+        next_action = f"waiting on reviewer{f' ({task.assignee})' if task.assignee else ''}"
+    elif task.status in ("ready", "todo", "triage"):
+        next_action = "queued; will run once a worker/dispatcher picks it up"
+    elif task.status == "running":
+        next_action = "worker in progress"
+    else:
+        next_action = None
+
+    return {
+        "owner": task.assignee,
+        "verified_outcome": verified_outcome,
+        "open_spawned_children": [{"id": cid, "status": status} for cid, status in open_children],
+        "blocker_age_seconds": status_entry_age_seconds(conn, task.id, task.status),
+        "next_action": next_action,
+    }
+
+
 def unsatisfied_decomposed_children(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
     """``(child_id, status)`` for every task this task spawned
     (``creator_task_id = task_id``) that is not yet terminal (``done`` /

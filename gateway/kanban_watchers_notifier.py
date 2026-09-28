@@ -453,6 +453,22 @@ def _fmt_timed_out(ev, n) -> tuple:
     return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None
 
 
+def _fmt_stale_waiting_manager_escalated(ev, n) -> tuple:
+    """Bounded retry/backoff exhausted with no resolution: named a manager
+    (config-resolved, never hardcoded) and left a durable board comment.
+    This ping is the best-effort extra layer on top of that comment for
+    whoever already holds a notify subscription on the card."""
+    manager = _payload(ev, "manager") or "?"
+    status = _payload(ev, "status") or "?"
+    ping_count = int(_payload(ev, "ping_count") or 0)
+    assignee = _payload(ev, "assignee") or "its assignee"
+    return (
+        f"🚨 {n.head} escalated to @{manager}: {status} with {ping_count} unresolved "
+        f"reminder(s) to {assignee}. `hermes kanban show {n.task_id}` for detail.",
+        None, None,
+    )
+
+
 def _fmt_stale_waiting_escalated(ev, n) -> tuple:
     """PR #37 class of incident: reviewed/blocked and sitting untouched past
     the configured threshold (``kanban.stale_review_timeout_seconds``).
@@ -487,6 +503,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "changes_requested": _fmt_changes_requested,
     "block_loop_detected": _fmt_block_loop_detected,
     "stale_waiting_escalated": _fmt_stale_waiting_escalated,
+    "stale_waiting_manager_escalated": _fmt_stale_waiting_manager_escalated,
 }
 
 

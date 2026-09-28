@@ -846,11 +846,24 @@ def detect_stale_running(
     return reclaimed
 
 
-# Status -> the task_events "kind" that marks entry into it. Both are
-# human-facing wait states the dispatcher never auto-promotes out of (only a
-# reviewer/operator resolves them); detect_stale_waiting only escalates
-# (event + durable notify-sub delivery), it never mutates ``status``.
-_STALE_WAITING_ENTRY_KINDS = {"review": "review_requested", "blocked": "blocked"}
+# Escalation pings back off exponentially so a chronically-stale card does not
+# spam its subscribers every tick forever: the Nth re-ping (N counted since
+# entry) is due at ``timeout_seconds * 2**min(N, _STALE_WAITING_BACKOFF_CAP)``.
+_STALE_WAITING_BACKOFF_CAP = 6
+
+
+def _resolve_escalation_manager(
+    assignee: Optional[str], manager_map: Optional[dict], default_manager: Optional[str],
+) -> Optional[str]:
+    """The profile that owns escalation for ``assignee`` — an explicit
+    per-assignee entry in ``kanban.escalation_manager_map`` wins, else
+    ``kanban.escalation_manager`` (board-wide fallback), else ``None``
+    (feature off: no hardcoded org chart in the kernel)."""
+    if isinstance(manager_map, dict) and assignee:
+        mapped = manager_map.get(assignee)
+        if mapped:
+            return str(mapped).strip() or None
+    return (default_manager or "").strip() or None
 
 
 def detect_stale_waiting(
@@ -858,26 +871,44 @@ def detect_stale_waiting(
     *,
     timeout_seconds: int = 0,
     statuses: tuple = ("review", "blocked"),
+    escalation_limit: int = 0,
+    escalation_manager_map: Optional[dict] = None,
+    escalation_manager: Optional[str] = None,
 ) -> list[dict]:
     """Escalate tasks sitting in a human-facing wait status (default:
     ``review``, ``blocked``) longer than ``timeout_seconds`` with no further
     action — the fm #37 class of incident (LGTM at 14:55:18, merge at
     18:33:52: a 3h38m34s post-review stall nobody was told about) and the
     "stale blocked child nobody revisits" class. Never mutates ``status``:
-    only a human/reviewer resolves these, so this only appends a
-    ``stale_waiting_escalated`` event and delivers it through the task's
-    existing notify subscriptions (``kanban_db_notify``) — the same durable
-    wakeup channel review-ready/completion already use, not a new one.
+    only a human/reviewer resolves these, so this only appends events and
+    delivers them through the task's existing notify subscriptions
+    (``kanban_db_notify``) — the same durable wakeup channel
+    review-ready/completion already use, not a new one.
 
-    ``0`` disables the check. Idempotent per entry into the status: an
-    already-escalated wait (a ``stale_waiting_escalated`` event newer than
-    the entry event) is not re-escalated every tick — a duplicate ping on
+    ``timeout_seconds=0`` disables the check entirely. Each re-ping backs off
+    exponentially (see :data:`_STALE_WAITING_BACKOFF_CAP`) so a chronically
+    stale card pings less often over time, not more — a duplicate ping on
     every dispatcher tick is not a wakeup, it's noise the human learns to
     ignore. Re-entering the status (e.g. blocked -> unblocked -> blocked
-    again) resets the clock, since that's a fresh entry event.
+    again) resets the clock and the ping count, since that's a fresh entry
+    event.
 
-    Returns ``[{"id", "status", "elapsed_seconds", "assignee"}, ...]`` for
-    every task escalated this call.
+    Bounded retry/backoff -> manager escalation: once a task has accumulated
+    ``escalation_limit`` (0 = disabled) ``stale_waiting_escalated`` pings
+    since its entry event with no resolution, ONE additional
+    ``stale_waiting_manager_escalated`` event fires (idempotent, same
+    per-entry rule) naming the resolved manager
+    (:func:`_resolve_escalation_manager` — ``escalation_manager_map``
+    per-assignee, else ``escalation_manager`` board default, else no
+    escalation happens: this is config, never a hardcoded org chart) and a
+    board comment records it durably so the escalation is visible without
+    requiring the manager to already hold a notify subscription on this
+    specific card.
+
+    Returns ``[{"id", "status", "elapsed_seconds", "assignee", "kind",
+    "manager"?}, ...]`` — one entry per event fired this call (a task that
+    both re-pings and crosses the manager threshold in one tick appears
+    once per event kind).
     """
     if timeout_seconds <= 0:
         return []
@@ -890,7 +921,7 @@ def detect_stale_waiting(
     ).fetchall()
     for row in rows:
         tid, status, assignee = row["id"], row["status"], row["assignee"]
-        entry_kind = _STALE_WAITING_ENTRY_KINDS.get(status)
+        entry_kind = _kb.WAIT_STATUS_ENTRY_EVENT_KINDS.get(status)
         if not entry_kind:
             continue
         entry = conn.execute(
@@ -902,20 +933,51 @@ def detect_stale_waiting(
         elapsed = now - int(entry["created_at"])
         if elapsed < timeout_seconds:
             continue
-        already = conn.execute(
-            "SELECT 1 FROM task_events WHERE task_id = ? "
-            "AND kind = 'stale_waiting_escalated' AND id > ? LIMIT 1",
+        prior_pings = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? "
+            "AND kind = 'stale_waiting_escalated' AND id > ? ORDER BY id",
             (tid, entry["id"]),
-        ).fetchone()
-        if already:
-            continue
-        payload = {
-            "status": status, "elapsed_seconds": elapsed,
-            "timeout_seconds": timeout_seconds, "assignee": assignee,
-        }
-        with _kb.write_txn(conn):
-            _kb._append_event(conn, tid, "stale_waiting_escalated", payload)
-        escalated.append({"id": tid, **payload})
+        ).fetchall()
+        ping_count = len(prior_pings)
+        next_due = timeout_seconds * (2 ** min(ping_count, _STALE_WAITING_BACKOFF_CAP))
+        if elapsed >= next_due:
+            payload = {
+                "status": status, "elapsed_seconds": elapsed,
+                "timeout_seconds": timeout_seconds, "assignee": assignee,
+                "ping_count": ping_count + 1,
+            }
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, tid, "stale_waiting_escalated", payload)
+            escalated.append({"id": tid, "kind": "stale_waiting_escalated", **payload})
+            ping_count += 1  # this tick's ping counts toward the manager threshold too
+        if escalation_limit > 0 and ping_count >= escalation_limit:
+            already_escalated_to_manager = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? "
+                "AND kind = 'stale_waiting_manager_escalated' AND id > ? LIMIT 1",
+                (tid, entry["id"]),
+            ).fetchone()
+            if already_escalated_to_manager:
+                continue
+            manager = _resolve_escalation_manager(
+                assignee, escalation_manager_map, escalation_manager,
+            )
+            if not manager:
+                continue
+            payload = {
+                "status": status, "elapsed_seconds": elapsed, "assignee": assignee,
+                "ping_count": ping_count, "escalation_limit": escalation_limit,
+                "manager": manager,
+            }
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, tid, "stale_waiting_manager_escalated", payload)
+                _kb._insert_comment(
+                    conn, tid, "kanban-dispatcher",
+                    f"@{manager} escalation: {tid} has been {status} for "
+                    f"{elapsed // 3600}h with {ping_count} unresolved reminder(s) "
+                    f"to {assignee or 'its assignee'}. Please take it over or reassign.",
+                    now,
+                )
+            escalated.append({"id": tid, "kind": "stale_waiting_manager_escalated", **payload})
     return escalated
 
 
@@ -2008,6 +2070,9 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     stale_waiting_timeout_seconds: int = 0,
+    stale_waiting_escalation_limit: int = 0,
+    stale_waiting_escalation_manager_map: Optional[dict] = None,
+    stale_waiting_escalation_manager: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -2032,6 +2097,9 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
             stale_waiting_timeout_seconds=stale_waiting_timeout_seconds,
+            stale_waiting_escalation_limit=stale_waiting_escalation_limit,
+            stale_waiting_escalation_manager_map=stale_waiting_escalation_manager_map,
+            stale_waiting_escalation_manager=stale_waiting_escalation_manager,
         )
 
     try:
@@ -2221,6 +2289,9 @@ def _run_reclaim_phase(
     reconcile_orphans: bool,
     board: Optional[str] = None,
     stale_waiting_timeout_seconds: int = 0,
+    stale_waiting_escalation_limit: int = 0,
+    stale_waiting_escalation_manager_map: Optional[dict] = None,
+    stale_waiting_escalation_manager: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
@@ -2231,6 +2302,9 @@ def _run_reclaim_phase(
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
     result.stale_waiting = detect_stale_waiting(
         conn, timeout_seconds=stale_waiting_timeout_seconds,
+        escalation_limit=stale_waiting_escalation_limit,
+        escalation_manager_map=stale_waiting_escalation_manager_map,
+        escalation_manager=stale_waiting_escalation_manager,
     )
     result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
@@ -2376,6 +2450,9 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     stale_waiting_timeout_seconds: int = 0,
+    stale_waiting_escalation_limit: int = 0,
+    stale_waiting_escalation_manager_map: Optional[dict] = None,
+    stale_waiting_escalation_manager: Optional[str] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2387,6 +2464,9 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
         stale_waiting_timeout_seconds=stale_waiting_timeout_seconds,
+        stale_waiting_escalation_limit=stale_waiting_escalation_limit,
+        stale_waiting_escalation_manager_map=stale_waiting_escalation_manager_map,
+        stale_waiting_escalation_manager=stale_waiting_escalation_manager,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
