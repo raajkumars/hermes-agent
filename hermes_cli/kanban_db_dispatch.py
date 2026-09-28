@@ -137,6 +137,10 @@ class DispatchResult:
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
+    stale_waiting: list[dict] = field(default_factory=list)
+    """``{"id","status","elapsed_seconds","assignee"}`` for review/blocked
+    tasks escalated by :func:`detect_stale_waiting` this tick (no state
+    change — a human/reviewer resolves these)."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
@@ -840,6 +844,79 @@ def detect_stale_running(
             reclaimed.append(tid)
 
     return reclaimed
+
+
+# Status -> the task_events "kind" that marks entry into it. Both are
+# human-facing wait states the dispatcher never auto-promotes out of (only a
+# reviewer/operator resolves them); detect_stale_waiting only escalates
+# (event + durable notify-sub delivery), it never mutates ``status``.
+_STALE_WAITING_ENTRY_KINDS = {"review": "review_requested", "blocked": "blocked"}
+
+
+def detect_stale_waiting(
+    conn: sqlite3.Connection,
+    *,
+    timeout_seconds: int = 0,
+    statuses: tuple = ("review", "blocked"),
+) -> list[dict]:
+    """Escalate tasks sitting in a human-facing wait status (default:
+    ``review``, ``blocked``) longer than ``timeout_seconds`` with no further
+    action — the fm #37 class of incident (LGTM at 14:55:18, merge at
+    18:33:52: a 3h38m34s post-review stall nobody was told about) and the
+    "stale blocked child nobody revisits" class. Never mutates ``status``:
+    only a human/reviewer resolves these, so this only appends a
+    ``stale_waiting_escalated`` event and delivers it through the task's
+    existing notify subscriptions (``kanban_db_notify``) — the same durable
+    wakeup channel review-ready/completion already use, not a new one.
+
+    ``0`` disables the check. Idempotent per entry into the status: an
+    already-escalated wait (a ``stale_waiting_escalated`` event newer than
+    the entry event) is not re-escalated every tick — a duplicate ping on
+    every dispatcher tick is not a wakeup, it's noise the human learns to
+    ignore. Re-entering the status (e.g. blocked -> unblocked -> blocked
+    again) resets the clock, since that's a fresh entry event.
+
+    Returns ``[{"id", "status", "elapsed_seconds", "assignee"}, ...]`` for
+    every task escalated this call.
+    """
+    if timeout_seconds <= 0:
+        return []
+    now = int(time.time())
+    escalated: list[dict] = []
+    placeholders = ",".join("?" * len(statuses))
+    rows = conn.execute(
+        f"SELECT id, status, assignee FROM tasks WHERE status IN ({placeholders})",
+        tuple(statuses),
+    ).fetchall()
+    for row in rows:
+        tid, status, assignee = row["id"], row["status"], row["assignee"]
+        entry_kind = _STALE_WAITING_ENTRY_KINDS.get(status)
+        if not entry_kind:
+            continue
+        entry = conn.execute(
+            "SELECT id, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 1", (tid, entry_kind),
+        ).fetchone()
+        if entry is None:
+            continue
+        elapsed = now - int(entry["created_at"])
+        if elapsed < timeout_seconds:
+            continue
+        already = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'stale_waiting_escalated' AND id > ? LIMIT 1",
+            (tid, entry["id"]),
+        ).fetchone()
+        if already:
+            continue
+        payload = {
+            "status": status, "elapsed_seconds": elapsed,
+            "timeout_seconds": timeout_seconds, "assignee": assignee,
+        }
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, tid, "stale_waiting_escalated", payload)
+        escalated.append({"id": tid, **payload})
+    return escalated
 
 
 def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
@@ -1930,6 +2007,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    stale_waiting_timeout_seconds: int = 0,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1953,6 +2031,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            stale_waiting_timeout_seconds=stale_waiting_timeout_seconds,
         )
 
     try:
@@ -2141,6 +2220,7 @@ def _run_reclaim_phase(
     failure_limit: int,
     reconcile_orphans: bool,
     board: Optional[str] = None,
+    stale_waiting_timeout_seconds: int = 0,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
@@ -2149,6 +2229,9 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
+    result.stale_waiting = detect_stale_waiting(
+        conn, timeout_seconds=stale_waiting_timeout_seconds,
+    )
     result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
@@ -2292,6 +2375,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    stale_waiting_timeout_seconds: int = 0,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2302,6 +2386,7 @@ def _dispatch_once_locked(
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        stale_waiting_timeout_seconds=stale_waiting_timeout_seconds,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,

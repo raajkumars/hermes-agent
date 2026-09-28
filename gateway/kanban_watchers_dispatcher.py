@@ -42,6 +42,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    stale_waiting_timeout_seconds: int = 0
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -92,6 +93,16 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
                        "disabling stale detection", raw_stale)
         stale_timeout_seconds = 0
 
+    # 0 disables the review/blocked staleness escalation (fm #37 class of
+    # incident: reviewed-but-nobody-merged, blocked-but-nobody-revisited).
+    raw_stale_waiting = kanban_cfg.get("stale_review_timeout_seconds", 0)
+    try:
+        stale_waiting_timeout_seconds = int(raw_stale_waiting or 0)
+    except (TypeError, ValueError):
+        logger.warning("kanban dispatcher: invalid kanban.stale_review_timeout_seconds=%r; "
+                       "disabling review/blocked staleness escalation", raw_stale_waiting)
+        stale_waiting_timeout_seconds = 0
+
     # Fallback profile for tasks created without an assignee (e.g. via the
     # dashboard). Empty (the schema default) keeps skipping them.
     # When set, the dispatcher applies it to unassigned ready tasks instead of skipping them indefinitely
@@ -115,6 +126,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        stale_waiting_timeout_seconds=stale_waiting_timeout_seconds,
     )
 
 

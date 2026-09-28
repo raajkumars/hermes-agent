@@ -1897,6 +1897,11 @@ DEFAULT_CONFIG = {
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,
+        # Tasks sitting in review or blocked (no worker running, waiting on a human/reviewer) for
+        # this many seconds get ONE escalation ping through their existing notify subscriptions
+        # (fm #37 class of incident: LGTM'd, then a 3h38m post-review stall nobody was told about).
+        # Never mutates status -- only a human resolves review/blocked. 0 = off.
+        "stale_review_timeout_seconds": 0,
         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.

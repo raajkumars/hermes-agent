@@ -933,6 +933,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
                                  f"--force to close its run and complete anyway.")
                 return False
+            except kb.OpenChildrenError as open_err:
+                detail = ", ".join(f"{cid} ({status})" for cid, status in open_err.open_children)
+                fail_msg[tid] = (f"cannot complete {tid}: it spawned children still open: {detail}. "
+                                 f"Wait for them (done/archived), or re-run with --force to complete "
+                                 f"anyway (explicit operator override — the request will report "
+                                 f"delivered while that work is still in flight).")
+                return False
             except kb.EmptyCompletionError as empty_err:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")

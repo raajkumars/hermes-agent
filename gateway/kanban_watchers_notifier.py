@@ -453,6 +453,24 @@ def _fmt_timed_out(ev, n) -> tuple:
     return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None
 
 
+def _fmt_stale_waiting_escalated(ev, n) -> tuple:
+    """PR #37 class of incident: reviewed/blocked and sitting untouched past
+    the configured threshold (``kanban.stale_review_timeout_seconds``).
+    Re-uses the existing notify-sub delivery path — no new wake channel — so
+    the human/reviewer/manager subscribed to this card gets a second, louder
+    nudge instead of the card silently aging past the first one."""
+    status = _payload(ev, "status") or "?"
+    elapsed = int(_payload(ev, "elapsed_seconds") or 0)
+    hours = elapsed / 3600
+    verb = "in review" if status == "review" else "blocked"
+    return (
+        f"⏰ {n.head} has been {verb} for {hours:.1f}h with no action. "
+        f"`hermes kanban show {n.task_id}` to check it, or reassign/unblock it — "
+        f"it will keep aging silently otherwise.",
+        None, None,
+    )
+
+
 # archived / unblocked are claimed (so the cursor advances past them) but
 # intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
 # never wake the creator.
@@ -468,6 +486,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
     "block_loop_detected": _fmt_block_loop_detected,
+    "stale_waiting_escalated": _fmt_stale_waiting_escalated,
 }
 
 
