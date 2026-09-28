@@ -1911,6 +1911,11 @@ DEFAULT_CONFIG = {
         "escalation_manager_map": {},
         # Board-wide fallback escalation target when an assignee has no entry above.
         "escalation_manager": "",
+        # Off by default: the only dispatcher detector that makes a network call. When true,
+        # a task still `running` whose declared GitHub PR (completion_contract, an exact PR
+        # URL) reaches reviewDecision=APPROVED gets one durable ping -- the fm #37 gap
+        # (collect_acceptance checks CI status, never human review approval).
+        "pr_review_wakeup_enabled": False,
         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.

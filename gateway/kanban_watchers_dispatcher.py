@@ -46,6 +46,7 @@ class _DispatcherSettings:
     stale_waiting_escalation_limit: int = 0
     stale_waiting_escalation_manager_map: Optional[dict] = None
     stale_waiting_escalation_manager: Optional[str] = None
+    pr_review_wakeup_enabled: bool = False
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -119,6 +120,9 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     stale_waiting_escalation_manager_map = raw_manager_map if isinstance(raw_manager_map, dict) else None
     stale_waiting_escalation_manager = (kanban_cfg.get("escalation_manager") or "").strip() or None
 
+    # Off by default: the only dispatcher detector that makes a network call.
+    pr_review_wakeup_enabled = bool(kanban_cfg.get("pr_review_wakeup_enabled", False))
+
     # Fallback profile for tasks created without an assignee (e.g. via the
     # dashboard). Empty (the schema default) keeps skipping them.
     # When set, the dispatcher applies it to unassigned ready tasks instead of skipping them indefinitely
@@ -146,6 +150,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         stale_waiting_escalation_limit=stale_waiting_escalation_limit,
         stale_waiting_escalation_manager_map=stale_waiting_escalation_manager_map,
         stale_waiting_escalation_manager=stale_waiting_escalation_manager,
+        pr_review_wakeup_enabled=pr_review_wakeup_enabled,
     )
 
 

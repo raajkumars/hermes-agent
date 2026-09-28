@@ -469,6 +469,19 @@ def _fmt_stale_waiting_manager_escalated(ev, n) -> tuple:
     )
 
 
+def _fmt_pr_review_ready_escalated(ev, n) -> tuple:
+    """The fm #37 gap directly: the task's declared GitHub PR was found
+    APPROVED while the kanban card itself is still ``running`` -- distinct
+    from ``review_requested``/``stale_waiting_escalated``, which only watch
+    kanban's own review/blocked status, not a linked PR's real state."""
+    pr_url = _payload(ev, "pr_url") or "?"
+    return (
+        f"✅ {n.head} -- its PR {pr_url} was approved but the card is still "
+        f"running. Merge it or complete the card once the merge lands.",
+        None, None,
+    )
+
+
 def _fmt_stale_waiting_escalated(ev, n) -> tuple:
     """PR #37 class of incident: reviewed/blocked and sitting untouched past
     the configured threshold (``kanban.stale_review_timeout_seconds``).
@@ -504,6 +517,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "block_loop_detected": _fmt_block_loop_detected,
     "stale_waiting_escalated": _fmt_stale_waiting_escalated,
     "stale_waiting_manager_escalated": _fmt_stale_waiting_manager_escalated,
+    "pr_review_ready_escalated": _fmt_pr_review_ready_escalated,
 }
 
 

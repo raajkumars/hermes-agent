@@ -141,6 +141,11 @@ class DispatchResult:
     """``{"id","status","elapsed_seconds","assignee"}`` for review/blocked
     tasks escalated by :func:`detect_stale_waiting` this tick (no state
     change — a human/reviewer resolves these)."""
+    pr_review_ready: list[dict] = field(default_factory=list)
+    """``{"id","pr_url","review_decision"}`` for tasks whose declared GitHub
+    PR (``completion_contract``) was found ``APPROVED`` this tick by
+    :func:`detect_stale_pr_review_ready` (off by default — the only
+    network-calling detector; ``kanban.pr_review_wakeup_enabled``)."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
@@ -978,6 +983,85 @@ def detect_stale_waiting(
                     now,
                 )
             escalated.append({"id": tid, "kind": "stale_waiting_manager_escalated", **payload})
+    return escalated
+
+
+def detect_stale_pr_review_ready(
+    conn: sqlite3.Connection,
+    *,
+    enabled: bool = False,
+    min_check_interval_seconds: int = 900,
+    query_fn=None,
+) -> list[dict]:
+    """The fm #37 gap specifically: a task's declared GitHub PR
+    (``completion_contract``, an exact PR URL) gets ``reviewDecision =
+    APPROVED`` while the task itself is still ``running`` (nobody told the
+    board the human side is done) -- distinct from
+    :func:`detect_stale_waiting`, which only watches kanban's OWN
+    ``review``/``blocked`` status, not a linked PR's real review state.
+
+    ``enabled=False`` (default) is a hard off-switch: this is the only
+    detector in the dispatcher that makes a network call, so it never runs
+    unless explicitly opted in (``kanban.pr_review_wakeup_enabled``).
+    ``min_check_interval_seconds`` rate-limits GitHub API calls per task
+    (checked via a durable ``pr_review_checked`` event, not an in-memory
+    cache -- correct across dispatcher restarts). ``query_fn`` defaults to
+    :func:`hermes_cli.kanban_pr_acceptance.fetch_pr_review_state`; a test
+    double never needs to touch the network.
+
+    Edge-triggered on the transition into ``APPROVED`` (compares against the
+    previous ``pr_review_checked`` event, not "is currently APPROVED"): a
+    PR that stays approved across many ticks escalates once, while an
+    approved -> changes-requested -> re-approved cycle escalates again,
+    since that second approval is genuinely new information. Returns
+    ``[{"id", "pr_url", "review_decision"}, ...]`` for every task escalated
+    this call.
+    """
+    if not enabled:
+        return []
+    if query_fn is None:
+        from hermes_cli.kanban_pr_acceptance import fetch_pr_review_state as query_fn
+    now = int(time.time())
+    escalated: list[dict] = []
+    rows = conn.execute(
+        "SELECT id, completion_contract FROM tasks "
+        "WHERE status = 'running' "
+        "AND completion_contract LIKE 'https://github.com/%/pull/%'",
+    ).fetchall()
+    for row in rows:
+        tid, pr_url = row["id"], row["completion_contract"]
+        last_check = conn.execute(
+            "SELECT created_at FROM task_events WHERE task_id = ? "
+            "AND kind = 'pr_review_checked' ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        if last_check is not None and (now - int(last_check["created_at"])) < min_check_interval_seconds:
+            continue
+        # Edge-triggered: escalate on the TRANSITION into APPROVED, not on
+        # "is currently APPROVED" -- else a PR that stays approved across
+        # many ticks would only ever escalate once, and a
+        # approved -> changes-requested -> re-approved cycle (genuinely new
+        # information) would never re-escalate at all.
+        previous_check = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'pr_review_checked' ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        previous_decision = (
+            _kb._json_dict(previous_check["payload"]).get("review_decision")
+            if previous_check is not None else None
+        )
+        state = query_fn(pr_url)
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, tid, "pr_review_checked", {"pr_url": pr_url, **state})
+        if state.get("error") or state.get("merged"):
+            continue
+        if state.get("review_decision") != "APPROVED":
+            continue
+        if previous_decision == "APPROVED":
+            continue
+        payload = {"pr_url": pr_url, "review_decision": "APPROVED"}
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, tid, "pr_review_ready_escalated", payload)
+        escalated.append({"id": tid, **payload})
     return escalated
 
 
@@ -2073,6 +2157,7 @@ def dispatch_once(
     stale_waiting_escalation_limit: int = 0,
     stale_waiting_escalation_manager_map: Optional[dict] = None,
     stale_waiting_escalation_manager: Optional[str] = None,
+    pr_review_wakeup_enabled: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -2100,6 +2185,7 @@ def dispatch_once(
             stale_waiting_escalation_limit=stale_waiting_escalation_limit,
             stale_waiting_escalation_manager_map=stale_waiting_escalation_manager_map,
             stale_waiting_escalation_manager=stale_waiting_escalation_manager,
+            pr_review_wakeup_enabled=pr_review_wakeup_enabled,
         )
 
     try:
@@ -2292,6 +2378,7 @@ def _run_reclaim_phase(
     stale_waiting_escalation_limit: int = 0,
     stale_waiting_escalation_manager_map: Optional[dict] = None,
     stale_waiting_escalation_manager: Optional[str] = None,
+    pr_review_wakeup_enabled: bool = False,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
@@ -2305,6 +2392,9 @@ def _run_reclaim_phase(
         escalation_limit=stale_waiting_escalation_limit,
         escalation_manager_map=stale_waiting_escalation_manager_map,
         escalation_manager=stale_waiting_escalation_manager,
+    )
+    result.pr_review_ready = detect_stale_pr_review_ready(
+        conn, enabled=pr_review_wakeup_enabled,
     )
     result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
@@ -2453,6 +2543,7 @@ def _dispatch_once_locked(
     stale_waiting_escalation_limit: int = 0,
     stale_waiting_escalation_manager_map: Optional[dict] = None,
     stale_waiting_escalation_manager: Optional[str] = None,
+    pr_review_wakeup_enabled: bool = False,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2467,6 +2558,7 @@ def _dispatch_once_locked(
         stale_waiting_escalation_limit=stale_waiting_escalation_limit,
         stale_waiting_escalation_manager_map=stale_waiting_escalation_manager_map,
         stale_waiting_escalation_manager=stale_waiting_escalation_manager,
+        pr_review_wakeup_enabled=pr_review_wakeup_enabled,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
