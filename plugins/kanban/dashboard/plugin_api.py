@@ -171,7 +171,7 @@ BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
-def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None) -> dict[str, Any]:
+def _task_dict(task: kanban_db.Task, *, conn: sqlite3.Connection, latest_summary: Optional[str] = None) -> dict[str, Any]:
     d = asdict(task)
     # Derived age metrics so the UI can colour stale cards without client deltas.
     try:
@@ -180,6 +180,11 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None) ->
         d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
     # Latest non-null run summary (workers hand off via ``task_runs.summary``, not ``tasks.result``).
     d["latest_summary"] = latest_summary
+    # Request-level view distinct from the raw orchestration `status` (owner,
+    # verified_outcome, open_spawned_children, last_verified_progress,
+    # blocker_age_seconds, next_action) — same fields `hermes kanban show`/`list`
+    # and the `kanban_show` tool already surface; see kanban_db.compute_request_view.
+    d.update(kanban_db.compute_request_view(conn, task))
     return d
 
 
@@ -299,7 +304,7 @@ def get_board(
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
         for t in tasks:
             full = summary_map.get(t.id)
-            d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None))
+            d = _task_dict(t, conn=conn, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None))
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -357,7 +362,7 @@ def get_task(
             raise HTTPException(status_code=400, detail="run_state_type must be 'status' or 'outcome'")
         task = _require_task(conn, task_id)
         # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
-        task_d = _task_dict(task, latest_summary=kanban_db.latest_summary(conn, task_id))
+        task_d = _task_dict(task, conn=conn, latest_summary=kanban_db.latest_summary(conn, task_id))
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
@@ -403,7 +408,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         # CreateTaskBody field names match create_task's keyword parameters.
         task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **payload.model_dump())
         task = kanban_db.get_task(conn, task_id)
-        body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        body: dict[str, Any] = {"task": _task_dict(task, conn=conn) if task else None}
         # Dispatcher-presence warning so the UI can banner a ready+assigned task that would
         # otherwise sit idle (no gateway / dispatch_in_gateway=false); triage/todo are expected
         # to wait, unassigned tasks can't dispatch anyway. Probe the request's active home: the
@@ -674,7 +679,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.title is not None or payload.body is not None:
             _patch_title_body(conn, task_id, payload, board)
         updated = kanban_db.get_task(conn, task_id)
-        return {"task": _task_dict(updated) if updated else None}
+        return {"task": _task_dict(updated, conn=conn) if updated else None}
 
 
 @router.delete("/tasks/{task_id}")

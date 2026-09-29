@@ -1339,3 +1339,77 @@ def test_diag_severity_tokens_route_through_host_theme_tokens():
         "error": ("--color-destructive", "#ff6b3d"),
         "critical": ("--color-destructive", "#ff4d4d"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Request-level view (owner, verified_outcome, open_spawned_children,
+# last_verified_progress, blocker_age_seconds, next_action) surfaced in the
+# dashboard JSON -- same computed fields as `hermes kanban show`/`list` and
+# the `kanban_show` tool (kanban_db.compute_request_view). Follow-up to
+# t_1b395d94 / PR raajkumars/hermes-agent#2 and #3, which wired the CLI/tool
+# surfaces but not the dashboard.
+# ---------------------------------------------------------------------------
+
+
+def test_board_and_task_detail_surface_request_view_fields(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "t", "assignee": "anika"},
+    ).json()["task"]
+    assert task["owner"] == "anika"
+    assert task["verified_outcome"] == "in_progress"
+    assert task["open_spawned_children"] == []
+    assert task["last_verified_progress"] is None
+    assert task["blocker_age_seconds"] is None
+    assert "queued" in task["next_action"]
+
+    # Board cards carry the same fields (get_board's per-task loop).
+    board = client.get("/api/plugins/kanban/board").json()
+    ready = next(c for c in board["columns"] if c["name"] == "ready")
+    card = next(c for c in ready["tasks"] if c["id"] == task["id"])
+    assert card["owner"] == "anika"
+    assert card["verified_outcome"] == "in_progress"
+
+    # Detail drawer carries the same fields.
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert detail["verified_outcome"] == "in_progress"
+    assert detail["next_action"] == task["next_action"]
+
+
+def test_board_and_detail_surface_orchestration_done_delivery_pending(client):
+    """The exact falsely-completed-parent shape: a 'done' orchestration card
+    whose spawned (creator_task_id) child is still open must not report
+    verified_outcome mirroring status='done', on the board OR the drawer."""
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "orchestrator", "assignee": "anika"},
+    ).json()["task"]
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="child", assignee="builder", creator_task_id=parent["id"])
+        assert kb.complete_task(conn, parent["id"], summary="decomposed", force=True)
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{parent['id']}").json()["task"]
+    assert detail["status"] == "done"
+    assert detail["verified_outcome"] == "orchestration_done_delivery_pending"
+    assert len(detail["open_spawned_children"]) == 1
+    assert "waiting on spawned children" in detail["next_action"]
+
+    board = client.get("/api/plugins/kanban/board").json()
+    done_col = next(c for c in board["columns"] if c["name"] == "done")
+    card = next(c for c in done_col["tasks"] if c["id"] == parent["id"])
+    assert card["verified_outcome"] == "orchestration_done_delivery_pending"
+    assert card["status"] == "done"
+
+
+def test_task_detail_surfaces_last_verified_progress_and_blocker_age_on_review(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "t", "assignee": "anika"},
+    ).json()["task"]
+    with kbc.connect() as conn:
+        kb.claim_task(conn, task["id"])
+        assert kb.request_review(conn, task["id"], summary="ready for review", reviewer="meera")
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert detail["status"] == "review"
+    assert detail["verified_outcome"] == "waiting"
+    assert detail["last_verified_progress"] == "ready for review"
+    assert detail["blocker_age_seconds"] is not None
+    assert "meera" in detail["next_action"]
