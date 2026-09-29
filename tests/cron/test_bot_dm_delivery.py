@@ -117,6 +117,46 @@ def test_enqueue_is_idempotent_on_the_same_delivery_id(tmp_path, home):
         queue.enqueue_busy_dm(delivery_id="a" * 64, argv=["hermes"], content="different", label="ops")
 
 
+def test_drain_replay_holds_the_profile_turn_lock(tmp_path, home, monkeypatch):
+    """The replay's _run_local_turn call runs under the SAME per-profile turn lock a
+    live delivery gets (#93091 — see tools/bot_relay.py::acquire_turn_lock): a
+    concurrent live delivery into the same target profile cannot race it. Mirrors the
+    proof in tests/tools/test_bot_turn_lock.py::test_run_delivery_holds_profile_lock_
+    during_turn — argv0 must be literally 'hermes' for _delivery_lock to engage
+    instead of short-circuiting to a no-op (the other tests in this file use a bare
+    python script and never exercise the real flock)."""
+    from tools.bot_relay import TurnBusyError, acquire_turn_lock
+
+    argv = ["hermes", "-p", "ops", "chat"]
+    delivery_id = "f" * 64
+    queue.enqueue_busy_dm(delivery_id=delivery_id, argv=argv, content="hi", label="ops")
+    observed = {}
+
+    def _fake_run(call_argv, **kwargs):
+        # While the replay's turn runs, a second acquire on the same profile must
+        # fail — proving the replay genuinely holds the lock, not a no-op.
+        with pytest.raises(TurnBusyError):
+            with acquire_turn_lock(home, "ops", timeout_seconds=0.15):
+                pass  # pragma: no cover — must not acquire concurrently
+        observed["argv"] = call_argv
+
+        class _P:
+            returncode = 0
+            stdout = "delivered"
+            stderr = ""
+
+        return _P()
+
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", _fake_run)
+    queue.drain()
+
+    assert observed["argv"][:3] == ["hermes", "-p", "ops"]
+    assert queue.read_pending(delivery_id)["status"] == "delivered"
+    # ...and after the replay, the lock is free again for the next delivery.
+    with acquire_turn_lock(home, "ops", timeout_seconds=0.5):
+        pass
+
+
 def test_unreadable_queued_dm_does_not_block_siblings(tmp_path, home, caplog):
     """One corrupt receipt beside healthy queued work degrades to a logged skip, never an
     aborted drain (same rule as cron/bot_chat_delivery.py and tools/bot_live_delivery.py)."""

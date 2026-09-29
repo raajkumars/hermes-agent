@@ -452,12 +452,20 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
         # decides whether to requeue or expire — it must never enqueue a second copy.
         who = argv[argv.index("-p") + 1] if "-p" in argv[:-1] else "the teammate"
         if delivery_id is not None:
+            record = None
             try:
                 from cron.bot_dm_delivery import enqueue_busy_dm
 
                 content = Path(dm_file).read_text(encoding="utf-8")
                 record = enqueue_busy_dm(delivery_id=delivery_id, argv=argv, content=content, label=who,
                                          author=author, profile_home=profile_home)
+            except Exception as exc:
+                logger.error("Failed to queue busy DM to @%s; falling back to a hard failure: %s",
+                            who, exc, exc_info=True)
+            if record is not None:
+                # The message is already durably queued at this point; any failure past
+                # here (e.g. a broken stdout) must not fall through to telling the sender
+                # a hard target_busy failure for a message that WILL still be delivered.
                 print(json.dumps({
                     "status": "queued_busy",
                     "delivery_id": record["id"],
@@ -469,9 +477,6 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
                     "queued_at": record["enqueued_at"],
                 }))
                 return 0
-            except Exception as exc:
-                logger.error("Failed to queue busy DM to @%s; falling back to a hard failure: %s",
-                            who, exc, exc_info=True)
         print(json.dumps({
             "error": f"Delivery failed: @{who}'s Bot Chat is open on another "
                      "surface right now, so your message was NOT delivered. Try again later.",
