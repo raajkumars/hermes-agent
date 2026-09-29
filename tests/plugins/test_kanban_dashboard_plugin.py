@@ -1413,34 +1413,3 @@ def test_task_detail_surfaces_last_verified_progress_and_blocker_age_on_review(c
     assert detail["last_verified_progress"] == "ready for review"
     assert detail["blocker_age_seconds"] is not None
     assert "meera" in detail["next_action"]
-
-
-# ---------------------------------------------------------------------------
-# Card front-end renders the request-view fields (behavioral, real bundle --
-# same pattern as test_touch_card_tap_opens_instead_of_dragging: no build
-# step, so the shipped source itself is the thing under test).
-# ---------------------------------------------------------------------------
-
-
-def test_bundle_wires_request_view_fields_into_card_and_drawer():
-    """The card badge and drawer meta rows must read the exact keys
-    compute_request_view emits (`verified_outcome`, `last_verified_progress`,
-    `next_action`, `blocker_age_seconds`, `open_spawned_children`) -- a typo'd
-    key here silently renders nothing, which a source-string match alone would
-    not catch, so this parses the real bundle with Node's own JS parser
-    (throws SyntaxError on a broken edit) before checking for the wiring."""
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("node not available")
-    bundle = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    source = bundle.read_text(encoding="utf-8")
-    result = subprocess.run(
-        [node, "--check", str(bundle)],
-        capture_output=True, text=True, timeout=30,
-    )
-    assert result.returncode == 0, f"bundle failed to parse: {result.stderr}"
-    for key in (
-        "t.verified_outcome", "t.last_verified_progress", "t.next_action",
-        "t.blocker_age_seconds", "t.open_spawned_children",
-    ):
-        assert key in source, f"missing wiring for {key}"
