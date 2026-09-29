@@ -3248,6 +3248,17 @@
                   title: tx(i18n, "needsAssigneeHint", "Dependencies are satisfied, but the dispatcher skips this task until you assign a profile."),
                 }, tx(i18n, "needsAssignee", "Needs assignee"))
               : null,
+            // The exact falsely-completed-parent shape compute_request_view exists to
+            // surface: status=done but a creator_task_id child it spawned is still open,
+            // so the orchestration step finished while the delivery work has not.
+            t.verified_outcome === "orchestration_done_delivery_pending"
+              ? h(Badge, {
+                  variant: "outline",
+                  className: "hermes-kanban-outcome-pending",
+                  title: `${tx(i18n, "outcomePendingHint", "Marked done, but spawned child task(s) are still open")}: ` +
+                    (t.open_spawned_children || []).map(function (c) { return `${c.id} (${c.status})`; }).join(", "),
+                }, tx(i18n, "outcomePending", "delivery pending"))
+              : null,
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
@@ -4020,6 +4031,37 @@
       ),
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
+        // Request-level view distinct from the raw orchestration status (owner is
+        // already the assignee row below): verified_outcome does not just mirror
+        // `status` for a decomposed-but-undelivered task, last_verified_progress is
+        // the newest evidenced run/comment (never an invented ETA), next_action names
+        // what unblocks it, blocker_age_seconds is elapsed time in review/blocked.
+        // Same computed fields as `hermes kanban show`/`list` — see
+        // hermes_cli/kanban_db.py::compute_request_view.
+        t.verified_outcome && t.verified_outcome !== t.status
+          ? h(MetaRow, { label: tx(i18n, "verifiedOutcome", "Verified outcome"), value: t.verified_outcome })
+          : null,
+        t.last_verified_progress
+          ? h(MetaRow, {
+              label: tx(i18n, "lastVerifiedProgress", "Last verified progress"),
+              value: t.last_verified_progress.split("\n")[0].slice(0, 160),
+            })
+          : null,
+        t.next_action
+          ? h(MetaRow, { label: tx(i18n, "nextAction", "Next action"), value: t.next_action })
+          : null,
+        (t.blocker_age_seconds !== null && t.blocker_age_seconds !== undefined)
+          ? h(MetaRow, {
+              label: tx(i18n, "blockerAge", "Waiting"),
+              value: `${Math.floor(t.blocker_age_seconds / 3600)}h ${Math.floor((t.blocker_age_seconds % 3600) / 60)}m`,
+            })
+          : null,
+        t.open_spawned_children && t.open_spawned_children.length > 0
+          ? h(MetaRow, {
+              label: tx(i18n, "openSpawnedChildren", "Open spawned children"),
+              value: t.open_spawned_children.map(function (c) { return `${c.id} (${c.status})`; }).join(", "),
+            })
+          : null,
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         h(ModelEditor, { task: t, onPatch: props.onPatch }),
