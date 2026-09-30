@@ -1095,8 +1095,13 @@ def _distinct_exact_sha_review_verdict(conn: sqlite3.Connection, task_id: str, h
         if _kb._json_dict(review["metadata"]).get("head_sha") != head_sha:
             continue
         verdict = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'changes_requested' "
-            "AND id > ? ORDER BY id DESC LIMIT 1", (task_id, review["id"]),
+            "SELECT c.payload FROM task_events c WHERE c.task_id = ? "
+            "AND c.kind = 'changes_requested' AND c.id > ? "
+            "AND NOT EXISTS (SELECT 1 FROM task_events later "
+            "WHERE later.task_id = c.task_id AND later.kind = 'review_requested' "
+            "AND later.id > ? AND later.id < c.id) "
+            "ORDER BY c.id DESC LIMIT 1",
+            (task_id, review["id"], review["id"]),
         ).fetchone()
         reviewer = _kb._json_dict(verdict["payload"] if verdict else None).get("reviewer")
         if isinstance(reviewer, str) and reviewer.strip() and reviewer != payload.get("implementer"):
