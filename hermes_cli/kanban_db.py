@@ -1772,7 +1772,15 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
-def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+def add_comment(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str,
+    *, hermes_home: Optional[str] = None,
+) -> int:
+    """``hermes_home`` is an optional audit field: the caller's resolved HERMES_HOME,
+    recorded on the ``commented`` event for interactive (non-worker) calls where
+    ``author`` is a best-effort guess rather than the dispatcher's own run record
+    (t_3a498b10). Omitted (``None``) when the caller already has authoritative
+    attribution."""
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -1786,7 +1794,10 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        payload = {"author": author, "len": len(body)}
+        if hermes_home:
+            payload["hermes_home"] = hermes_home
+        _append_event(conn, task_id, "commented", payload)
         return int(cur.lastrowid or 0)
 
 
