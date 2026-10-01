@@ -3855,6 +3855,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         assignee = assignee.strip()
         if len(assignee) > MAX_KANBAN_CREATE_ASSIGNEE_LENGTH:
             return _invalid_request(f"assignee must be ≤ {MAX_KANBAN_CREATE_ASSIGNEE_LENGTH} characters")
+        try:
+            from hermes_cli import kanban_db
+            from hermes_cli.profiles import normalize_profile_name
+            normalized_assignee = normalize_profile_name(assignee)
+            known_profiles = kanban_db.list_profiles_on_disk()
+        except Exception as exc:
+            # Fail closed: an assignee we can't verify must never become a silent
+            # ready-forever card (no dispatcher will ever pick it up).
+            logger.error("kanban create: assignee validation failed: %s", type(exc).__name__)
+            return web.json_response({"error": "Unable to validate assignee"}, status=502)
+        if not known_profiles or normalized_assignee not in known_profiles:
+            return _invalid_request(f"assignee {assignee!r} is not a known profile")
+        assignee = normalized_assignee
 
         idempotency_key = body.get("idempotency_key")
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():

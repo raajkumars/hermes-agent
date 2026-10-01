@@ -45,8 +45,15 @@ def adapter():
 def _isolated_kanban_db(tmp_path, monkeypatch):
     """Every test gets its own temp Kanban root — never the real board. HERMES_KANBAN_HOME
     (not HERMES_KANBAN_DB) so per-board resolution/validation (_normalize_board_slug) still
-    engages instead of being short-circuited by a single pinned DB path."""
+    engages instead of being short-circuited by a single pinned DB path. Also seeds a fake
+    on-disk "tanvi" profile (HERMES_HOME=<root>/profiles/<anything>, so
+    kanban_db.list_profiles_on_disk() resolves <root>) so assignee validation has a real
+    profile to accept, matching prime's requirement that an unknown assignee 400s."""
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-root"))
+    hermes_root = tmp_path / "hermes-home"
+    (hermes_root / "profiles" / "tanvi").mkdir(parents=True)
+    (hermes_root / "profiles" / "tanvi" / "config.yaml").write_text("{}\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_root / "profiles" / "tanvi"))
 
 
 def _payload(**overrides):
@@ -168,6 +175,30 @@ class TestValidation:
                 headers={"Authorization": "Bearer sk-secret"},
                 json=_payload(assignee="x" * (MAX_KANBAN_CREATE_ASSIGNEE_LENGTH + 1)))
             assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_unknown_assignee_400(self, adapter):
+        """prime's requirement: an assignee that isn't a real on-disk profile must 4xx, never
+        silently create a ready-forever card no dispatcher will ever pick up."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/kanban/create",
+                headers={"Authorization": "Bearer sk-secret"},
+                json=_payload(assignee="no-such-profile"))
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_assignee_case_insensitive_match(self, adapter):
+        """normalize_profile_name lowercases before the on-disk check, same as every other
+        Kanban assignment surface."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/kanban/create",
+                headers={"Authorization": "Bearer sk-secret"},
+                json=_payload(assignee="TANVI"))
+            assert resp.status == 200
 
     @pytest.mark.asyncio
     async def test_missing_idempotency_key_400(self, adapter):
