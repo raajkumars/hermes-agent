@@ -150,3 +150,69 @@ def test_profile_author_outside_worker_still_honours_env(kanban_home, monkeypatc
     monkeypatch.setenv("HERMES_PROFILE", "raaj")
 
     assert kc._profile_author() == "raaj"
+
+
+# --- Round 2 regression: HERMES_KANBAN_RUN_ID fail-open bypass (t_3a498b10 comment 2110) ---
+#
+# PR #19 round 1 resolved attribution from ``_worker_run_id_for()``, which reads the
+# process's OWN ``HERMES_KANBAN_RUN_ID`` env var and returns ``None`` whenever that var is
+# unset, empty, unparseable, or points at a run that doesn't exist. ``_worker_run_profile()``
+# read that ``None`` as "not a worker" and fell through to ``--author``/the ambient profile
+# env — a shell caller inside the worker just has to `unset HERMES_KANBAN_RUN_ID` (or set it
+# to garbage, or to a stale/nonexistent id) to defeat the whole hardening. These four variants
+# must now fail CLOSED: resolved from the task's own ``current_run_id`` column instead, never
+# from the (forgeable) env var, for both ``comment`` and ``attach``.
+
+_BYPASS_RUN_IDS = pytest.mark.parametrize(
+    "bad_run_id", [None, "", "garbage", "999999"],
+    ids=["unset", "empty", "garbage", "nonexistent"],
+)
+
+
+@_BYPASS_RUN_IDS
+def test_worker_comment_run_id_bypass_variants_are_refused(kanban_home, monkeypatch, bad_run_id):
+    with kbc.connect_closing() as conn:
+        tid, _real_run_id = _claim_as(conn, "pari task", "pari")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    if bad_run_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", bad_run_id)
+    monkeypatch.setenv("HERMES_PROFILE", "prime")
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "prime")
+
+    # The fail-open bug let --author prime through (and even the ambient-env path, with no
+    # --author at all) despite the task being claimed by pari. Both must now be refused /
+    # resolved to pari, never silently attributed to prime.
+    with pytest.raises(ValueError, match="disagrees with this worker's run record"):
+        kc._cmd_comment(_comment_args(tid, "must be refused", author="prime"))
+
+    assert kc._cmd_comment(_comment_args(tid, "ambient env must not win")) == 0
+    with kbc.connect_closing() as conn:
+        comments = kb.list_comments(conn, tid)
+    assert len(comments) == 1
+    assert comments[0].author == "pari"
+
+
+@_BYPASS_RUN_IDS
+def test_worker_attach_run_id_bypass_variants_are_refused(kanban_home, monkeypatch, tmp_path, bad_run_id):
+    with kbc.connect_closing() as conn:
+        tid, _real_run_id = _claim_as(conn, "pari task", "pari")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    if bad_run_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", bad_run_id)
+    monkeypatch.setenv("HERMES_PROFILE", "prime")
+
+    src = tmp_path / "evidence.txt"
+    src.write_text("evidence")
+
+    with pytest.raises(ValueError, match="disagrees with this worker's run record"):
+        kc._cmd_attach(argparse.Namespace(
+            task_id=tid, path=str(src), content_type=None, name=None, author="prime",
+        ))
+    with kbc.connect_closing() as conn:
+        assert kb.list_attachments(conn, tid) == []

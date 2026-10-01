@@ -207,8 +207,18 @@ def _worker_run_profile() -> Optional[str]:
     the process environment (``HERMES_PROFILE``/``HERMES_PROFILE_NAME``, or a bare
     ``--author``) is set by whoever launched the shell, not by the dispatcher, so any
     caller sharing that shell (or a subprocess that forgot to clear it) could otherwise
-    post as any profile (t_3a498b10). ``None`` outside a dispatcher-owned worker context,
-    or when the run has no recorded profile (never expected once a worker is live).
+    post as any profile (t_3a498b10). ``None`` outside a dispatcher-owned worker context
+    (the only case where falling back to ``--author``/the process environment is safe).
+
+    Inside a worker, this FAILS CLOSED rather than falling through: the task's own
+    ``current_run_id`` column (refreshed by the dispatcher on every claim) is the
+    authoritative pointer to "the run presently executing this task", so it is used
+    directly — never the process's own ``HERMES_KANBAN_RUN_ID`` env var, which a shell
+    caller inside the worker could unset, blank, garble, or repoint at an unrelated run
+    to defeat attribution (t_3a498b10 round 2: all four were reproduced as silent
+    fall-through to ``--author``). A task with no resolvable run, or a run with no
+    recorded profile, raises instead of returning ``None`` — the caller must never read
+    that as "not a worker, trust --author".
     """
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -217,15 +227,17 @@ def _worker_run_profile() -> Optional[str]:
     task_id = os.environ.get("HERMES_KANBAN_TASK")
     if not task_id:
         return None
-    try:
-        run_id = _worker_run_id_for(task_id)
-    except ValueError:
-        return None
-    if run_id is None:
-        return None
     with kbc.connect_closing() as conn:
-        run = kb.get_run(conn, run_id)
-    return (run.profile or None) if run else None
+        task = kb.get_task(conn, task_id)
+        run_id = task.current_run_id if task else None
+        run = kb.get_run(conn, run_id) if run_id is not None else None
+    if run is None or not run.profile:
+        raise ValueError(
+            f"kanban worker for task {task_id!r} has no resolvable run record "
+            f"(task.current_run_id={run_id!r}); refusing to attribute this mutation "
+            f"instead of trusting --author or the process environment"
+        )
+    return run.profile
 
 
 def _profile_author() -> str:
@@ -1361,7 +1373,7 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
     """Shared driver for ``specify`` / ``decompose``: validate ids (one task id XOR ``--all``), run
     ``run_one(tid, author=...)`` per id, print JSON or human lines, exit code."""
     all_flag = bool(getattr(args, "all_triage", False))
-    author = getattr(args, "author", None) or _profile_author()
+    author = _resolve_cli_author(getattr(args, "author", None))
     want_json = bool(getattr(args, "json", False))
     tenant = getattr(args, "tenant", None)
     if args.task_id and all_flag:
