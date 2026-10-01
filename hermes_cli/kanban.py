@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from hermes_constants import get_hermes_home
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
@@ -198,8 +199,55 @@ def kanban_command(args: argparse.Namespace) -> int:
 
 # --- Handlers ---
 
+def _worker_run_profile() -> Optional[str]:
+    """The profile the dispatcher recorded on THIS run's ``task_runs`` row, when the
+    current process is a dispatcher-owned kanban worker scoped via ``HERMES_KANBAN_TASK``.
+
+    Authoritative identity for comment/block/schedule/etc. attribution inside a worker:
+    the process environment (``HERMES_PROFILE``/``HERMES_PROFILE_NAME``, or a bare
+    ``--author``) is set by whoever launched the shell, not by the dispatcher, so any
+    caller sharing that shell (or a subprocess that forgot to clear it) could otherwise
+    post as any profile (t_3a498b10). ``None`` outside a dispatcher-owned worker context
+    (the only case where falling back to ``--author``/the process environment is safe).
+
+    Inside a worker, this FAILS CLOSED rather than falling through: the task's own
+    ``current_run_id`` column (refreshed by the dispatcher on every claim) is the
+    authoritative pointer to "the run presently executing this task", so it is used
+    directly — never the process's own ``HERMES_KANBAN_RUN_ID`` env var, which a shell
+    caller inside the worker could unset, blank, garble, or repoint at an unrelated run
+    to defeat attribution (t_3a498b10 round 2: all four were reproduced as silent
+    fall-through to ``--author``). A task with no resolvable run, or a run with no
+    recorded profile, raises instead of returning ``None`` — the caller must never read
+    that as "not a worker, trust --author".
+    """
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    if not is_dispatcher_owned_worker_context():
+        return None
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return None
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        run_id = task.current_run_id if task else None
+        run = kb.get_run(conn, run_id) if run_id is not None else None
+    if run is None or not run.profile:
+        raise ValueError(
+            f"kanban worker for task {task_id!r} has no resolvable run record "
+            f"(task.current_run_id={run_id!r}); refusing to attribute this mutation "
+            f"instead of trusting --author or the process environment"
+        )
+    return run.profile
+
+
 def _profile_author() -> str:
-    """Best-effort author name for an interactive CLI call."""
+    """Best-effort author name for a kanban mutation. Inside a dispatcher-owned worker,
+    the dispatcher's own run record is authoritative (see ``_worker_run_profile``) and
+    the process environment is never trusted; outside a worker this is the same
+    best-effort interactive-CLI guess it always was."""
+    worker_profile = _worker_run_profile()
+    if worker_profile:
+        return worker_profile
     for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
         v = os.environ.get(env)
         if v:
@@ -209,6 +257,28 @@ def _profile_author() -> str:
         return get_active_profile_name() or "user"
     except Exception:
         return "user"
+
+
+def _resolve_cli_author(requested: Optional[str]) -> str:
+    """Resolve an explicit ``--author`` (``comment`` / ``attach``). Inside a
+    dispatcher-owned worker the run record is authoritative and a disagreeing
+    ``--author`` is REFUSED rather than silently overridden or silently honoured — so
+    an impersonation attempt surfaces as an error instead of a mismatch nobody notices.
+    An omitted ``--author``, or one that agrees with the run record, is accepted.
+    Outside a worker, behaviour is unchanged (``--author`` or the best-effort guess).
+    """
+    worker_profile = _worker_run_profile()
+    if worker_profile is not None:
+        requested_stripped = (requested or "").strip()
+        if requested_stripped and requested_stripped != worker_profile:
+            raise ValueError(
+                f"--author {requested_stripped!r} disagrees with this worker's run "
+                f"record ({worker_profile!r}); inside a dispatcher-owned kanban worker, "
+                f"comment/attach attribution always comes from the dispatcher's run "
+                f"record, never from --author or the process environment"
+            )
+        return worker_profile
+    return requested or _profile_author()
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
@@ -773,9 +843,14 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         if len(body) > args.max_len:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
-    author = args.author or _profile_author()
+    author = _resolve_cli_author(args.author)
+    # Interactive CLI calls (no dispatcher-owned worker on this task) carry no
+    # authoritative run record, so the resolved HERMES_HOME rides along in the event
+    # payload for audit instead (t_3a498b10) — a worker's attribution is already
+    # authoritative via the run record and needs no extra audit field.
+    audit_home = None if _worker_run_profile() else str(get_hermes_home())
     with kbc.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        kb.add_comment(conn, args.task_id, author, body, hermes_home=audit_home)
     print(f"Comment added to {args.task_id}")
     return 0
 
@@ -792,7 +867,7 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     data = src.read_bytes()
     name = args.name or src.name
     content_type = args.content_type or mimetypes.guess_type(name)[0]
-    uploaded_by = args.author or _profile_author()
+    uploaded_by = _resolve_cli_author(args.author)
     try:
         with kbc.connect_closing() as conn:
             att_id = kb.store_attachment_bytes(conn, args.task_id, name, data, content_type=content_type,
@@ -1298,7 +1373,7 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
     """Shared driver for ``specify`` / ``decompose``: validate ids (one task id XOR ``--all``), run
     ``run_one(tid, author=...)`` per id, print JSON or human lines, exit code."""
     all_flag = bool(getattr(args, "all_triage", False))
-    author = getattr(args, "author", None) or _profile_author()
+    author = _resolve_cli_author(getattr(args, "author", None))
     want_json = bool(getattr(args, "json", False))
     tenant = getattr(args, "tenant", None)
     if args.task_id and all_flag:
