@@ -1076,6 +1076,20 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _cmd_recover_stale_failure(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban stale-failure recovery is orchestrator-only")
+    actor = _profile_author()
+    with kbc.connect_closing() as conn:
+        ok, detail = kb.recover_stale_failure(
+            conn, args.task_id, actor=actor, reason=args.reason,
+        )
+    if not ok:
+        return _err(f"cannot recover stale failure for {args.task_id}: {detail}")
+    print(f"Recovered stale provider failure for {args.task_id} -> {detail}")
+    return 0
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1373,6 +1387,7 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "rebind-contract": _cmd_rebind_contract,
     "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "recover-stale-failure": _cmd_recover_stale_failure,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

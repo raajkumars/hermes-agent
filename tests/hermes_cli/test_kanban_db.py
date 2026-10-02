@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import sqlite3
@@ -614,6 +615,122 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
 # ---------------------------------------------------------------------------
 # Complete / block / unblock / archive / assign
 # ---------------------------------------------------------------------------
+
+
+def _seed_stale_failure(conn, task_id, *, status, error, failures=2):
+    conn.execute(
+        "UPDATE tasks SET status=?, consecutive_failures=?, last_failure_error=? WHERE id=?",
+        (status, failures, error, task_id),
+    )
+    conn.commit()
+
+
+def test_recover_stale_quota_failure_audits_digest_without_raw_error(kanban_home):
+    raw_error = "Provider quota exhausted; secret-looking detail must not enter the audit event"
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="quota hold", assignee="worker")
+        _seed_stale_failure(conn, tid, status="blocked", error=raw_error)
+
+        ok, landed = kb.recover_stale_failure(
+            conn, tid, actor="operator", reason="provider reset window has elapsed",
+        )
+
+        assert (ok, landed) == (True, "ready")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+        event = next(event for event in kb.list_events(conn, tid) if event.kind == "stale_failure_recovered")
+        assert event.payload == {
+            "actor": "operator",
+            "classification": "provider_quota",
+            "reason": "provider reset window has elapsed",
+            "evidence": "explicit provider capacity/session evidence",
+            "prior_error_sha256": hashlib.sha256(raw_error.encode()).hexdigest(),
+            "old_status": "blocked",
+            "new_status": "ready",
+        }
+        assert raw_error not in json.dumps(event.payload)
+
+
+def test_recover_session_limit_re_gates_open_parents(kanban_home):
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="unfinished parent", assignee="worker")
+        child = kb.create_task(conn, title="session hold", assignee="worker", parents=[parent])
+        _seed_stale_failure(
+            conn, child, status="ready", error="Provider session-limit reached; retry after reset",
+        )
+
+        assert kb.recover_stale_failure(
+            conn, child, actor="operator", reason="provider session reset confirmed",
+        ) == (True, "todo")
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert (task.status, task.consecutive_failures, task.last_failure_error) == ("todo", 0, None)
+        event = next(event for event in kb.list_events(conn, child) if event.kind == "stale_failure_recovered")
+        assert event.payload is not None
+        assert event.payload["classification"] == "provider_session_limit"
+        assert (event.payload["old_status"], event.payload["new_status"]) == ("ready", "todo")
+
+
+@pytest.mark.parametrize("error", [
+    "quota exhausted; security scan denied the request",
+    "quota exhausted; HTTP 403 forbidden",
+    "session-limit reached; permission denied",
+    "rate-limited by qwick-guard",
+    "quota exhausted; SOP policy violation",
+    "401 unauthorized despite quota reset",
+])
+def test_recover_stale_failure_deny_precedence_preserves_hold(kanban_home, error):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="deny wins", assignee="worker")
+        _seed_stale_failure(conn, tid, status="blocked", error=error, failures=3)
+
+        ok, detail = kb.recover_stale_failure(
+            conn, tid, actor="operator", reason="operator tried stale recovery",
+        )
+
+        assert ok is False
+        assert "narrow provider" in detail
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert (task.status, task.consecutive_failures, task.last_failure_error) == ("blocked", 3, error)
+        assert not [event for event in kb.list_events(conn, tid) if event.kind == "stale_failure_recovered"]
+
+
+def test_recover_stale_failure_rejects_repeat_after_audited_reset(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="repeat", assignee="worker")
+        _seed_stale_failure(conn, tid, status="scheduled", error="provider capacity reset completed", failures=1)
+
+        assert kb.recover_stale_failure(
+            conn, tid, actor="operator", reason="provider capacity reset",
+        ) == (True, "ready")
+        assert kb.recover_stale_failure(
+            conn, tid, actor="operator", reason="duplicate request",
+        )[0] is False
+        events = [event for event in kb.list_events(conn, tid) if event.kind == "stale_failure_recovered"]
+        assert len(events) == 1
+        assert events[0].payload is not None
+        assert events[0].payload["classification"] == "provider_capacity_reset"
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert (task.status, task.last_failure_error, task.consecutive_failures) == ("ready", None, 0)
+
+
+def test_unblock_and_reassign_cannot_clear_stale_failure_without_recovery(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="no bypass", assignee="worker")
+        _seed_stale_failure(conn, tid, status="blocked", error="provider quota exhausted", failures=2)
+
+        assert kb.unblock_task(conn, tid)
+        assert kb.assign_task(conn, tid, "new-worker")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert (task.status, task.assignee, task.consecutive_failures, task.last_failure_error) == (
+            "ready", "new-worker", 2, "provider quota exhausted",
+        )
 
 
 
