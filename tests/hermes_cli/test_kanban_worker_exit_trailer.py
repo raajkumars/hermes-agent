@@ -103,10 +103,13 @@ def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
         assert kb.get_task(conn, tid).status == "ready"
 
 
-def test_plain_budget_trip_still_auto_recovers(kanban_home):
-    """A unified-budget trip carries no ``sticky`` marker, so the two recovery paths on main
-    survive: raising the dispatcher ``failure_limit`` past the counter promotes the card, and
-    ``assign_task`` to a fresh profile (counter reset by design) promotes it too."""
+def test_plain_budget_trip_requires_recovery_not_reassignment(kanban_home):
+    """A unified-budget trip is released when its configured failure limit rises,
+    but reassignment is not evidence that a provider/security failure cleared.
+
+    ``assign_task`` must preserve the failure state so only the audited narrow
+    recovery lifecycle can erase it; otherwise reassignment bypasses the hold.
+    """
     with kbc.connect() as conn:
         tids = [kb.create_task(conn, title=t, assignee="a") for t in ("raise-limit", "reassign")]
         for tid in tids:
@@ -128,8 +131,11 @@ def test_plain_budget_trip_still_auto_recovers(kanban_home):
             )
         assert kb.get_task(conn, tids[1]).status == "blocked"
         kb.assign_task(conn, tids[1], "other-profile")
-        assert kb.recompute_ready(conn, failure_limit=2) == 1
-        assert kb.get_task(conn, tids[1]).status == "ready"
+        assert kb.recompute_ready(conn, failure_limit=2) == 0
+        task = kb.get_task(conn, tids[1])
+        assert task is not None
+        assert (task.status, task.assignee) == ("blocked", "other-profile")
+        assert task.consecutive_failures >= 2
 
 
 def test_exit_single_query_writes_trailer_only_for_kanban_workers(monkeypatch, capsys):

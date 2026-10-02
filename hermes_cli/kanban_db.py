@@ -12,6 +12,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -110,6 +111,26 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+# Recovery is deliberately narrower than the dispatcher's respawn guard.  A
+# respawn guard may hold a card on broad auth/quota-like text; this operator
+# lifecycle may release only explicit provider capacity/session evidence, and
+# any denial token wins even when capacity evidence is also present.
+_RECOVERY_DENIAL_RE = re.compile(
+    r"\b(?:401|403|unauthori[sz]ed|unauthori[sz]ation|forbidden|"
+    r"(?:permission|access)\s+denied|invalid\s+(?:api\s*)?key|"
+    r"qwick[- ]guard|security\s*scan|"
+    r"(?:sop|policy)\s+(?:denied|violation|blocked)|"
+    r"(?:denied|blocked)\s+(?:by\s+)?(?:sop|policy))\b",
+    re.IGNORECASE,
+)
+_RECOVERY_RATE_LIMIT_RE = re.compile(r"\brate[- ]?limit(?:ed|ing)?\b", re.IGNORECASE)
+_RECOVERY_QUOTA_RE = re.compile(r"\bquota\b", re.IGNORECASE)
+_RECOVERY_SESSION_LIMIT_RE = re.compile(r"\bsession[- ]?limit\b", re.IGNORECASE)
+_RECOVERY_PROVIDER_RESET_RE = re.compile(
+    r"\b(?:provider(?:\s+capacity)?|quota|rate[- ]?limit|session[- ]?limit)\b.{0,80}\breset\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -1570,14 +1591,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
-        if row["assignee"] != profile:
-            # The failure streak is per task/profile; a new profile starts fresh.
-            conn.execute(
-                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?", (profile, task_id),
-            )
-        else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
+        # Reassignment is not evidence that a provider hold has cleared.  Keep
+        # failure state intact; recover_stale_failure is the only non-success
+        # lifecycle that may clear it, with a digest-only audit event.
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
         # a no-op re-assign or an unassign, which must not lift ``active_pr``.
         _append_event(
@@ -3869,6 +3886,93 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
+def classify_stale_failure_recovery(error: Any) -> Optional[str]:
+    """Return the one narrow capacity class eligible for stale recovery.
+
+    This classifier is intentionally fail-closed.  It never treats generic
+    reset prose as provider evidence, and a denial token always rejects mixed
+    strings before a capacity token can be considered.
+    """
+    text = _lossy_text(error)
+    if not isinstance(text, str) or not text.strip() or _RECOVERY_DENIAL_RE.search(text):
+        return None
+    if _RECOVERY_SESSION_LIMIT_RE.search(text):
+        return "provider_session_limit"
+    if _RECOVERY_RATE_LIMIT_RE.search(text):
+        return "provider_rate_limit"
+    if _RECOVERY_QUOTA_RE.search(text):
+        return "provider_quota"
+    if _RECOVERY_PROVIDER_RESET_RE.search(text):
+        return "provider_capacity_reset"
+    return None
+
+
+def recover_stale_failure(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: str,
+) -> tuple[bool, str]:
+    """Auditably release a stale provider-capacity hold for fresh dispatch.
+
+    Only ``ready``, ``blocked`` and ``scheduled`` cards qualify.  The prior
+    failure itself never enters the event log; its SHA-256 digest is enough to
+    correlate an operator's action without persisting possibly secret-bearing
+    provider output.  Every other failure class, including mixed capacity plus
+    security/auth denial text, remains untouched.
+    """
+    actor = str(actor or "").strip()
+    reason = str(reason or "").strip()
+    if not actor:
+        return False, "recovery actor is required"
+    if not reason:
+        return False, "recovery reason is required"
+
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, last_failure_error FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task not found"
+        old_status = row["status"]
+        if old_status not in {"ready", "blocked", "scheduled"}:
+            return False, "recovery requires a ready, blocked, or scheduled task"
+        prior_error = _lossy_text(row["last_failure_error"])
+        classification = classify_stale_failure_recovery(prior_error)
+        if classification is None:
+            return False, "failure is not narrow provider quota/rate-limit/session-limit/reset evidence"
+
+        resume_status = _resume_status_from_events(conn, task_id) if old_status == "blocked" else "ready"
+        landing_status = _landing_status_after_parents(conn, task_id)
+        new_status = "review" if landing_status == "ready" and resume_status == "review" else landing_status
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("ready", "blocked", "scheduled"), now=now,
+            note="invariant recovery on stale provider capacity recovery",
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = ?",
+            (new_status, task_id, old_status),
+        )
+        if cur.rowcount != 1:
+            return False, "task changed during recovery"
+        digest = hashlib.sha256(prior_error.encode("utf-8", errors="replace")).hexdigest()
+        _append_event(
+            conn, task_id, "stale_failure_recovered",
+            {
+                "actor": actor,
+                "classification": classification,
+                "reason": reason,
+                "evidence": "explicit provider capacity/session evidence",
+                "prior_error_sha256": digest,
+                "old_status": old_status,
+                "new_status": new_status,
+            },
+        )
+    notify_task_updated(conn, task_id, ("status", "consecutive_failures", "last_failure_error"))
+    return True, new_status
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
@@ -3890,14 +3994,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        # ``block_kind``/``block_recurrences`` deliberately survive the unblock.
+        # So do failure state and its retry budget: an unblock is not evidence
+        # that a stale provider hold cleared.  recover_stale_failure owns that
+        # narrow, digest-audited reset.
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "UPDATE tasks SET status = ?, current_run_id = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
