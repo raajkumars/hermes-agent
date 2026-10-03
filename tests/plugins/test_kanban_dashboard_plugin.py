@@ -518,6 +518,40 @@ def test_dispatch_dry_run(client):
     assert isinstance(body, dict)
 
 
+def test_dashboard_dispatch_returns_the_shared_pacing_decision(client, monkeypatch, kanban_home):
+    """A manual dashboard nudge uses dispatch_once's normal pace-aware budget."""
+    from hermes_cli import kanban_db_dispatch as dispatch
+
+    state_path = kanban_home / "state" / "provider_pace.json"
+    state_path.parent.mkdir()
+    state_path.write_text(json.dumps({
+        "generated_at": time.time(),
+        "chain": ["claude-subscription", "openai-codex"],
+        "reserved_lane_pct": 15,
+        "providers": {
+            "claude-subscription": {
+                "five_hour_used_pct": 80, "five_hour_allowed_pct": 20,
+                "weekly_used_pct": None, "weekly_allowed_pct": None, "error": None,
+            },
+            "openai-codex": {
+                "five_hour_used_pct": 80, "five_hour_allowed_pct": 40,
+                "weekly_used_pct": None, "weekly_allowed_pct": None, "error": None,
+            },
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(dispatch, "configured_max_in_progress", lambda: 8)
+    monkeypatch.setattr(dispatch, "resolve_max_in_progress", lambda configured: configured)
+
+    response = client.post("/api/plugins/kanban/dispatch?dry_run=true")
+
+    assert response.status_code == 200, response.text
+    throttle = response.json()["pacing_throttle"]
+    assert throttle["active"] is True
+    assert throttle["base_cap"] == 8
+    assert throttle["effective_cap"] == 2
+    assert throttle["provider"] == "claude-subscription"
+
+
 # ---------------------------------------------------------------------------
 # Triage column (new v1 status)
 # ---------------------------------------------------------------------------
