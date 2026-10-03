@@ -26,6 +26,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli import kanban_db_dispatch_pacing as _pacing
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -165,6 +166,9 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    pacing_throttle: Optional[dict[str, Any]] = None
+    """Fresh provider-pace throttle telemetry for this tick, or ``None`` when
+    the normal cap is uncapped and therefore cannot be reduced."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -2761,6 +2765,23 @@ def _tick_spawn_budget(
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
+
+        # Provider pace reduces only the *normal* global cap and only when the
+        # latest snapshot proves every provider is over its worker lane pace.
+        # Missing/stale snapshots are deliberately fail-open: a telemetry
+        # outage must never stop background progress.
+        throttle = _pacing.resolve_concurrency_throttle(max_in_progress)
+        if throttle is not None:
+            result.pacing_throttle = throttle.payload()
+            if throttle.active:
+                effective_remaining = max(0, throttle.effective_cap - total_running)
+                if spawn_budget is None or spawn_budget > effective_remaining:
+                    spawn_budget = effective_remaining
+                _kb._log.info(
+                    "kanban dispatch pacing throttle: ratio=%.3f base_cap=%d effective_cap=%d provider=%s reason=%s",
+                    throttle.ratio, throttle.base_cap, throttle.effective_cap,
+                    throttle.provider or "unknown", throttle.reason,
+                )
 
     # Memory-pressure guard: a static cap can't see the host's actual state.
     # critical -> spawn nothing this tick; elevated -> at most one new worker.
