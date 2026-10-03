@@ -8,9 +8,11 @@ operator footgun that only manifests in long-running setups.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -94,5 +96,58 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     assert captured.get("max_spawn") == 2, (
         f"CLI --max=2 must override config kanban.max_spawn=10; got {captured.get('max_spawn')!r}"
     )
+
+
+def test_cli_dispatch_reports_the_shared_pacing_decision(
+    isolated_kanban_home, monkeypatch, capsys,
+):
+    """The CLI reaches dispatch_once's pacing seam and returns its exact decision."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    state_path = os.path.join(isolated_kanban_home, "state", "provider_pace.json")
+    os.makedirs(os.path.dirname(state_path), exist_ok=True)
+    with open(state_path, "w", encoding="utf-8") as state_file:
+        json.dump({
+            "generated_at": time.time(),
+            "chain": ["claude-subscription", "openai-codex"],
+            "reserved_lane_pct": 15,
+            "providers": {
+                "claude-subscription": {
+                    "five_hour_used_pct": 80,
+                    "five_hour_allowed_pct": 20,
+                    "weekly_used_pct": None,
+                    "weekly_allowed_pct": None,
+                    "error": None,
+                },
+                "openai-codex": {
+                    "five_hour_used_pct": 80,
+                    "five_hour_allowed_pct": 40,
+                    "weekly_used_pct": None,
+                    "weekly_allowed_pct": None,
+                    "error": None,
+                },
+            },
+        }, state_file)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"max_in_progress": 8}},
+    )
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {})
+
+    assert kb_cli._cmd_dispatch(
+        argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=True),
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pacing_throttle"] == {
+        "active": True,
+        "base_cap": 8,
+        "effective_cap": 2,
+        "ratio": 4.0,
+        "provider": "claude-subscription",
+        "reason": "every provider is over pace; limiting new background workers by worst fleet pressure",
+        "freshness": "fresh",
+    }
 
 

@@ -2752,36 +2752,44 @@ def _tick_spawn_budget(
     if max_spawn is not None or max_in_progress is not None:
         running_count = count_running_tasks(conn)
 
+    # Resolve and record provider pacing before any ordinary-cap early return:
+    # operators need the decision for every capped dispatch tick, including a
+    # tick that the per-board cap has already filled. Fresh data gets one INFO
+    # decision record; unavailable or stale telemetry remains fail-open and is
+    # DEBUG-only so a telemetry outage does not create an alert storm.
+    effective_max_in_progress = max_in_progress
+    if max_in_progress is not None:
+        throttle = _pacing.resolve_concurrency_throttle(max_in_progress)
+        if throttle is not None:
+            result.pacing_throttle = throttle.payload()
+            if throttle.freshness == "fresh":
+                _kb._log.info(
+                    "kanban dispatch pacing decision: ratio=%.3f base_cap=%d effective_cap=%d "
+                    "provider=%s reason=%s",
+                    throttle.ratio, throttle.base_cap, throttle.effective_cap,
+                    throttle.provider or "unknown", throttle.reason,
+                )
+            else:
+                _kb._log.debug(
+                    "kanban dispatch pacing unavailable: freshness=%s base_cap=%d reason=%s",
+                    throttle.freshness, throttle.base_cap, throttle.reason,
+                )
+            if throttle.active:
+                effective_max_in_progress = throttle.effective_cap
+
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
             return False, None
         spawn_budget = max_spawn - running_count
 
-    if max_in_progress is not None:
+    if effective_max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
-        if total_running >= max_in_progress:
+        if total_running >= effective_max_in_progress:
             return False, None
-        remaining = max_in_progress - total_running
+        remaining = effective_max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
-
-        # Provider pace reduces only the *normal* global cap and only when the
-        # latest snapshot proves every provider is over its worker lane pace.
-        # Missing/stale snapshots are deliberately fail-open: a telemetry
-        # outage must never stop background progress.
-        throttle = _pacing.resolve_concurrency_throttle(max_in_progress)
-        if throttle is not None:
-            result.pacing_throttle = throttle.payload()
-            if throttle.active:
-                effective_remaining = max(0, throttle.effective_cap - total_running)
-                if spawn_budget is None or spawn_budget > effective_remaining:
-                    spawn_budget = effective_remaining
-                _kb._log.info(
-                    "kanban dispatch pacing throttle: ratio=%.3f base_cap=%d effective_cap=%d provider=%s reason=%s",
-                    throttle.ratio, throttle.base_cap, throttle.effective_cap,
-                    throttle.provider or "unknown", throttle.reason,
-                )
 
     # Memory-pressure guard: a static cap can't see the host's actual state.
     # critical -> spawn nothing this tick; elevated -> at most one new worker.
