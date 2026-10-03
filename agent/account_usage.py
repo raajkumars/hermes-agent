@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 from dataclasses import dataclass
@@ -8,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import httpx
 
-from agent.anthropic_credentials import _is_oauth_token, resolve_anthropic_token
+from agent.anthropic_credentials import _is_oauth_token, claude_code_credentials_path, resolve_anthropic_token
 from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -583,6 +584,16 @@ def redeem_codex_reset_credit(
     return _codex_reset_outcome(body, available)
 
 
+def _claude_code_organization_uuid() -> Optional[str]:
+    """Best-effort Claude Code organization identity for the OAuth usage endpoint."""
+    try:
+        metadata_path = claude_code_credentials_path().parent.parent / ".claude.json"
+        value = (json.loads(metadata_path.read_text()).get("oauthAccount") or {}).get("organizationUuid")
+        return value.strip() if isinstance(value, str) and value.strip() else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def _fetch_anthropic_account_usage(
     base_url: Optional[str] = None, api_key: Optional[str] = None
 ) -> Optional[AccountUsageSnapshot]:
@@ -594,6 +605,8 @@ def _fetch_anthropic_account_usage(
                          unavailable_reason="Anthropic account limits are only available for OAuth-backed Claude accounts.")
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json",
                "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0"}
+    if organization_uuid := _claude_code_organization_uuid():
+        headers["x-organization-uuid"] = organization_uuid
     payload = _get_json("https://api.anthropic.com/api/oauth/usage", headers, timeout=15.0)
     windows = _usage_windows(
         payload, (("five_hour", "Current session"), ("seven_day", "Current week"), ("seven_day_opus", "Opus week"),

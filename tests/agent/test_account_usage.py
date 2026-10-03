@@ -55,6 +55,26 @@ def codex_usage_payload():
     }
 
 
+def test_anthropic_usage_includes_claude_code_organization_header(monkeypatch, tmp_path):
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (tmp_path / ".claude.json").write_text('{"oauthAccount":{"organizationUuid":"org-test-uuid"}}')
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: "sk-ant-oat-test")
+    monkeypatch.setattr(account_usage, "claude_code_credentials_path", lambda: claude_dir / ".credentials.json", raising=False)
+    calls = []
+
+    def get_json(url, headers, timeout):
+        calls.append({"url": url, "headers": headers, "timeout": timeout})
+        return {"five_hour": {"utilization": 12, "resets_at": "2026-10-04T00:00:00Z"}}
+
+    monkeypatch.setattr(account_usage, "_get_json", get_json)
+
+    snapshot = account_usage._fetch_anthropic_account_usage()
+
+    assert snapshot is not None
+    assert calls[0]["headers"]["x-organization-uuid"] == "org-test-uuid"
+
+
 def test_codex_usage_prefers_explicit_live_agent_credentials(monkeypatch, codex_usage_payload):
     calls = []
     monkeypatch.setattr(
