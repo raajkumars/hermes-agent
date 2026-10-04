@@ -331,6 +331,11 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("recover-stale-failure", [
+        _TASK_ID,
+        _arg("--reason", required=True,
+             help="Why explicit provider quota/rate-limit/session-limit/reset evidence is stale."),
+    ], help="Auditably release only a stale provider capacity/session failure; denials remain blocked"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

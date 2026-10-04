@@ -73,6 +73,30 @@ def test_kanban_show_json_includes_runtime_limit(kanban_home):
     assert uncapped["task"]["max_runtime_seconds"] is None
 
 
+def test_kanban_recover_stale_failure_cli_uses_audited_lifecycle(kanban_home):
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="provider hold", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=2, "
+            "last_failure_error='provider rate-limited; capacity reset pending' WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+
+    output = kc.run_slash(
+        f"recover-stale-failure {task_id} --reason 'provider reset window elapsed'"
+    )
+
+    assert f"Recovered stale provider failure for {task_id} -> ready" in output
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert (task.status, task.consecutive_failures, task.last_failure_error) == ("ready", 0, None)
+        event = next(event for event in kb.list_events(conn, task_id) if event.kind == "stale_failure_recovered")
+        assert event.payload is not None
+        assert event.payload["classification"] == "provider_rate_limit"
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kbc.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")
