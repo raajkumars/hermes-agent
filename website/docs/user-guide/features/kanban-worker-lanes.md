@@ -41,7 +41,7 @@ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <ass
 | `HERMES_KANBAN_WORKSPACE` | absolute path to *this* task's workspace |
 | `HERMES_KANBAN_RUN_ID` | the current run's id (for the lifecycle gate) |
 | `HERMES_KANBAN_CLAIM_LOCK` | the claim lock string (`<host>:<pid>:<uuid>`) |
-| `HERMES_PROFILE` | the worker's own profile name (for `kanban_comment` author attribution) |
+| `HERMES_PROFILE` | the worker's own profile name |
 | `HERMES_TENANT` | tenant namespace, if the task has one |
 
 For non-Hermes lanes (registered via a plugin), the plugin supplies its own `spawn_fn` callable that gets `task`, `workspace`, and `board` and returns an optional pid for crash detection.
