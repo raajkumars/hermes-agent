@@ -2437,12 +2437,22 @@ class BasePlatformAdapter(ABC):
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(source))
 
+    def _apply_tag_route(self, event: "MessageEvent") -> None:
+        """Re-home a configured leading ``@profile`` tag before identity is pinned."""
+        try:
+            from gateway.tag_routing import apply_tag_route
+            apply_tag_route(self, event)
+        except Exception:
+            logger.warning("[%s] tag route evaluation failed; message stays on its routed profile",
+                           self.name, exc_info=True)
+
     def _text_batch_key(self, event: "MessageEvent") -> str:
         """Session-scoped key for text batching (subclasses may override)."""
         return self._event_session_key(event)
 
     def _enqueue_text_event(self, event: "MessageEvent") -> None:
         """Buffer a text event (merging into a pending one) and restart the flush timer."""
+        self._apply_tag_route(event)
         if self._drop_unresolved(event):
             return
         key = self._text_batch_key(event)
@@ -3904,6 +3914,7 @@ class BasePlatformAdapter(ABC):
                 )
             return
 
+        self._apply_tag_route(event)
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.

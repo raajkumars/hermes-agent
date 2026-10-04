@@ -629,6 +629,7 @@ class GatewayConfig:
     # Prune SessionEntry records older than this (a resumed chat gets a fresh session). 0 = off.
     session_store_max_age_days: int = 90
     profile_routes: list = field(default_factory=list)  # gateway/profile_routing.py
+    tag_routes: Optional[Any] = None  # gateway/tag_routing.py TagRouteConfig; None = off
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
@@ -705,6 +706,7 @@ class GatewayConfig:
                 if is_dataclass(r) and not isinstance(r, type) else r
                 for r in self.profile_routes
             ],
+            **({"tag_routes": self.tag_routes.to_dict()} if self.tag_routes is not None else {}),
         }
 
     @classmethod
@@ -769,6 +771,7 @@ class GatewayConfig:
             session_store_max_age_days = 90
 
         from gateway.profile_routing import parse_profile_routes
+        from gateway.tag_routing import parse_tag_routes
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),
@@ -791,6 +794,7 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
+            tag_routes=parse_tag_routes(pick("tag_routes")),
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:
