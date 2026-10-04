@@ -14,6 +14,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.profile_routing import parse_profile_routes
 from gateway.session_identity import identity_of
 from gateway.tag_routing import TagRouteConfig, apply_tag_route, chat_matches, extract_tag, parse_tag_routes
+from tests.gateway.test_whatsapp_from_owner import _dm_payload, _make_adapter as _make_whatsapp_adapter
 
 SELF = "19785669223@s.whatsapp.net"
 OTHER = "15550001111@s.whatsapp.net"
@@ -122,6 +123,22 @@ def test_explicit_default_profile_route_and_unknown_tag_do_not_reroute(rig, capl
                for record in caplog.records) == 1
 
 
+def test_primary_tag_command_is_normalized_without_rerouting(rig):
+    event = _event(rig.bot, SELF, "@default /new")
+
+    assert apply_tag_route(rig.bot, event) is None
+    assert event.source.profile is None
+    assert event.text == "/new"
+    assert event.get_command() == "new"
+
+
+def test_owner_prefix_requires_trusted_whatsapp_metadata(rig):
+    untrusted = _event(rig.bot, SELF, "[owner reply] @prime status")
+
+    assert apply_tag_route(rig.bot, untrusted) is None
+    assert untrusted.source.profile is None
+
+
 @pytest.mark.asyncio
 async def test_tagged_self_chat_uses_tagged_profile_lane_and_transport(rig):
     seen = []
@@ -146,6 +163,37 @@ async def test_tagged_self_chat_uses_tagged_profile_lane_and_transport(rig):
     assert ("default", "prime", rig.home / "profiles" / "prime", "@prime do X") in seen
     assert rig.runner._delivery_adapter_for(tagged.source) is rig.bot
     _drain(rig.bot)
+
+
+@pytest.mark.asyncio
+async def test_real_owner_event_routes_before_command_handling(rig, monkeypatch):
+    """Bridge owner provenance must survive its transcript prefix into tag routing."""
+    monkeypatch.setenv("WHATSAPP_ALLOW_ALL_USERS", "true")
+    adapter = _make_whatsapp_adapter()
+    BasePlatformAdapter.__init__(adapter, adapter.config, Platform.WHATSAPP)
+    adapter.gateway_runner = rig.runner
+    seen = []
+
+    async def handler(event):
+        identity = identity_of(event.source)
+        assert identity is not None
+        seen.append((identity.runtime_profile, event.get_command(), event.metadata.copy()))
+
+    adapter.set_message_handler(handler)
+    event = await adapter._build_message_event(_dm_payload(
+        chatId=SELF, senderId=SELF, fromOwner=True, body="@prime /new"))
+    assert event is not None
+    assert event.metadata["whatsapp_from_owner"] is True
+    event.allow_gateway_control = True
+
+    await adapter.handle_message(event)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert event.text == "/new"
+    assert event.source.profile == "prime"
+    assert ("prime", "new", {"whatsapp_from_owner": True}) in seen
+    _drain(adapter)
 
 
 @pytest.mark.asyncio

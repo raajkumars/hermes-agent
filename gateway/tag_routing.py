@@ -100,6 +100,23 @@ def extract_tag(cfg: TagRouteConfig, text: Optional[str]) -> Optional[Tuple[str,
     return match.group(1).strip().lower(), match
 
 
+def _routing_text(event: Any, platform: str) -> Optional[str]:
+    """Return the trusted leading-tag view of an inbound event.
+
+    WhatsApp owner-authored messages retain an ``[owner reply]`` transcript marker.
+    The adapter sets its metadata from the bridge's ``fromOwner`` payload, so only that
+    provenance may make the marker transparent for leading-tag routing. A user-written
+    lookalike remains ordinary text and cannot turn an inline mention into a route.
+    """
+    text = getattr(event, "text", None)
+    metadata = getattr(event, "metadata", None)
+    if (platform in _WHATSAPP_PLATFORMS and isinstance(metadata, dict)
+            and metadata.get("whatsapp_from_owner") is True
+            and isinstance(text, str) and text.startswith("[owner reply] ")):
+        return text[len("[owner reply] "):]
+    return text
+
+
 def _primary_profile(runner: Any) -> str:
     name = getattr(runner, "_primary_profile_name", None)
     if isinstance(name, str) and name.strip():
@@ -136,7 +153,8 @@ def apply_tag_route(adapter: Any, event: Any) -> Optional[str]:
     platform = platform.lower()
     if platform not in cfg.platforms or not chat_matches(cfg, platform, getattr(source, "chat_id", None)):
         return None
-    found = extract_tag(cfg, getattr(event, "text", None))
+    routing_text = _routing_text(event, platform) or ""
+    found = extract_tag(cfg, routing_text)
     if found is None:
         return None
     tag, match = found
@@ -157,12 +175,16 @@ def apply_tag_route(adapter: Any, event: Any) -> Optional[str]:
     except Exception:
         logger.warning("tag route: @%s not applied: served-profile set could not be resolved; staying on profile %s",
                        tag, primary, exc_info=True)
+        setattr(event, _DECIDED_ATTR, True)
         return None
     if tag not in served:
         logger.warning("tag route: @%s names a profile this gateway does not serve; staying on profile %s", tag, primary)
         setattr(event, _DECIDED_ATTR, True)
         return None
     if tag == primary:
+        remainder = routing_text[match.end():].lstrip()
+        if remainder.startswith("/"):
+            event.text = remainder
         logger.info("tag route: @%s -> profile %s", tag, tag)
         setattr(event, _DECIDED_ATTR, True)
         return None
@@ -170,7 +192,7 @@ def apply_tag_route(adapter: Any, event: Any) -> Optional[str]:
         clear_identity(source)
     source.profile = tag
     setattr(event, _DECIDED_ATTR, True)
-    remainder = event.text[match.end():].lstrip()
+    remainder = routing_text[match.end():].lstrip()
     if remainder.startswith("/"):
         event.text = remainder
     logger.info("tag route: @%s -> profile %s", tag, tag)
