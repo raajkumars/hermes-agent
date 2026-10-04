@@ -15,7 +15,9 @@ import os
 from unittest.mock import patch
 
 from tools.environments.local import hermes_subprocess_env
-from tools.environments.local_env_policy import _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_FORCE_PREFIX
+from tools.environments.local_env_policy import (
+    _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_FORCE_PREFIX, _SECRETS_SERVICE_KEY_ENV_VARS,
+)
 
 
 _TIER1_SAMPLE = {
@@ -119,6 +121,9 @@ class TestTierInvariants:
 
     def test_tier1_covers_github_auth(self):
         assert {"GH_TOKEN", "GITHUB_TOKEN"} <= _ALWAYS_STRIP_KEYS
+
+    def test_tier1_covers_secrets_service_key(self):
+        assert _SECRETS_SERVICE_KEY_ENV_VARS <= _ALWAYS_STRIP_KEYS
 
     def test_tier1_covers_infra_secrets(self):
         assert {"MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY"} <= _ALWAYS_STRIP_KEYS
