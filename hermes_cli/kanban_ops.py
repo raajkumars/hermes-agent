@@ -113,6 +113,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            "pacing_throttle": res.pacing_throttle,
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")

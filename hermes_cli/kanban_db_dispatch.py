@@ -26,6 +26,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli import kanban_db_dispatch_pacing as _pacing
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -165,6 +166,9 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    pacing_throttle: Optional[dict[str, Any]] = None
+    """Fresh provider-pace throttle telemetry for this tick, or ``None`` when
+    the normal cap is uncapped and therefore cannot be reduced."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -2748,17 +2752,42 @@ def _tick_spawn_budget(
     if max_spawn is not None or max_in_progress is not None:
         running_count = count_running_tasks(conn)
 
+    # Resolve and record provider pacing before any ordinary-cap early return:
+    # operators need the decision for every capped dispatch tick, including a
+    # tick that the per-board cap has already filled. Fresh data gets one INFO
+    # decision record; unavailable or stale telemetry remains fail-open and is
+    # DEBUG-only so a telemetry outage does not create an alert storm.
+    effective_max_in_progress = max_in_progress
+    if max_in_progress is not None:
+        throttle = _pacing.resolve_concurrency_throttle(max_in_progress)
+        if throttle is not None:
+            result.pacing_throttle = throttle.payload()
+            if throttle.freshness == "fresh":
+                _kb._log.info(
+                    "kanban dispatch pacing decision: ratio=%.3f base_cap=%d effective_cap=%d "
+                    "provider=%s reason=%s",
+                    throttle.ratio, throttle.base_cap, throttle.effective_cap,
+                    throttle.provider or "unknown", throttle.reason,
+                )
+            else:
+                _kb._log.debug(
+                    "kanban dispatch pacing unavailable: freshness=%s base_cap=%d reason=%s",
+                    throttle.freshness, throttle.base_cap, throttle.reason,
+                )
+            if throttle.active:
+                effective_max_in_progress = throttle.effective_cap
+
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
             return False, None
         spawn_budget = max_spawn - running_count
 
-    if max_in_progress is not None:
+    if effective_max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
-        if total_running >= max_in_progress:
+        if total_running >= effective_max_in_progress:
             return False, None
-        remaining = max_in_progress - total_running
+        remaining = effective_max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
 
