@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def _run_apply_profile_override(
     tmp_path, monkeypatch, *, hermes_home: str | None, active_profile: str | None,
@@ -51,6 +53,7 @@ def _run_apply_profile_override(
         "HERMES_S6_SUPERVISED_CHILD",
         "INVOCATION_ID",
         "HERMES_GATEWAY_EXTERNAL_SUPERVISOR",
+        "HERMES_PROFILE",  # the real run's own profile must never leak into the resolution under test
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -129,6 +132,117 @@ class TestApplyProfileOverrideHermesHomeGuard:
         assert _resolve_sudo_user_profile_env("ghost") is None
 
 
+class TestStickyActiveProfileFailsSoft:
+    """A dangling active_profile must warn and fall back to default, never hard-exit.
+
+    Regression for the fleet-wide-kill-switch incident: a merge operation tombstoned a
+    profile and left ``active_profile`` naming a directory that never existed
+    (``prime-old``). Every ``hermes`` invocation on the host — 24 profiles, kanban CLI,
+    maestro bootstrap — died with a hard ``sys.exit(1)`` for about an hour.
+    """
+
+    def test_dangling_active_profile_falls_back_to_default_with_warning(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # Build the root by hand: the shared helper auto-creates a dir for any non-"default"
+        # active_profile value, which would defeat this test's whole premise (a name with
+        # NO directory, exactly the prime-old incident).
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+        (hermes_root / "active_profile").write_text("prime-old")
+
+        result = _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=None, active_profile=None,
+            argv=["hermes", "profile", "list"],
+        )
+        # Falls through to the default profile: HERMES_HOME is never set to a dead path.
+        assert result is None
+        err = capsys.readouterr().err
+        assert "Warning" in err
+        assert "prime-old" in err
+
+    def test_tombstoned_active_profile_falls_back_to_default_with_warning(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A profile dir that exists but is tombstoned (deleted) is just as dangling."""
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+        (hermes_root / "active_profile").write_text("prime")
+        profile_dir = hermes_root / "profiles" / "prime"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        (profile_dir / "config.yaml").write_text("{}\n")
+        (hermes_root / "profiles" / ".deleted").mkdir(parents=True, exist_ok=True)
+        (hermes_root / "profiles" / ".deleted" / "prime").write_text("deleted\n")
+
+        result = _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=None, active_profile=None,
+            argv=["hermes", "profile", "list"],
+        )
+        assert result is None
+        err = capsys.readouterr().err
+        assert "Warning" in err
+        assert "prime" in err
+
+    def test_explicit_flag_still_hard_fails_on_nonexistent_profile(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Unlike the sticky fallback, an operator-typed ``-p`` must still error loudly."""
+        with pytest.raises(SystemExit) as excinfo:
+            _run_apply_profile_override(
+                tmp_path, monkeypatch, hermes_home=None, active_profile=None,
+                argv=["hermes", "-p", "does-not-exist", "profile", "list"],
+            )
+        assert excinfo.value.code == 1
+        assert "Error" in capsys.readouterr().err
+
+
+class TestHermesProfileEnvOverride:
+    """HERMES_PROFILE is an explicit override, same standing as -p/--profile."""
+
+    def test_hermes_profile_env_overrides_dangling_active_profile(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+        (hermes_root / "active_profile").write_text("prime-old")  # dangling, no dir
+        profile_dir = hermes_root / "profiles" / "prime"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        (profile_dir / "config.yaml").write_text("{}\n")
+
+        result = _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=None, active_profile=None,
+            argv=["hermes", "profile", "list"],
+            extra_env={"HERMES_PROFILE": "prime"},
+        )
+        assert result is not None
+        assert result.endswith("prime")
+
+    def test_hermes_profile_env_hard_fails_on_nonexistent_profile(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """HERMES_PROFILE is explicit operator intent too — a typo must still error."""
+        with pytest.raises(SystemExit) as excinfo:
+            _run_apply_profile_override(
+                tmp_path, monkeypatch, hermes_home=None, active_profile=None,
+                argv=["hermes", "profile", "list"],
+                extra_env={"HERMES_PROFILE": "does-not-exist"},
+            )
+        assert excinfo.value.code == 1
+        assert "Error" in capsys.readouterr().err
+
+    def test_hermes_profile_env_ignored_under_gateway_supervisor(
+        self, tmp_path, monkeypatch
+    ):
+        """A supervised gateway child has a fixed identity; HERMES_PROFILE must not re-home it,
+        same reasoning as the existing active_profile supervisor guard."""
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+        result = _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=str(hermes_root), active_profile=None,
+            argv=["hermes", "gateway", "run"],
+            extra_env={"HERMES_PROFILE": "prime", "HERMES_SUPERVISED_CHILD": "1"},
+        )
+        assert result == str(hermes_root)
 
 
 class TestSupervisedChildIgnoresStickyProfile:

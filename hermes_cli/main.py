@@ -518,6 +518,22 @@ def _scan_profile_flag(argv: list) -> tuple:
     return None, 0, None
 
 
+def _scan_profile_env() -> str | None:
+    """``HERMES_PROFILE`` as an explicit profile selector, mirroring ``-p``/``--profile``.
+
+    Lets an operator escape a corrupted sticky ``active_profile`` without touching argv —
+    ``HERMES_PROFILE=prime hermes profile list`` must resolve ``prime`` even while
+    ``active_profile`` still names a dead profile. An invalid value is treated as absent
+    rather than erroring here; ``resolve_profile_env`` raises its own clear error once this
+    becomes the chosen ``profile_name``.
+    """
+    raw = os.environ.get("HERMES_PROFILE", "").strip()
+    if not raw:
+        return None
+    value = raw.casefold()
+    return value if re.match(_PROFILE_NAME_RE, value) else None
+
+
 def _resolve_sudo_user_profile_env(name: str) -> str | None:
     """Resolve `sudo hermes -p <name>` against the invoking user's home.
 
@@ -578,9 +594,19 @@ def _desktop_ssh_backend(argv: list) -> bool:
 
 
 def _apply_profile_override() -> None:
-    """Pre-parse --profile/-p and set HERMES_HOME before imports."""
+    """Pre-parse --profile/-p and set HERMES_HOME before imports.
+
+    Resolution order: an explicit -p/--profile argv flag, then an explicit HERMES_PROFILE
+    env var, then the sticky active_profile file. The first two are the operator's stated
+    intent for THIS invocation and fail HARD on an unknown/invalid name. The sticky file is
+    implicit (this process never asked for that profile) so it fails SOFT: a dangling
+    active_profile (renamed/deleted profile, or any other corruption) warns and falls back
+    to the default profile instead of hard-erroring every hermes invocation on the host.
+    HERMES_PROFILE also lets a stuck sticky file be overridden without touching argv.
+    """
     argv = sys.argv[1:]
     profile_name, consume, profile_index = _scan_profile_flag(argv)
+    explicit = profile_name is not None
 
     # HERMES_HOME already set with no explicit flag: trust it only when it
     # points at a specific profile dir ("profiles" as immediate parent). If it
@@ -597,16 +623,20 @@ def _apply_profile_override() -> None:
         return
 
     if profile_name is None and not _under_gateway_supervisor(argv) and not _desktop_ssh_backend(argv):
-        try:
-            from hermes_constants import get_default_hermes_root
+        env_profile = _scan_profile_env()
+        if env_profile is not None:
+            profile_name, explicit = env_profile, True
+        else:
+            try:
+                from hermes_constants import get_default_hermes_root
 
-            active_path = get_default_hermes_root() / "active_profile"
-            if active_path.exists():
-                name = active_path.read_text(encoding="utf-8").strip()
-                if name and name != "default":
-                    profile_name = name  # consume stays 0: nothing to strip
-        except (UnicodeDecodeError, OSError):
-            pass  # corrupted file, skip
+                active_path = get_default_hermes_root() / "active_profile"
+                if active_path.exists():
+                    name = active_path.read_text(encoding="utf-8").strip()
+                    if name and name != "default":
+                        profile_name = name  # consume stays 0: nothing to strip; explicit stays False
+            except (UnicodeDecodeError, OSError):
+                pass  # corrupted file, skip
 
     if profile_name is None:
         return
@@ -617,11 +647,26 @@ def _apply_profile_override() -> None:
     except FileNotFoundError as exc:
         hermes_home = _resolve_sudo_user_profile_env(profile_name)
         if not hermes_home:
+            if explicit:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(
+                f"Warning: active profile {profile_name!r} does not exist "
+                "(renamed, deleted, or never created) -- falling back to the default "
+                "profile. Fix with: hermes profile use <name>.",
+                file=sys.stderr,
+            )
+            return
+    except ValueError as exc:
+        if explicit:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        print(
+            f"Warning: active profile {profile_name!r} is invalid ({exc}) -- falling back "
+            "to the default profile. Fix with: hermes profile use <name>.",
+            file=sys.stderr,
+        )
+        return
     except Exception as exc:
         # A bug in profiles.py must NEVER prevent hermes from starting
         print(f"Warning: profile override failed ({exc}), using default", file=sys.stderr)

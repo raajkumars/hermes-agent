@@ -1547,6 +1547,14 @@ def delete_profile(name: str, yes: bool = False) -> Path:
 
     # Tombstone before rmtree so a stale serve/logging mkdir cannot relist this name live.
     mark_named_profile_deleted(profile_dir)
+    # Retarget active_profile IMMEDIATELY after tombstoning, before any other step (service
+    # cleanup, multiplexer notify, identity purge, rmtree can all take real wall-clock time and
+    # each is a window where `active_profile` names a tombstoned profile). Any concurrent
+    # `hermes` invocation that reads the sticky file during that window gets a dead profile
+    # name — the fleet-wide-kill-switch failure mode. Retargeting is also protected by the
+    # soft-fallback in `_apply_profile_override`, but the window should be as close to zero
+    # as possible, not just survivable.
+    _retarget_active_profile(canon, "default", "✓ Active profile reset to default")
     # The multiplexer sees the tombstone, stops this profile's adapters and releases its handles
     # into the directory before we remove it. Identity settlement is a separate delete-only
     # operation below: an ordinary unserve must preserve identity, because a rename's old name
@@ -1598,8 +1606,7 @@ def delete_profile(name: str, yes: bool = False) -> Path:
         print(f"⚠ Could not remove {profile_dir}: {e}")
         remove_error = e
 
-    # 5. Clear active_profile if it pointed to this profile
-    _retarget_active_profile(canon, "default", "✓ Active profile reset to default")
+    # 5. active_profile was already retargeted immediately after tombstoning (above).
     if remove_error is not None:
         raise RuntimeError(f"Could not remove profile directory {profile_dir}: {remove_error}") from remove_error
     print(f"\nProfile '{canon}' deleted.")
@@ -2111,6 +2118,14 @@ def rename_profile(old_name: str, new_name: str) -> Path:
     if live_mux:
         clear_named_profile_deleted(old_dir)
 
+    # Retarget active_profile IMMEDIATELY after the directory move succeeds, before wrapper/
+    # Honcho/identity-migration steps below. Those can take real wall-clock time and each is a
+    # window where `active_profile` names old_canon, a directory that no longer exists — exactly
+    # how a merge/rename left `active_profile=prime-old` with no matching dir on disk. The
+    # directory rename and this retarget are as close to one atomic unit as the filesystem
+    # rename allows: no other step runs between them.
+    _retarget_active_profile(old_canon, new_canon, f"✓ Active profile updated: {new_canon}")
+
     # 2b. Record the rename so Bot Mode group chats can re-link persisted
     # member descriptors to the new slug (#110200). Best-effort: a metadata
     # write failure must never fail the rename itself.
@@ -2128,8 +2143,7 @@ def rename_profile(old_name: str, new_name: str) -> Path:
     else:
         print(f"⚠ Cannot create alias '{new_canon}' — {collision}")
 
-    # 5. Update active_profile if it pointed to old name
-    _retarget_active_profile(old_canon, new_canon, f"✓ Active profile updated: {new_canon}")
+    # 5. active_profile was already retargeted immediately after the directory move (above).
 
     # 6. Migrate profile-name-keyed session/routing state (session keys, profile_name, heartbeats,
     # delivery + routing index) from the old name to the new one. A stale ``agent:<old>:*`` routing
