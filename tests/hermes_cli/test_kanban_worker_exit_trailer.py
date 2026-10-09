@@ -33,7 +33,9 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def _dead_worker_with_log(conn, tid: str, pid: int, rc: int, message: str = "the model said something") -> None:
+def _dead_worker_with_log(
+    conn, tid: str, pid: int, rc: int, message: str = "the model said something", cause: str = "",
+) -> None:
     """Claim ``tid`` for a worker that already exited ``rc`` and wrote its log — never reaped here."""
     host = kb._claimer_id().split(":", 1)[0]
     kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
@@ -45,7 +47,8 @@ def _dead_worker_with_log(conn, tid: str, pid: int, rc: int, message: str = "the
     log = kb.worker_log_path(tid)
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "a", encoding="utf-8") as f:
-        f.write(f"{message}\n\nResume this session with:\n  hermes --resume x\n\n{KANBAN_WORKER_EXIT_TRAILER}{rc}\n")
+        suffix = f" cause={cause}" if cause else ""
+        f.write(f"{message}\n\nResume this session with:\n  hermes --resume x\n\n{KANBAN_WORKER_EXIT_TRAILER}{rc}{suffix}\n")
 
 
 @pytest.mark.parametrize(
@@ -138,9 +141,8 @@ def test_plain_budget_trip_requires_recovery_not_reassignment(kanban_home):
         assert task.consecutive_failures >= 2
 
 
-def test_config_fatal_trips_every_queued_card_for_the_profile(kanban_home):
-    """A missing provider key blocks the profile on the first observed exit,
-    rather than letting each card consume the normal two-crash retry budget."""
+def test_unstructured_worker_output_cannot_block_peer_cards(kanban_home):
+    """Provider-looking prose in one worker log is not authority to mutate peer cards."""
     with kbc.connect() as conn:
         failed = kb.create_task(conn, title="failed", assignee="broken-profile")
         queued = kb.create_task(conn, title="queued", assignee="broken-profile")
@@ -150,14 +152,28 @@ def test_config_fatal_trips_every_queued_card_for_the_profile(kanban_home):
             "No API key found for provider 'openrouter'",
         )
 
+        crashed = kbd.detect_crashed_workers(conn)
+
+        assert crashed == [failed]
+        assert kb.get_task(conn, failed).status == "ready"
+        assert kb.get_task(conn, queued).status == "ready"
+        assert kb.get_task(conn, other).status == "ready"
+        assert "config_fatal" not in [e.kind for e in kb.list_events(conn, queued)]
+
+
+def test_structured_provider_config_cause_blocks_the_affected_profile(kanban_home):
+    with kbc.connect() as conn:
+        failed = kb.create_task(conn, title="failed", assignee="broken-profile")
+        queued = kb.create_task(conn, title="queued", assignee="broken-profile")
+        _dead_worker_with_log(conn, failed, 72001, 1, cause="provider_config")
+
         blocked = kbd.detect_crashed_workers(conn)
 
         assert blocked == [failed]
+        assert kbd.detect_crashed_workers._last_auto_blocked == [failed, queued]
         assert kb.get_task(conn, failed).status == "blocked"
         assert kb.get_task(conn, queued).status == "blocked"
-        assert kb.get_task(conn, other).status == "ready"
-        queued_events = [e.kind for e in kb.list_events(conn, queued)]
-        assert "config_fatal" in queued_events
+        assert "config_fatal" in [event.kind for event in kb.list_events(conn, queued)]
         comment = conn.execute(
             "SELECT body FROM task_comments WHERE task_id=? ORDER BY id DESC LIMIT 1", (queued,),
         ).fetchone()
@@ -173,6 +189,9 @@ def test_exit_single_query_writes_trailer_only_for_kanban_workers(monkeypatch, c
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
     with pytest.raises(SystemExit) as exc:
-        exit_single_query(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        exit_single_query(kb.KANBAN_RATE_LIMIT_EXIT_CODE, kanban_cause="provider_config")
     assert exc.value.code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
-    assert f"{KANBAN_WORKER_EXIT_TRAILER}{kb.KANBAN_RATE_LIMIT_EXIT_CODE}" in capsys.readouterr().err
+    assert (
+        f"{KANBAN_WORKER_EXIT_TRAILER}{kb.KANBAN_RATE_LIMIT_EXIT_CODE} cause=provider_config"
+        in capsys.readouterr().err
+    )

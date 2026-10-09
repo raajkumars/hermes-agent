@@ -73,10 +73,6 @@ _RESPAWN_BLOCKER_RE = re.compile(
 # These messages mean the worker could not construct its profile/provider at
 # all. Retrying every card assigned to that profile only burns the retry budget,
 # so the first observed crash trips a profile-scoped breaker.
-_CONFIG_FATAL_RE = re.compile(
-    r"No API key found for provider|Profile\s+.+?\s+does not exist",
-    re.IGNORECASE,
-)
 
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
@@ -279,7 +275,8 @@ def _exit_code_kind(code: int) -> "tuple[str, int]":
 
 
 _EXIT_TRAILER_RE = re.compile(
-    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
+    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(?P<code>\d+)"
+    r"(?:\s+cause=(?P<cause>[a-z_]+))?\s*$", re.MULTILINE,
 )
 
 
@@ -295,8 +292,18 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
         raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
     except Exception:
         return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
-    return int(matches[-1]) if matches else None
+    matches = list(_EXIT_TRAILER_RE.finditer(raw or ""))
+    return int(matches[-1].group("code")) if matches else None
+
+
+def _worker_log_exit_cause(task_id: str, board: Optional[str] = None) -> Optional[str]:
+    """Structured cause attached to the last durable worker-exit trailer, if any."""
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+    except Exception:
+        return None
+    matches = list(_EXIT_TRAILER_RE.finditer(raw or ""))
+    return matches[-1].group("cause") if matches else None
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -1558,8 +1565,7 @@ class _DeadWorker:
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
     config_fatal: bool = False
-    """Profile/provider configuration could not be loaded; trip queued work for
-    the assignee after the first observed worker exit."""
+    """The worker emitted the structured ``provider_config`` trailer cause."""
 
     @property
     def run_outcome(self) -> str:
@@ -1583,10 +1589,10 @@ def _classify_dead_worker(
         if worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
-    if not dead.rate_limited and _CONFIG_FATAL_RE.search(dead.error_text):
+    if task_id and _worker_log_exit_cause(task_id, board=board) == "provider_config":
         dead.config_fatal = True
         dead.event_payload["config_fatal"] = True
-        dead.event_payload["config_fatal_cause"] = "missing_profile_or_provider_key"
+        dead.event_payload["config_fatal_cause"] = "provider_config"
     return dead
 
 
@@ -1744,19 +1750,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 def _trip_profile_config_fatal(
     conn: sqlite3.Connection, assignee: Optional[str], origin_task_id: str, error: str,
 ) -> list[str]:
-    """Block queued work for one misconfigured profile after its first fatal exit.
-
-    Workers already running are allowed to exit naturally, but no queued card is
-    retried: this prevents one broken profile from spending every card's retry
-    budget. ``config_fatal`` is a terminal notifier event, so subscribers are
-    alerted through the existing delivery path on the next notifier tick.
-    """
+    """Block queued work for one profile after its worker emitted a structured config cause."""
     if not assignee:
         return []
     now = int(time.time())
     reason = (
-        f"config_fatal for profile {assignee!r}: {error[:240]}. Fix the profile configuration "
-        "(provider key or profile identity), then unblock affected cards."
+        f"config_fatal for profile {assignee!r}: {error[:240]}. Fix the profile/provider configuration, "
+        "then unblock or reassign affected cards."
     )
     tripped: list[str] = []
     with _kb.write_txn(conn):
@@ -1771,13 +1771,12 @@ def _trip_profile_config_fatal(
                 "UPDATE tasks SET status = 'blocked', last_failure_error = ? WHERE id = ?",
                 (reason[:500], task_id),
             )
-            payload = {
+            _kb._append_event(conn, task_id, "config_fatal", {
                 "profile": assignee,
                 "origin_task_id": origin_task_id,
-                "cause": "missing_profile_or_provider_key",
+                "cause": "provider_config",
                 "error": error[:500],
-            }
-            _kb._append_event(conn, task_id, "config_fatal", payload)
+            })
             _kb._insert_comment(conn, task_id, "kanban-dispatcher", reason, now)
             tripped.append(task_id)
     return tripped
@@ -2260,6 +2259,47 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
     return _gated
 
 
+def _installed_profile_exists_fn() -> Optional[Callable[[str], bool]]:
+    """Raw local profile predicate, deliberately independent of claim allowlists."""
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return None
+    return profile_exists
+
+
+def _assignee_is_claimable_here(assignee: str) -> bool:
+    """Whether this home owns ``assignee`` under its optional dispatch allowlist."""
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+        allowlist = _dispatch_profile_allowlist(normalize_profile_name)
+        return allowlist is None or normalize_profile_name(assignee) in allowlist
+    except Exception:
+        # A corrupt allowlist must not let this dispatcher mutate another home's card.
+        return False
+
+
+def _block_dead_assignee(conn: sqlite3.Connection, task_id: str, assignee: str) -> bool:
+    """Durably park one task whose assigned local profile is absent or tombstoned."""
+    now = int(time.time())
+    reason = (
+        f"dead_assignee: profile {assignee!r} is not installed or is tombstoned. "
+        "Reassign this task to an installed profile or restore the profile."
+    )
+    with _kb.write_txn(conn):
+        updated = conn.execute(
+            "UPDATE tasks SET status = 'blocked', last_failure_error = ? "
+            "WHERE id = ? AND status IN ('ready', 'review') AND claim_lock IS NULL",
+            (reason[:500], task_id),
+        ).rowcount
+        if not updated:
+            return False
+        payload = {"assignee": assignee, "cause": "missing_or_tombstoned_profile"}
+        _kb._append_event(conn, task_id, "dead_assignee", payload)
+        _kb._insert_comment(conn, task_id, "kanban-dispatcher", reason, now)
+    return True
+
+
 def _dispatch_profile_allowlist(normalize_profile_name) -> Optional[frozenset]:
     """Per-home claim allowlist ``kanban.dispatch_profiles`` (#110995).
 
@@ -2620,10 +2660,19 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
-    # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
-    # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
-    # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
-    # it by assigning a profile, and health telemetry suppresses "stuck" for it.
+    # Missing/tombstoned local profiles are actionable configuration failures.
+    # Check the raw predicate before the per-home allowlist: a real foreign
+    # profile must remain queued for its owner rather than being blocked here.
+    installed_profile_exists = (
+        _installed_profile_exists_fn() if _assignee_is_claimable_here(assignee) else None
+    )
+    if installed_profile_exists is not None and not installed_profile_exists(assignee):
+        if not dry_run and _block_dead_assignee(conn, task_id, assignee):
+            result.auto_blocked.append(task_id)
+        return False
+    # Non-profile assignees / foreign profiles not claimable by this dispatcher
+    # remain a nonspawnable steady-state lane; do not turn an allowlist boundary
+    # into a board-wide mutation.
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
