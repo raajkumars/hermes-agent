@@ -70,6 +70,14 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# These messages mean the worker could not construct its profile/provider at
+# all. Retrying every card assigned to that profile only burns the retry budget,
+# so the first observed crash trips a profile-scoped breaker.
+_CONFIG_FATAL_RE = re.compile(
+    r"No API key found for provider|Profile\s+.+?\s+does not exist",
+    re.IGNORECASE,
+)
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -1549,6 +1557,9 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    config_fatal: bool = False
+    """Profile/provider configuration could not be loaded; trip queued work for
+    the assignee after the first observed worker exit."""
 
     @property
     def run_outcome(self) -> str:
@@ -1572,6 +1583,10 @@ def _classify_dead_worker(
         if worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
+    if not dead.rate_limited and _CONFIG_FATAL_RE.search(dead.error_text):
+        dead.config_fatal = True
+        dead.event_payload["config_fatal"] = True
+        dead.event_payload["config_fatal_cause"] = "missing_profile_or_provider_key"
     return dead
 
 
@@ -1726,6 +1741,48 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     return sweep
 
 
+def _trip_profile_config_fatal(
+    conn: sqlite3.Connection, assignee: Optional[str], origin_task_id: str, error: str,
+) -> list[str]:
+    """Block queued work for one misconfigured profile after its first fatal exit.
+
+    Workers already running are allowed to exit naturally, but no queued card is
+    retried: this prevents one broken profile from spending every card's retry
+    budget. ``config_fatal`` is a terminal notifier event, so subscribers are
+    alerted through the existing delivery path on the next notifier tick.
+    """
+    if not assignee:
+        return []
+    now = int(time.time())
+    reason = (
+        f"config_fatal for profile {assignee!r}: {error[:240]}. Fix the profile configuration "
+        "(provider key or profile identity), then unblock affected cards."
+    )
+    tripped: list[str] = []
+    with _kb.write_txn(conn):
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE assignee = ? "
+            "AND status IN ('todo', 'ready', 'review', 'triage')",
+            (assignee,),
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', last_failure_error = ? WHERE id = ?",
+                (reason[:500], task_id),
+            )
+            payload = {
+                "profile": assignee,
+                "origin_task_id": origin_task_id,
+                "cause": "missing_profile_or_provider_key",
+                "error": error[:500],
+            }
+            _kb._append_event(conn, task_id, "config_fatal", payload)
+            _kb._insert_comment(conn, task_id, "kanban-dispatcher", reason, now)
+            tripped.append(task_id)
+    return tripped
+
+
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
@@ -1772,6 +1829,11 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                     "protocol_violation_limit": violation_limit,
                 },
             )
+        elif dead.config_fatal:
+            row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (tid,)).fetchone()
+            assignee = row["assignee"] if row is not None else None
+            auto_blocked.extend(_trip_profile_config_fatal(conn, assignee, tid, error_text))
+            continue
         elif dead.terminal_provider:
             # A retry cannot heal a revoked credential or a missing model, so
             # the whole ``failure_limit`` budget would be spent on identical
