@@ -736,8 +736,47 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_dead_assignee(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A non-terminal card names a Hermes profile that no longer exists.
+
+    Dispatch allowlists are intentionally not consulted here: a real profile
+    owned by another dispatcher is not dead.
+    """
+    if _task_field(task, "status") in {"done", "archived"}:
+        return []
+    assignee = _task_field(task, "assignee")
+    if not assignee:
+        return []
+    profile_exists = cfg.get("profile_exists")
+    if not callable(profile_exists):
+        return []
+    try:
+        missing = not bool(profile_exists(str(assignee)))
+    except Exception:
+        return []
+    if not missing:
+        return []
+    task_id = _task_field(task, "id") or "<task_id>"
+    cmd = f"hermes kanban assign {task_id} <installed-profile>"
+    return [Diagnostic(
+        kind="dead_assignee", severity="critical",
+        title=f"Assignee profile {assignee!r} is not installed",
+        detail=(f"This non-terminal task is assigned to {assignee!r}, but that Hermes profile is "
+                "not installed (or is tombstoned) on this dispatcher. It cannot be claimed until "
+                "it is reassigned to an installed profile or the profile is restored."),
+        actions=[
+            DiagnosticAction(kind="reassign", label="Reassign to an installed profile",
+                             payload={"current_assignee": assignee}, suggested=True),
+            _cli_hint(f"Reassign: {cmd}", cmd),
+        ],
+        first_seen_at=now, last_seen_at=now, count=1,
+        data={"assignee": assignee, "task_id": task_id},
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
+    _rule_dead_assignee,
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
@@ -799,6 +838,11 @@ def config_from_runtime_config(raw_config: Optional[dict]) -> dict:
         value = raw_config.get(key)
         if value is not None:
             cfg[key] = value
+    try:
+        from hermes_cli.profiles import profile_exists
+        cfg["profile_exists"] = profile_exists
+    except Exception:
+        pass
     return cfg
 
 
@@ -840,6 +884,7 @@ def compute_task_diagnostics(
 # The whole block is removed by reverting the commit that added it.
 
 DIAGNOSTIC_KINDS = (
+    "dead_assignee",
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",
