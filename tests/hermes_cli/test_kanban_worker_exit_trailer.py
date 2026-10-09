@@ -33,7 +33,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
+def _dead_worker_with_log(conn, tid: str, pid: int, rc: int, message: str = "the model said something") -> None:
     """Claim ``tid`` for a worker that already exited ``rc`` and wrote its log — never reaped here."""
     host = kb._claimer_id().split(":", 1)[0]
     kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
@@ -45,7 +45,7 @@ def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
     log = kb.worker_log_path(tid)
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "a", encoding="utf-8") as f:
-        f.write(f"the model said something\n\nResume this session with:\n  hermes --resume x\n\n{KANBAN_WORKER_EXIT_TRAILER}{rc}\n")
+        f.write(f"{message}\n\nResume this session with:\n  hermes --resume x\n\n{KANBAN_WORKER_EXIT_TRAILER}{rc}\n")
 
 
 @pytest.mark.parametrize(
@@ -136,6 +136,32 @@ def test_plain_budget_trip_requires_recovery_not_reassignment(kanban_home):
         assert task is not None
         assert (task.status, task.assignee) == ("blocked", "other-profile")
         assert task.consecutive_failures >= 2
+
+
+def test_config_fatal_trips_every_queued_card_for_the_profile(kanban_home):
+    """A missing provider key blocks the profile on the first observed exit,
+    rather than letting each card consume the normal two-crash retry budget."""
+    with kbc.connect() as conn:
+        failed = kb.create_task(conn, title="failed", assignee="broken-profile")
+        queued = kb.create_task(conn, title="queued", assignee="broken-profile")
+        other = kb.create_task(conn, title="other", assignee="healthy-profile")
+        _dead_worker_with_log(
+            conn, failed, 72001, 1,
+            "No API key found for provider 'openrouter'",
+        )
+
+        blocked = kbd.detect_crashed_workers(conn)
+
+        assert blocked == [failed]
+        assert kb.get_task(conn, failed).status == "blocked"
+        assert kb.get_task(conn, queued).status == "blocked"
+        assert kb.get_task(conn, other).status == "ready"
+        queued_events = [e.kind for e in kb.list_events(conn, queued)]
+        assert "config_fatal" in queued_events
+        comment = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id=? ORDER BY id DESC LIMIT 1", (queued,),
+        ).fetchone()
+        assert "config_fatal" in comment["body"]
 
 
 def test_exit_single_query_writes_trailer_only_for_kanban_workers(monkeypatch, capsys):
