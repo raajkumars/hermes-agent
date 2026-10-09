@@ -143,8 +143,12 @@ def test_kanban_create_tool_accepts_real_repo_contract(
         assert task.completion_contract == "qwickapps/aos"
 
 
+@pytest.mark.parametrize("contract", [
+    "qwickapps/aos",
+    "https://github.com/qwickapps/aos/pull/659",
+])
 def test_create_task_rejects_unprotected_contract_before_persistence(
-    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, contract: str,
 ) -> None:
     from hermes_cli import kanban_pr_acceptance
 
@@ -152,7 +156,7 @@ def test_create_task_rejects_unprotected_contract_before_persistence(
     with kbc.connect_closing() as conn:
         before = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
         with pytest.raises(ValueError, match="can never pass PR acceptance"):
-            kb.create_task(conn, title="unprotected", completion_contract="qwickapps/aos")
+            kb.create_task(conn, title="unprotected", completion_contract=contract)
         assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
 
 
