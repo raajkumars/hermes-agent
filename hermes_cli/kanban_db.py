@@ -1308,9 +1308,10 @@ def create_task(
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
-    from hermes_cli.kanban_pr_acceptance import validate_contract
+    from hermes_cli.kanban_pr_acceptance import preflight_contract, validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    preflight_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -3421,9 +3422,10 @@ def rebind_contract(
     auditable ``contract_rebound`` event (old/new/reason/actor) — the durable
     trail a human reviews in ``kanban show``.
     """
-    from hermes_cli.kanban_pr_acceptance import _PR, _REPO, validate_contract
+    from hermes_cli.kanban_pr_acceptance import _PR, _REPO, preflight_contract, validate_contract
 
     new_contract = validate_contract(new_contract)
+    preflight_contract(new_contract)
 
     def _repo_of(contract: Optional[str]) -> Optional[str]:
         if contract is None or contract == "local-only":

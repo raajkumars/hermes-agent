@@ -31,6 +31,70 @@ def validate_contract(value: str | None) -> str:
     return value
 
 
+def resolve_required_checks(contract: str) -> dict:
+    """Resolve the acceptance branch and its required checks for a contract.
+
+    The same evidence drives creation-time admission and completion-time
+    acceptance. A repo contract is checked on its default branch; a PR
+    contract is checked on that PR's base branch.
+    """
+    declared = _PR.fullmatch(contract)
+    repo = declared[1] if declared else contract
+    owner, name = repo.split("/")
+    if declared:
+        number = int(declared[2])
+        query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
+            baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
+                json.dumps(owner), json.dumps(name), number)
+        pr = _api("graphql", query=query)["data"]["repository"]["pullRequest"]
+        if pr is None:
+            raise ValueError("PR is unavailable")
+        branch = pr["baseRefName"]
+        protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
+        head_sha, state = pr.get("headRefOid"), pr.get("state")
+    else:
+        query = '''{repository(owner:%s,name:%s){defaultBranchRef{name
+            branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}''' % (
+                json.dumps(owner), json.dumps(name))
+        default = _api("graphql", query=query)["data"]["repository"]["defaultBranchRef"]
+        if default is None:
+            raise ValueError("repository default branch is unavailable")
+        branch = default["name"]
+        protection = default.get("branchProtectionRule") or {}
+        head_sha, state = None, None
+    required = {(r["context"], (r.get("app") or {}).get("databaseId"))
+                for r in protection.get("requiredStatusChecks", [])}
+    rulesets_unavailable = False
+    try:
+        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+        rulesets_unavailable = True
+        rules = []
+    for page in rules:
+        for rule in page:
+            if rule["type"] == "required_status_checks":
+                required.update((r["context"], r.get("integration_id"))
+                                for r in rule["parameters"]["required_status_checks"])
+    return {
+        "repo": repo, "branch": branch, "head_sha": head_sha, "state": state,
+        "required": required, "rulesets_unavailable": rulesets_unavailable,
+    }
+
+
+def preflight_contract(contract: str) -> None:
+    """Reject contracts that cannot produce an acceptance receipt before write."""
+    if contract == "local-only":
+        return
+    try:
+        resolution = resolve_required_checks(contract)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+        raise ValueError("could not verify contract; retry or use local-only") from None
+    if not resolution["required"] and not resolution["rulesets_unavailable"]:
+        raise ValueError(
+            "contract can never pass PR acceptance; use local-only for review-only/non-CI work"
+        )
+
+
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
     command = ["gh", "api", endpoint, "--hostname", "github.com"]
     if query is not None:
@@ -59,32 +123,14 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
             return receipt
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
-        owner, name = repo.split("/")
-        query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
-            baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
-                json.dumps(owner), json.dumps(name), number)
-        pr = _api("graphql", query=query)["data"]["repository"]["pullRequest"]
-        sha, branch = pr["headRefOid"], pr["baseRefName"]
+        resolution = resolve_required_checks(contract)
+        sha, branch = resolution["head_sha"], resolution["branch"]
         receipt["head_sha"] = sha
-        if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
+        if not re.fullmatch(r"[0-9a-f]{40}", sha or "") or resolution["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
-        protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
-        required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        # A private repo on GitHub Free has no rulesets API: it answers 403
-        # "Upgrade to GitHub Pro or make this repository public". That is a plan
-        # limit, not an access failure, and letting it fall through to the generic
-        # handler reports a correctly-authenticated gh as broken. Treated as "no
-        # rulesets", which leaves the verdict to the no-required-checks branch below.
-        try:
-            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
-        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+        required = resolution["required"]
+        if resolution["rulesets_unavailable"]:
             receipt["rulesets_unavailable"] = True
-            rules = []
-        for page in rules:
-            for rule in page:
-                if rule["type"] == "required_status_checks":
-                    required.update((r["context"], r.get("integration_id"))
-                                    for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required and receipt.get("rulesets_unavailable"):
             # No repository-enforced checks exist and none CAN on this plan. Verify
