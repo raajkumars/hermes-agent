@@ -737,10 +737,16 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
 
 
 def _rule_dead_assignee(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """A non-terminal card names a Hermes profile that no longer exists.
+    """A non-terminal card names a Hermes profile this dispatcher would itself
+    try to claim and dispatch, but that profile is not installed here.
 
-    Dispatch allowlists are intentionally not consulted here: a real profile
-    owned by another dispatcher is not dead.
+    ``cfg["assignee_claimable"]`` mirrors the dispatcher's own
+    ``_assignee_is_claimable_here()`` gate (#110995): on a shared board mounted
+    across several Hermes homes, a card legitimately assigned to a profile
+    owned by ANOTHER home must read as "not mine", never as "dead" — only this
+    home's own dispatch allowlist decides what "dead" means for it. Callers
+    that don't plumb the predicate (direct rule-level tests, callers with no
+    allowlist concept) get the single-home default: everything is claimable.
     """
     if _task_field(task, "status") in {"done", "archived"}:
         return []
@@ -750,6 +756,13 @@ def _rule_dead_assignee(task, events, runs, now, cfg) -> list[Diagnostic]:
     profile_exists = cfg.get("profile_exists")
     if not callable(profile_exists):
         return []
+    claimable = cfg.get("assignee_claimable")
+    if callable(claimable):
+        try:
+            if not claimable(str(assignee)):
+                return []
+        except Exception:
+            return []
     try:
         missing = not bool(profile_exists(str(assignee)))
     except Exception:
@@ -841,6 +854,11 @@ def config_from_runtime_config(raw_config: Optional[dict]) -> dict:
     try:
         from hermes_cli.profiles import profile_exists
         cfg["profile_exists"] = profile_exists
+    except Exception:
+        pass
+    try:
+        from hermes_cli.kanban_db_dispatch import _assignee_is_claimable_here
+        cfg["assignee_claimable"] = _assignee_is_claimable_here
     except Exception:
         pass
     return cfg
