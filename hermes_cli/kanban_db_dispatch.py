@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -162,6 +163,10 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    config_fatal_recovered: list[str] = field(default_factory=list)
+    """Task ids auto-requeued this tick by :func:`_recheck_config_fatal_credentials` after
+    their profile's provider credential passed a live health check following a prior
+    ``config_fatal`` trip. One-shot per trip — see that function's docstring."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1758,10 +1763,19 @@ def _trip_profile_config_fatal(
         f"config_fatal for profile {assignee!r}: {error[:240]}. Fix the profile/provider configuration, "
         "then unblock or reassign affected cards."
     )
+    # Best-effort: name the actual provider on the card so a human (and the recovery check
+    # below) knows what to fix/re-probe, without blocking the trip on this extra subprocess call.
+    provider = None
+    try:
+        probe = _run_credential_probe(assignee, timeout=15.0)
+        if probe:
+            provider = probe.get("provider") or None
+    except Exception:
+        provider = None
     tripped: list[str] = []
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id FROM tasks WHERE assignee = ? "
+            "SELECT id, status FROM tasks WHERE assignee = ? "
             "AND status IN ('todo', 'ready', 'review', 'triage')",
             (assignee,),
         ).fetchall()
@@ -1773,6 +1787,8 @@ def _trip_profile_config_fatal(
             )
             _kb._append_event(conn, task_id, "config_fatal", {
                 "profile": assignee,
+                "provider": provider,
+                "prev_status": row["status"],
                 "origin_task_id": origin_task_id,
                 "cause": "provider_config",
                 "error": error[:500],
@@ -1780,6 +1796,159 @@ def _trip_profile_config_fatal(
             _kb._insert_comment(conn, task_id, "kanban-dispatcher", reason, now)
             tripped.append(task_id)
     return tripped
+
+
+def _config_fatal_recheck_interval_seconds() -> int:
+    """Floor between live credential re-probes for the SAME parked profile (#t_f9a0fdf7):
+    every dispatcher tick would otherwise fire one HTTP call per parked profile every ~60s."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = (load_config_readonly() or {}).get("kanban") or {}
+        val = cfg.get("config_fatal_recheck_interval_seconds")
+        return max(30, int(val)) if val is not None else 300
+    except Exception:
+        return 300
+
+
+def _config_fatal_parked_profiles(conn: sqlite3.Connection) -> list[str]:
+    """Distinct assignee profiles with at least one task still parked by an UNRECOVERED
+    ``config_fatal`` trip: the latest event recorded for the task is ``config_fatal`` itself —
+    once recovered (or re-blocked for an unrelated reason) a later event kind excludes it."""
+    rows = conn.execute(
+        "SELECT DISTINCT assignee FROM tasks t WHERE status = 'blocked' AND assignee IS NOT NULL "
+        "AND (SELECT kind FROM task_events WHERE task_id = t.id ORDER BY id DESC LIMIT 1) "
+        "= 'config_fatal'"
+    ).fetchall()
+    return [r["assignee"] for r in rows if r["assignee"]]
+
+
+def _config_fatal_last_probe_at(conn: sqlite3.Connection, assignee: str) -> Optional[int]:
+    """Timestamp of the most recent trip or recheck probe for ``assignee`` (throttle anchor)."""
+    row = conn.execute(
+        "SELECT MAX(e.created_at) AS ts FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE t.assignee = ? AND e.kind IN ('config_fatal', 'config_fatal_recheck')",
+        (assignee,),
+    ).fetchone()
+    ts = row["ts"] if row else None
+    return int(ts) if ts is not None else None
+
+
+def _run_credential_probe(profile: str, *, timeout: float = 20.0) -> Optional[dict]:
+    """Cheap authenticated-call health check for one profile's ACTIVE provider credential.
+
+    Shells out to ``hermes -p <profile> doctor --check-active-provider`` under that profile's
+    own scrubbed secret scope (same boundary a dispatched worker gets, :func:`_default_spawn`):
+    the dispatcher process itself is not bound to any one profile's secret scope, and several
+    profiles can be parked at once. Returns the probe's parsed JSON, or ``None`` when the probe
+    could not even run (binary missing, profile dir gone, timeout, malformed output) — callers
+    MUST treat ``None`` as "still unhealthy", never as a pass (fail closed).
+    """
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    from tools.environments.local import build_subprocess_env, strip_launch_profile_env
+
+    profile_arg = normalize_profile_name(profile)
+    try:
+        profile_home = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        return None
+    with _worker_profile_scope(profile_home, bind_home=False):
+        env = build_subprocess_env(scrub_secrets=True, inherit_profile_home=True)
+    env["HERMES_HOME"] = profile_home
+    strip_launch_profile_env(env, profile_home)
+    cmd = [*_resolve_hermes_argv(), "-p", profile_arg, "doctor", "--check-active-provider"]
+    try:
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception:
+        return None
+
+
+def _recover_profile_config_fatal(
+    conn: sqlite3.Connection, assignee: str, *, probe_timeout: float = 20.0,
+) -> list[str]:
+    """Re-validate ``assignee``'s active provider credential; on a confirmed pass, requeue every
+    task its ``config_fatal`` trip parked and reset the failure counter — exactly once per trip.
+    A still-failing or inconclusive probe appends a throttle-only ``config_fatal_recheck`` event
+    (no task mutation) so the NEXT tick's :func:`_config_fatal_parked_profiles` scan still finds
+    it while :func:`_config_fatal_last_probe_at` spaces out the real network calls.
+
+    Never loops: once recovered, the tasks leave ``blocked`` and their latest event becomes
+    ``config_fatal_recovered`` — :func:`_config_fatal_parked_profiles` stops selecting them. A
+    fresh crash is a brand-new ``config_fatal`` trip with its own one-shot recheck budget.
+    """
+    probe = _run_credential_probe(assignee, timeout=probe_timeout)
+    now = int(time.time())
+    if not probe or not probe.get("ok"):
+        rows = conn.execute(
+            "SELECT id FROM tasks t WHERE status = 'blocked' AND assignee = ? "
+            "AND (SELECT kind FROM task_events WHERE task_id = t.id ORDER BY id DESC LIMIT 1) "
+            "= 'config_fatal' LIMIT 1",
+            (assignee,),
+        ).fetchall()
+        if rows:
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, rows[0]["id"], "config_fatal_recheck", {
+                    "profile": assignee, "ok": False,
+                    "reason": (probe or {}).get("reason") if probe else "probe_unavailable",
+                })
+        return []
+    provider = probe.get("provider") or "?"
+    reason = (
+        f"config_fatal recovered for profile {assignee!r}: the {provider} credential now passes "
+        "a live health check. Re-queued automatically (one-shot); failure counter reset."
+    )
+    recovered: list[str] = []
+    with _kb.write_txn(conn):
+        rows = conn.execute(
+            "SELECT id FROM tasks t WHERE status = 'blocked' AND assignee = ? "
+            "AND (SELECT kind FROM task_events WHERE task_id = t.id ORDER BY id DESC LIMIT 1) "
+            "= 'config_fatal'",
+            (assignee,),
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            trip = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'config_fatal' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            prev_status = "ready"
+            if trip and trip["payload"]:
+                try:
+                    prev_status = json.loads(trip["payload"]).get("prev_status") or "ready"
+                except Exception:
+                    prev_status = "ready"
+            conn.execute(
+                "UPDATE tasks SET status = ?, consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ?",
+                (prev_status, task_id),
+            )
+            _kb._append_event(conn, task_id, "config_fatal_recovered", {
+                "profile": assignee, "provider": provider, "restored_status": prev_status,
+            })
+            _kb._insert_comment(conn, task_id, "kanban-dispatcher", reason, now)
+            recovered.append(task_id)
+    return recovered
+
+
+def _recheck_config_fatal_credentials(conn: sqlite3.Connection, board: Optional[str] = None) -> list[str]:
+    """One dispatcher-tick pass: for every profile with ``config_fatal``-parked work whose last
+    probe is past :func:`_config_fatal_recheck_interval_seconds`, re-validate its active provider
+    credential with a single cheap authenticated call and requeue on a confirmed pass. Safe to
+    call every tick — the interval floor keeps the real network calls bounded regardless of
+    dispatcher cadence."""
+    interval = _config_fatal_recheck_interval_seconds()
+    now = int(time.time())
+    recovered: list[str] = []
+    for assignee in _config_fatal_parked_profiles(conn):
+        last_probe = _config_fatal_last_probe_at(conn, assignee)
+        if last_probe is not None and now - last_probe < interval:
+            continue
+        recovered.extend(_recover_profile_config_fatal(conn, assignee))
+    return recovered
 
 
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
@@ -2833,6 +3002,7 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    result.config_fatal_recovered = _recheck_config_fatal_credentials(conn, board=board)
 
 
 def _tick_spawn_budget(
