@@ -1812,12 +1812,13 @@ def _config_fatal_recheck_interval_seconds() -> int:
 
 def _config_fatal_parked_profiles(conn: sqlite3.Connection) -> list[str]:
     """Distinct assignee profiles with at least one task still parked by an UNRECOVERED
-    ``config_fatal`` trip: the latest event recorded for the task is ``config_fatal`` itself —
-    once recovered (or re-blocked for an unrelated reason) a later event kind excludes it."""
+    ``config_fatal`` trip. A failed recovery probe records ``config_fatal_recheck`` without
+    changing the parked task, so either config-fatal lifecycle event remains eligible; recovery
+    or any unrelated later event excludes it."""
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks t WHERE status = 'blocked' AND assignee IS NOT NULL "
         "AND (SELECT kind FROM task_events WHERE task_id = t.id ORDER BY id DESC LIMIT 1) "
-        "= 'config_fatal'"
+        "IN ('config_fatal', 'config_fatal_recheck')"
     ).fetchall()
     return [r["assignee"] for r in rows if r["assignee"]]
 
@@ -1885,7 +1886,7 @@ def _recover_profile_config_fatal(
         rows = conn.execute(
             "SELECT id FROM tasks t WHERE status = 'blocked' AND assignee = ? "
             "AND (SELECT kind FROM task_events WHERE task_id = t.id ORDER BY id DESC LIMIT 1) "
-            "= 'config_fatal' LIMIT 1",
+            "IN ('config_fatal', 'config_fatal_recheck') LIMIT 1",
             (assignee,),
         ).fetchall()
         if rows:
@@ -1905,7 +1906,7 @@ def _recover_profile_config_fatal(
         rows = conn.execute(
             "SELECT id FROM tasks t WHERE status = 'blocked' AND assignee = ? "
             "AND (SELECT kind FROM task_events WHERE task_id = t.id ORDER BY id DESC LIMIT 1) "
-            "= 'config_fatal'",
+            "IN ('config_fatal', 'config_fatal_recheck')",
             (assignee,),
         ).fetchall()
         for row in rows:

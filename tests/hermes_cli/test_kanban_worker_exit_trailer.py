@@ -232,29 +232,54 @@ def test_recheck_requeues_once_after_credential_recovers(kanban_home, monkeypatc
         assert kbd._recheck_config_fatal_credentials(conn) == []
 
 
-def test_recheck_stays_parked_while_credential_still_fails(kanban_home, monkeypatch):
-    """A probe that still fails appends a throttle-only recheck event and leaves the card
-    blocked — never a silent requeue on an inconclusive or failing check."""
-    monkeypatch.setattr(kbd, "_config_fatal_recheck_interval_seconds", lambda: 0)
+def test_recheck_recovers_after_failed_probe_once_interval_elapses(kanban_home, monkeypatch):
+    """A failed recheck stays parked and throttled, then a later healthy probe requeues once."""
+    clock = [1_000]
+    calls: list[str] = []
+    responses = iter((
+        {"ok": False, "provider": "openrouter", "reason": "credential_rejected"},
+        {"ok": False, "provider": "openrouter", "reason": "credential_rejected"},
+        {"ok": True, "provider": "openrouter"},
+    ))
+    monkeypatch.setattr(kbd.time, "time", lambda: clock[0])
+    monkeypatch.setattr(kbd, "_config_fatal_recheck_interval_seconds", lambda: 5)
     monkeypatch.setattr(
         kbd, "_run_credential_probe",
-        lambda profile, timeout=20.0: {
-            "ok": False, "provider": "openrouter", "reason": "credential_rejected",
-        },
+        lambda profile, timeout=20.0: (calls.append(profile), next(responses))[1],
     )
     with kbc.connect() as conn:
         failed = kb.create_task(conn, title="failed", assignee="broken-profile")
         _dead_worker_with_log(conn, failed, 72001, 1, cause="provider_config")
         kbd.detect_crashed_workers(conn)
 
-        recovered = kbd._recheck_config_fatal_credentials(conn)
+        # The initial config-fatal trip itself is the first probe. At the interval boundary,
+        # the next failed probe records a recheck without unblocking the task.
+        clock[0] += 5
+        assert kbd._recheck_config_fatal_credentials(conn) == []
 
-        assert recovered == []
         task = kb.get_task(conn, failed)
+        assert task is not None
         assert task.status == "blocked"
         last_event = kb.list_events(conn, failed)[-1]
         assert last_event.kind == "config_fatal_recheck"
         assert last_event.payload["ok"] is False
+
+        # A dispatcher tick inside the interval must not probe again.
+        clock[0] += 1
+        assert kbd._recheck_config_fatal_credentials(conn) == []
+        assert calls == ["broken-profile", "broken-profile"]
+
+        # Once the recheck interval elapses and the credential heals, restore precisely once.
+        clock[0] += 4
+        assert kbd._recheck_config_fatal_credentials(conn) == [failed]
+        assert kb.get_task(conn, failed).status == "ready"
+        assert [event.kind for event in kb.list_events(conn, failed)].count(
+            "config_fatal_recovered",
+        ) == 1
+
+        clock[0] += 5
+        assert kbd._recheck_config_fatal_credentials(conn) == []
+        assert calls == ["broken-profile", "broken-profile", "broken-profile"]
 
 
 def test_recheck_throttles_repeat_probes_within_interval(kanban_home, monkeypatch):
