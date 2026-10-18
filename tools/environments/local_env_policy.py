@@ -14,6 +14,14 @@ _HERMES_PROVIDER_ENV_FORCE_PREFIX = "_HERMES_FORCE_"
 # blocklisted name (GHSA-rhgp-j443-p4rf), so blocking it would be unrecoverable.
 _AWS_SDK_CREDENTIAL_ENV_VARS = frozenset({"AWS_BEARER_TOKEN_BEDROCK"})
 
+# Secrets-service master key (hermes-secrets-plugin): one key reads EVERY stored secret, and the
+# plugin reads it in-process via os.getenv, so no child needs it. A terminal ``env`` dump exposed it
+# because the terminal scrub only drops blocklisted names; listed in BOTH tiers so the terminal,
+# background, remote-forward and inherit_credentials surfaces all drop it.
+_SECRETS_SERVICE_KEY_ENV_VARS = frozenset({
+    "SECRETS_SERVICE_KEY", "SECRETS_API_SERVICE_KEY", "QWICKSECRETS_SERVICE_KEY",
+})
+
 _STATIC_PROVIDER_ENV_BLOCKLIST = frozenset({
     "OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_API_BASE", "OPENAI_ORG_ID",
     "OPENAI_ORGANIZATION", "OPENROUTER_API_KEY", "ANTHROPIC_BASE_URL",
@@ -38,6 +46,7 @@ _STATIC_PROVIDER_ENV_BLOCKLIST = frozenset({
     "DAYTONA_API_KEY", "GATEWAY_RELAY_ID", "GATEWAY_RELAY_SECRET",
     "GATEWAY_RELAY_DELIVERY_KEY", "VERCEL_OIDC_TOKEN", "VERCEL_TOKEN",
     "VERCEL_PROJECT_ID", "VERCEL_TEAM_ID",
+    *_SECRETS_SERVICE_KEY_ENV_VARS,
 })
 
 
@@ -254,4 +263,5 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "HASS_TOKEN", "EMAIL_PASSWORD", "HERMES_DASHBOARD_SESSION_TOKEN",
     # Remote-compute / infrastructure secrets
     "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY",
+    *_SECRETS_SERVICE_KEY_ENV_VARS,
 })
