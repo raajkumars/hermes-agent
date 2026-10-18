@@ -1450,13 +1450,25 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 
+def _cmd_clone(args: argparse.Namespace) -> int:
+    """Create an isolated clone backed by Kanban's immutable Git object cache."""
+    from hermes_cli.kanban_git_cache import GitReferenceCacheError, clone_with_reference
+
+    try:
+        destination = clone_with_reference(args.repository, args.destination, branch=args.branch)
+    except GitReferenceCacheError as exc:
+        return _err(f"kanban clone: {exc}")
+    print(destination)
+    return 0
+
+
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
-    "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
+    "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim, "clone": _cmd_clone,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "rebind-contract": _cmd_rebind_contract,
