@@ -10,6 +10,7 @@ normal ``git fetch`` continues to contact its origin.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import shutil
@@ -90,10 +91,15 @@ def ensure_reference_cache(repository: str) -> Path:
             raise GitReferenceCacheError(f"could not create reference cache for {repository!r}: {detail}")
         try:
             os.rename(temporary, cache)
-        except FileExistsError:
-            # Another worker safely published the same immutable cache first.
+        except OSError as error:
+            # Publishing a non-empty directory over a concurrently-published
+            # non-empty cache is platform-specific: Linux may report EEXIST or
+            # ENOTEMPTY rather than FileExistsError.  Only accept those races
+            # after proving the winner published a usable bare repository.
+            if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise
             if not _is_bare_repository(cache):
-                raise GitReferenceCacheError(f"published cache is not a bare repository: {cache}")
+                raise GitReferenceCacheError(f"published cache is not a bare repository: {cache}") from error
         if not _is_bare_repository(cache):
             raise GitReferenceCacheError(f"reference cache was not published as a bare repository: {cache}")
         return cache

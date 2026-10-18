@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -90,6 +92,40 @@ def test_invalid_cache_path_is_not_deleted_or_replaced(kanban_home, tmp_path):
         cache.clone_with_reference(str(remote), tmp_path / "destination")
 
     assert sentinel.read_text(encoding="utf-8") == "do not delete\n"
+
+
+def test_concurrent_creators_share_one_immutable_published_cache(kanban_home, tmp_path, monkeypatch):
+    _source, remote = _make_remote(tmp_path)
+    reference = cache.reference_cache_path(str(remote))
+    original_rename = cache.os.rename
+    original_rmtree = cache.shutil.rmtree
+    publishers = 4
+    publish_barrier = threading.Barrier(publishers)
+    removed_paths: list[Path] = []
+
+    def synchronized_rename(source, destination):
+        if Path(destination) == reference:
+            publish_barrier.wait(timeout=15)
+        return original_rename(source, destination)
+
+    def recording_rmtree(path, *args, **kwargs):
+        removed_paths.append(Path(path))
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(cache.os, "rename", synchronized_rename)
+    monkeypatch.setattr(cache.shutil, "rmtree", recording_rmtree)
+
+    with ThreadPoolExecutor(max_workers=publishers) as executor:
+        destinations = [tmp_path / f"workspace-{index}" for index in range(publishers)]
+        clones = list(executor.map(lambda destination: cache.clone_with_reference(str(remote), destination), destinations))
+
+    assert clones == destinations
+    assert cache._is_bare_repository(reference)
+    assert all((clone / ".git").is_dir() for clone in clones)
+    assert all(_git(clone, "rev-parse", "HEAD") == _git(reference, "rev-parse", "HEAD") for clone in clones)
+    # Creators discard only their private staging mirrors; the published cache
+    # must never be selected for cleanup by a losing creator.
+    assert reference not in removed_paths
 
 
 def test_clone_command_uses_the_cache_backed_clone_path(kanban_home, tmp_path, capsys):
