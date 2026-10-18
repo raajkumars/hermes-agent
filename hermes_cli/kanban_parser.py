@@ -265,6 +265,11 @@ _SPECS = [
         _TASK_ID,
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),
     ], help="Atomically claim a ready task (prints resolved workspace path)"),
+    _cmd("clone", [
+        _arg("repository", help="Git repository URL or local path"),
+        _arg("destination", help="New workspace directory (must not already exist)"),
+        _arg("--branch", help="Branch or tag to check out"),
+    ], help="Clone using a persistent immutable object cache (saves disk across task workspaces)"),
     _cmd("comment", [
         _TASK_ID,
         _arg("text", nargs="+", help="Comment body"),

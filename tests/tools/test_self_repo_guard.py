@@ -412,10 +412,10 @@ class TestBlockMessageGuidance:
     on most distros — parallel salvage clones running npm ci filled a 32GB
     tmpfs to 97% in one campaign)."""
 
-    def test_message_recommends_shared_clone_on_disk(self, repo):
+    def test_message_recommends_cache_backed_clone_on_disk(self, repo):
         hit, msg = _detect("git rebase origin/main", repo, repo)
         assert hit is True
-        assert "git clone --shared" in msg
+        assert "hermes kanban clone" in msg
         assert "scratch" in msg
 
     def test_message_warns_against_tmp_for_dep_installs(self, repo):
