@@ -70,6 +70,20 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# How long a quota/auth-flavoured failure keeps a card parked. Without a window
+# `blocker_auth` is permanent: the text stays stamped on the row and no CLI
+# clears it, so a card whose cause was fixed never retries. The
+# consecutive-failure breaker still owns the repeat case.
+_RESPAWN_BLOCKER_WINDOW = 3600  # 1 hour
+
+# A local filesystem error is not a provider auth wall, even though it says
+# "Permission denied". Treating one as a blocker parked t_3b0c89ea behind three
+# root-owned log files.
+_LOCAL_FS_ERROR_RE = re.compile(
+    r"\[Errno \d+\]|\bOSError\b|\bPermissionError\b|\bIsADirectoryError\b|"
+    r"\bFileNotFoundError\b",
+)
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -2085,8 +2099,13 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+    if (err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err)
+            and not _LOCAL_FS_ERROR_RE.search(err)):
+        # Hold only while the stamped failure is fresh. An unknown age still
+        # holds (fail closed); a stale one retries, and the breaker owns repeats.
+        blocked_at = latest_run["ended_at"] if latest_run is not None else None
+        if blocked_at is None or (now - int(blocked_at)) < _RESPAWN_BLOCKER_WINDOW:
+            return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
     # are the canonical *inputs* to a review handoff, not duplicate-work signals.
@@ -2152,6 +2171,10 @@ def check_respawn_guard(
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
+        # A merged/closed PR is not a duplicate-work risk. `pr_state` is the
+        # pr-drain timer's cache; unknown means still guarded (fail closed).
+        if _pr_settled(conn, body):
+            continue
         return "active_pr"
 
     return None
@@ -2239,6 +2262,30 @@ def _is_explicit_pr_continuation(
     ))
     return explicit_review or explicit_merge_continuation
 
+
+def _pr_settled(conn: sqlite3.Connection, body: str) -> bool:
+    """True only when `pr_state` positively records this PR as merged/closed.
+
+    The dispatcher never calls GitHub - the `pr-drain` timer refreshes the cache.
+    A missing table, a missing row or a stale row all mean "unknown", which keeps
+    the active_pr guard in force: the guard can only be loosened for a PR we have
+    actually observed to be settled.
+    """
+    urls = _RESPAWN_GUARD_PR_URL_RE.findall(body or "")
+    if not urls:
+        return False
+    try:
+        rows = conn.execute(
+            "SELECT url FROM pr_state WHERE state IN ('merged','closed')"
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    settled = {r[0] for r in rows}
+    found = _PR_URL_CAPTURE_RE.findall(body or "")
+    return any(u in settled for u in found)
+
+
+_PR_URL_CAPTURE_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/\d+")
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
     """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
