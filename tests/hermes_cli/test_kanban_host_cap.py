@@ -108,6 +108,42 @@ def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
     assert captured.get("max_in_progress") == 7
 
 
+def test_gateway_dispatcher_returns_the_shared_pacing_decision(kanban_home, monkeypatch):
+    """Gateway ticks reach the same dispatch budget that emits pace telemetry."""
+    import json
+
+    from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
+
+    state_path = kanban_home / "state" / "provider_pace.json"
+    state_path.parent.mkdir()
+    state_path.write_text(json.dumps({
+        "generated_at": time.time(),
+        "chain": ["claude-subscription", "openai-codex"],
+        "reserved_lane_pct": 15,
+        "providers": {
+            "claude-subscription": {
+                "five_hour_used_pct": 80, "five_hour_allowed_pct": 20,
+                "weekly_used_pct": None, "weekly_allowed_pct": None, "error": None,
+            },
+            "openai-codex": {
+                "five_hour_used_pct": 80, "five_hour_allowed_pct": 40,
+                "weekly_used_pct": None, "weekly_allowed_pct": None, "error": None,
+            },
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {})
+    dispatcher = _KanbanDispatcher(
+        kb,
+        _DispatcherSettings(60.0, None, 8, 2, 0, True, None, None),
+    )
+
+    result = dispatcher.tick_once_for_board(kb.DEFAULT_BOARD)
+
+    assert isinstance(result, kb.DispatchResult)
+    assert result.pacing_throttle is not None
+    assert result.pacing_throttle["effective_cap"] == 2
+
+
 def test_configured_max_in_progress_parsing(monkeypatch):
     import hermes_cli.config as cfgmod
 
