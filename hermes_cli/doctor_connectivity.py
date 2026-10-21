@@ -403,6 +403,47 @@ def _probe_github_token() -> ProbeResult:
     return _row(name, "fail", f"(HTTP {r.status_code} from api.github.com)")
 
 
+def probe_active_provider_credential(timeout: float = 10.0) -> dict:
+    """Cheap, read-only verdict on THIS profile's ACTIVE provider credential — the one the next
+    agent turn would actually use — for automation that needs a boolean rather than the full
+    doctor report (``hermes doctor --check-active-provider``; the Kanban dispatcher's
+    config_fatal recovery check runs it as a subprocess per parked profile).
+
+    Returns ``{"ok": bool, "provider": str | None, "reason": str, "detail": str}``. Any
+    ambiguous outcome (resolution failure, network error, a non-200/401/403/429 status) reports
+    ``ok=False`` — fail closed, never let an inconclusive probe look like a healthy credential.
+    """
+    from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
+    try:
+        runtime = resolve_runtime_provider()
+    except Exception as exc:
+        return {"ok": False, "provider": None, "reason": "resolve_failed",
+                "detail": format_runtime_provider_error(exc)}
+    provider = runtime.get("provider") or ""
+    cred = runtime.get("api" + "_key")
+    base_url = (runtime.get("base_url") or "").rstrip("/")
+    if callable(cred):
+        # A callable credential (Azure Entra ID, etc.) mints a fresh token per request;
+        # resolving it successfully here already exercised that token-acquisition path.
+        return {"ok": True, "provider": provider, "reason": "callable_credential", "detail": ""}
+    if not (isinstance(cred, str) and cred) or not base_url:
+        return {"ok": False, "provider": provider, "reason": "no_credential",
+                "detail": "No usable API key / base URL resolved for the active provider."}
+    try:
+        import httpx
+        resp = httpx.get(base_url + "/models",
+                          headers={"Authorization": f"Bearer {cred}", "User-Agent": _HERMES_USER_AGENT},
+                          timeout=timeout)
+    except Exception as exc:
+        return {"ok": False, "provider": provider, "reason": "network_error", "detail": str(exc)}
+    if resp.status_code in (200, 429):  # 429 = valid key, rate-limited
+        return {"ok": True, "provider": provider, "reason": "", "detail": f"HTTP {resp.status_code}"}
+    if resp.status_code in (401, 403):
+        return {"ok": False, "provider": provider, "reason": "credential_rejected",
+                "detail": f"HTTP {resp.status_code}"}
+    return {"ok": False, "provider": provider, "reason": "inconclusive", "detail": f"HTTP {resp.status_code}"}
+
+
 def build_probes() -> list:
     """(label, callable) pairs in display order."""
     global _APIKEY_PROVIDERS_CACHE
