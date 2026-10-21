@@ -434,7 +434,11 @@ def _require_token(request: Request) -> None:
     ``gated_auth_middleware`` already 401'd anything without a verified
     ``request.state.session`` — requiring the absent token here would make every
     ``_require_token`` endpoint unreachable behind the gate, so defer to it.
+    Either mode also accepts a principal the token-auth seam verified for this exact
+    route with that route's required scope (``token_authenticated``).
     """
+    if getattr(request.state, "token_authenticated", False):
+        return
     if getattr(request.app.state, "auth_required", False):
         ok = getattr(request.state, "session", None) is not None
     else:

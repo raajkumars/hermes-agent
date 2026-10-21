@@ -1,0 +1,7 @@
+name: idle_proof
+version: 1.0.0
+description: "Dashboard auth provider — owner-only machine credential for GET /api/health/idle on an auth-gated (non-loopback) dashboard. Verifies an Authorization bearer against HERMES_DASHBOARD_IDLE_SECRET (constant-time) and registers only that route, with a required scope, as token-authable. Non-exclusive: cookie and loopback session-token callers are unaffected. Fails CLOSED on a weak (< 256-bit) secret. No-op when the env var is unset."
+author: NousResearch
+kind: backend
+requires_env:
+  - HERMES_DASHBOARD_IDLE_SECRET
