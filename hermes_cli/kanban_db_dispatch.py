@@ -1437,6 +1437,20 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+def _is_hermes_cli_startup_import_error(error_text: str) -> bool:
+    """True for the pre-startup package-shadowing failure this dispatcher can diagnose.
+
+    The worker never reaches its lifecycle tools in this case, so retrying the
+    same command only recreates the identical crash. Keep the signature narrow:
+    other application ImportErrors remain subject to the normal retry budget.
+    """
+    normalized = " ".join(error_text.lower().split())
+    return (
+        "importerror: cannot import name '__version__' from 'hermes_cli'" in normalized
+        or 'importerror: cannot import name "__version__" from "hermes_cli"' in normalized
+    )
+
+
 # ~96% of "clean exit without a terminal tool call" tasks complete on a later
 # run, so a protocol violation gets a bounded retry before the breaker trips.
 # The budget is a violation-only STREAK (``_protocol_violation_streak``),
@@ -1785,6 +1799,19 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
+            )
+        elif _is_hermes_cli_startup_import_error(error_text):
+            # This occurs before the worker can call a lifecycle tool. A retry
+            # with unchanged startup state is guaranteed to spin, so surface a
+            # single sticky failure for an operator instead.
+            tripped = _record_task_failure(
+                conn, tid,
+                error=error_text,
+                outcome="crashed",
+                force_trip=True,
+                release_claim=False,
+                end_run=False,
+                event_payload_extra={"pid": pid, "claimer": claimer, "startup_import_error": True},
             )
         else:
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
@@ -3113,6 +3140,23 @@ def _module_hermes_argv() -> list[str]:
     return [sys.executable, "-m", "hermes_cli.main"]
 
 
+def _propagate_module_import_root(cmd: list[str], env: dict[str, str]) -> None:
+    """Pin the running tree for a module-form worker launched from its workspace.
+
+    ``python -m`` prepends the worker's current directory to ``sys.path``.  A
+    workspace that has a top-level ``hermes_cli/`` directory can therefore
+    shadow an editable install as a namespace package before startup.  Prepend
+    this source tree explicitly so its regular package wins while preserving
+    the workspace as the child cwd.  A resolved executable owns its imports
+    and is intentionally left untouched.
+    """
+    if cmd[1:3] != ["-m", "hermes_cli.main"]:
+        return
+    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+
+    pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
+
+
 def _absolute_hermes_path(path: str) -> str:
     """Return an absolute filesystem path for a resolved Hermes shim."""
     expanded = os.path.expanduser(path)
@@ -3533,6 +3577,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    _propagate_module_import_root(cmd, env)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
