@@ -1516,10 +1516,26 @@ def start_server(
                 initial_profile=initial_profile,
                 start_mcp_discovery_after_bind=start_mcp_discovery_after_bind,
             )
+            # Owner-only same-host idle proof for supervisors (systemd units carry no session
+            # token); see web_server_idle_socket. Non-fatal: no socket == indeterminate.
+            idle_socket = None
+            try:
+                from hermes_cli.web_server_idle_socket import DashboardIdleSocket
+                from hermes_constants import get_process_hermes_home
 
-            await server.main_loop()
-            if server.started:
-                await server.shutdown()
+                idle_socket = DashboardIdleSocket(get_process_hermes_home(), host,
+                                                  _read_bound_port(server, fallback=port))
+                idle_socket.start()
+            except Exception:
+                _log.warning("dashboard idle socket not started", exc_info=True)
+
+            try:
+                await server.main_loop()
+                if server.started:
+                    await server.shutdown()
+            finally:
+                if idle_socket is not None:
+                    idle_socket.stop()
 
     _run_serve(_serve, config, host, port)
 
