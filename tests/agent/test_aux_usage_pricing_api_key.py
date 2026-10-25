@@ -186,3 +186,87 @@ async def test_async_fallback_forwards_client_key_to_aux_usage(monkeypatch):
         "base_url": "https://fallback.example/v1",
         "api_key": "fallback-key",
     }
+
+
+def test_sync_recovery_call_forwards_key_to_aux_usage_without_relay_kwargs(monkeypatch):
+    import agent.aux_accounting as accounting
+    import agent.auxiliary_client as aux
+
+    response = _response()
+    primary_client = SimpleNamespace(api_key="primary-key", base_url="https://primary.example/v1")
+    recovery_client = SimpleNamespace(api_key="recovery-key", base_url="https://recovery.example/v1")
+    req = aux._PreparedAuxRequest(
+        primary_client, "keyless-model", {}, "openai", "openai", "keyless-model",
+        "https://primary.example/v1", "primary-key", "responses", 30.0, {},
+        "https://primary.example/v1",
+    )
+    captured = {}
+
+    def recovery_ladder():
+        return (yield aux._LadderStep("call", (recovery_client, {})))
+
+    calls = iter([RuntimeError("primary failed"), response])
+    def relay(*args, **kwargs):
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(aux, "_plan_aux_call", lambda *args, **kwargs: (req, {}, {}))
+    monkeypatch.setattr(aux, "_relay_sync_completion", relay)
+    monkeypatch.setattr(aux, "_start_recovery_ladder", lambda *args, **kwargs: recovery_ladder())
+    monkeypatch.setattr(
+        accounting, "record_aux_usage",
+        lambda _response, _task, **kwargs: captured.update(task=_task, **kwargs),
+    )
+
+    assert aux._call_llm_impl(task="compression", messages=[]) is response
+    assert captured == {
+        "task": "compression",
+        "provider": "openai",
+        "base_url": "https://recovery.example/v1",
+        "api_key": "recovery-key",
+    }
+
+
+@pytest.mark.asyncio
+async def test_async_recovery_call_forwards_key_to_aux_usage_without_relay_kwargs(monkeypatch):
+    import agent.aux_accounting as accounting
+    import agent.auxiliary_client as aux
+
+    response = _response()
+    primary_client = SimpleNamespace(api_key="primary-key", base_url="https://primary.example/v1")
+    recovery_client = SimpleNamespace(api_key="recovery-key", base_url="https://recovery.example/v1")
+    req = aux._PreparedAuxRequest(
+        primary_client, "keyless-model", {}, "openai", "openai", "keyless-model",
+        "https://primary.example/v1", "primary-key", "responses", 30.0, {},
+        "https://primary.example/v1",
+    )
+    captured = {}
+
+    def recovery_ladder():
+        return (yield aux._LadderStep("call", (recovery_client, {})))
+
+    calls = iter([RuntimeError("primary failed"), response])
+
+    async def relay(*args, **kwargs):
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(aux, "_plan_aux_call", lambda *args, **kwargs: (req, {}, {}))
+    monkeypatch.setattr(aux, "_relay_async_completion", relay)
+    monkeypatch.setattr(aux, "_start_recovery_ladder", lambda *args, **kwargs: recovery_ladder())
+    monkeypatch.setattr(
+        accounting, "record_aux_usage",
+        lambda _response, _task, **kwargs: captured.update(task=_task, **kwargs),
+    )
+
+    assert await aux._async_call_llm_impl(task="compression", messages=[]) is response
+    assert captured == {
+        "task": "compression",
+        "provider": "openai",
+        "base_url": "https://recovery.example/v1",
+        "api_key": "recovery-key",
+    }

@@ -8007,9 +8007,9 @@ def _call_llm_impl(
             if kind == "call":
                 return _validate_llm_response(
                     _relay_sync_completion(*args, **kw), task,
+                    provider=kw["provider"],
                     base_url=str(getattr(args[0], "base_url", "") or ""),
                     api_key=_client_api_key_for_usage(args[0]),
-                    **kw,
                 )
             if kind == "retry":
                 return _retry_same_provider_sync(**kw)
@@ -8159,9 +8159,9 @@ async def _async_call_llm_impl(
             if kind == "call":
                 return _validate_llm_response(
                     await _relay_async_completion(*args, **kw), task,
+                    provider=kw["provider"],
                     base_url=str(getattr(args[0], "base_url", "") or ""),
                     api_key=_client_api_key_for_usage(args[0]),
-                    **kw,
                 )
             if kind == "retry":
                 return await _retry_same_provider_async(**kw)
