@@ -431,9 +431,29 @@ def probe_active_provider_credential(timeout: float = 10.0) -> dict:
                 "detail": "No usable API key / base URL resolved for the active provider."}
     try:
         import httpx
-        resp = httpx.get(base_url + "/models",
-                          headers={"Authorization": f"Bearer {cred}", "User-Agent": _HERMES_USER_AGENT},
-                          timeout=timeout)
+        api_mode = str(runtime.get("api_mode") or "").strip().lower()
+        if api_mode == "anthropic_messages":
+            # Native Anthropic does not accept the generic Bearer /models probe. Normalise exactly
+            # as its client does (including Azure's api-version), then use the native auth family.
+            from agent.anthropic_adapter import _COMMON_BETAS, _OAUTH_ONLY_BETAS, _base_client_kwargs
+            from agent.anthropic_credentials import _is_oauth_token
+            from agent.anthropic_endpoints import _requires_bearer_auth
+
+            normalized, kwargs = _base_client_kwargs(base_url, None)
+            is_oauth = _is_oauth_token(cred)
+            headers = {"anthropic-version": "2023-06-01", "User-Agent": _HERMES_USER_AGENT}
+            if is_oauth or _requires_bearer_auth(normalized):
+                headers["Authorization"] = f"Bearer {cred}"
+            else:
+                headers["x-api-key"] = cred
+            if is_oauth:
+                headers["anthropic-beta"] = ",".join(_COMMON_BETAS + _OAUTH_ONLY_BETAS)
+            resp = httpx.get(normalized + "/v1/models", headers=headers,
+                             params=kwargs.get("default_query"), timeout=timeout)
+        else:
+            resp = httpx.get(base_url + "/models",
+                             headers={"Authorization": f"Bearer {cred}", "User-Agent": _HERMES_USER_AGENT},
+                             timeout=timeout)
     except Exception as exc:
         return {"ok": False, "provider": provider, "reason": "network_error", "detail": str(exc)}
     if resp.status_code in (200, 429):  # 429 = valid key, rate-limited
