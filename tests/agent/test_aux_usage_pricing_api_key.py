@@ -105,3 +105,84 @@ async def test_async_primary_forwards_resolved_key_to_aux_usage(monkeypatch):
         "base_url": "https://keyless.example/v1",
         "api_key": "resolved-key",
     }
+
+
+def test_sync_same_provider_retry_forwards_rebuilt_client_key_to_aux_usage(monkeypatch):
+    import agent.aux_accounting as accounting
+    import agent.auxiliary_client as aux
+
+    response = _response()
+    client = SimpleNamespace(api_key="retry-key", base_url="https://retry.example/v1")
+    captured = {}
+
+    monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (client, "keyless-model"))
+    monkeypatch.setattr(aux, "_relay_sync_completion", lambda *args, **kwargs: response)
+    monkeypatch.setattr(
+        accounting, "record_aux_usage",
+        lambda _response, _task, **kwargs: captured.update(task=_task, **kwargs),
+    )
+
+    assert aux._retry_same_provider_sync(
+        task="compression",
+        resolved_provider="openai",
+        resolved_model="keyless-model",
+        resolved_base_url="https://retry.example/v1",
+        resolved_api_key="stale-key",
+        resolved_api_mode=None,
+        main_runtime=None,
+        final_model="keyless-model",
+        messages=[],
+        temperature=None,
+        max_tokens=None,
+        tools=None,
+        effective_timeout=30.0,
+        effective_extra_body={},
+        reasoning_config=None,
+    ) is response
+
+    assert captured == {
+        "task": "compression",
+        "provider": "openai",
+        "base_url": "https://retry.example/v1",
+        "api_key": "retry-key",
+    }
+
+
+@pytest.mark.asyncio
+async def test_async_fallback_forwards_client_key_to_aux_usage(monkeypatch):
+    import agent.aux_accounting as accounting
+    import agent.auxiliary_client as aux
+
+    response = _response()
+    client = SimpleNamespace(api_key="fallback-key", base_url="https://fallback.example/v1")
+    captured = {}
+
+    async def relay(*args, **kwargs):
+        return response
+
+    monkeypatch.setattr(aux, "_relay_async_completion", relay)
+    monkeypatch.setattr(
+        accounting, "record_aux_usage",
+        lambda _response, _task, **kwargs: captured.update(task=_task, **kwargs),
+    )
+
+    assert await aux._call_fallback_candidate_async(
+        client,
+        "keyless-model",
+        "fallback_chain[0](openai)",
+        task="compression",
+        messages=[],
+        temperature=None,
+        max_tokens=None,
+        tools=None,
+        effective_timeout=30.0,
+        effective_extra_body={},
+        reasoning_config=None,
+    ) is response
+
+    assert captured == {
+        "task": "compression",
+        "provider": "openai",
+        "base_url": "https://fallback.example/v1",
+        "api_key": "fallback-key",
+    }

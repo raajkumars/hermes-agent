@@ -3708,7 +3708,11 @@ def _retry_same_provider_sync(*, resolved_provider: str, resolved_api_mode: Opti
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=False, **prep,
     )
     return _validate_llm_response(
-        _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode), task,
+        _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
+        task,
+        provider=resolved_provider,
+        base_url=str(getattr(retry_client, "base_url", "") or ""),
+        api_key=_client_api_key_for_usage(retry_client),
     )
 
 
@@ -3719,6 +3723,9 @@ async def _retry_same_provider_async(*, resolved_provider: str, resolved_api_mod
     return _validate_llm_response(
         await _relay_async_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
         task,
+        provider=resolved_provider,
+        base_url=str(getattr(retry_client, "base_url", "") or ""),
+        api_key=_client_api_key_for_usage(retry_client),
     )
 
 
@@ -4053,6 +4060,9 @@ def _call_fallback_candidate_sync(
                 ),
             ),
             task,
+            provider=dest.provider,
+            base_url=dest.base_url,
+            api_key=_client_api_key_for_usage(client),
         )
     from agent.auxiliary_fallback_recovery import send_with_parameter_rungs
 
@@ -4103,6 +4113,9 @@ async def _call_fallback_candidate_async(
         return _validate_llm_response(
             await _relay_async_completion(client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode),
             task,
+            provider=dest.provider,
+            base_url=dest.base_url,
+            api_key=_client_api_key_for_usage(client),
         )
     from agent.auxiliary_fallback_recovery import send_with_parameter_rungs_async
 
@@ -6671,6 +6684,12 @@ def _validate_llm_response(
     return response
 
 
+def _client_api_key_for_usage(client: Any) -> Optional[str]:
+    """Return a concrete client credential for pricing without invoking key providers."""
+    api_key = getattr(client, "api_key", None)
+    return api_key if isinstance(api_key, str) else None
+
+
 def _complete_relay_auxiliary_call(*, outcome: str = "success") -> None:
     """Close one auxiliary logical call after acceptance or terminal failure."""
     context = _RELAY_AUX_CALL_CONTEXT.get()
@@ -7986,7 +8005,12 @@ def _call_llm_impl(
         def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
-                return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
+                return _validate_llm_response(
+                    _relay_sync_completion(*args, **kw), task,
+                    base_url=str(getattr(args[0], "base_url", "") or ""),
+                    api_key=_client_api_key_for_usage(args[0]),
+                    **kw,
+                )
             if kind == "retry":
                 return _retry_same_provider_sync(**kw)
             return _call_fallback_candidate_sync(*args, **kw)
@@ -8133,7 +8157,12 @@ async def _async_call_llm_impl(
         async def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
-                return _validate_llm_response(await _relay_async_completion(*args, **kw), task)
+                return _validate_llm_response(
+                    await _relay_async_completion(*args, **kw), task,
+                    base_url=str(getattr(args[0], "base_url", "") or ""),
+                    api_key=_client_api_key_for_usage(args[0]),
+                    **kw,
+                )
             if kind == "retry":
                 return await _retry_same_provider_async(**kw)
             fb_client, fb_model, fb_label = args
