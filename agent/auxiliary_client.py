@@ -6626,11 +6626,12 @@ def _build_call_kwargs(
 
 def _validate_llm_response(
     response: Any, task: Optional[str] = None, provider: Optional[str] = None, base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Any:
     """Validate the .choices[0].message shape (fail fast, not a downstream AttributeError).
 
     Also the single aux-usage accounting chokepoint: every successful non-streaming response
-    passes here exactly once; *provider*/*base_url* are optional hints.
+    passes here exactly once; *provider*/*base_url*/*api_key* are optional hints.
 
     See #7264.
     Recording is best-effort and never affects validation. *provider*/*base_url* are optional accounting
@@ -6640,7 +6641,7 @@ def _validate_llm_response(
     if response is None:
         raise RuntimeError(f"Auxiliary {task or 'call'}: LLM returned None response")
     from agent.aux_accounting import record_aux_usage
-    record_aux_usage(response, task, provider=provider, base_url=base_url)
+    record_aux_usage(response, task, provider=provider, base_url=base_url, api_key=api_key)
     # Adapter SimpleNamespace responses are fine — they have .choices[0].message.
     try:
         choices = response.choices
@@ -7955,7 +7956,7 @@ def _call_llm_impl(
                         request_provider, req.base_info or req.resolved_base_url),
                 ),
             ),
-            task, **validate_kw,
+            task, api_key=req.resolved_api_key, **validate_kw,
         )
     try:
         # Bounded same-provider retry (exponential backoff, auxiliary.transient_retries) for
@@ -8118,7 +8119,7 @@ async def _async_call_llm_impl(
                 await _relay_async_completion(
                     client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
                     create=_acreate),
-                task, **validate_kw)
+                task, api_key=req.resolved_api_key, **validate_kw)
         try:
             return await _primary(provider=request_provider, base_url=req.base_info)
         except Exception as transient_err:
