@@ -420,13 +420,13 @@ def probe_active_provider_credential(timeout: float = 10.0) -> dict:
         return {"ok": False, "provider": None, "reason": "resolve_failed",
                 "detail": format_runtime_provider_error(exc)}
     provider = runtime.get("provider") or ""
-    cred = runtime.get("api" + "_key")
+    from agent.command_token_source import materialize_probe_api_key
+    # A callable credential (for example a key_cmd or Entra source) has not proved it can mint
+    # until it is invoked. Materialize it before the request so recovery unblocks only after the
+    # same credential path the next turn uses has produced a bearer token.
+    cred = materialize_probe_api_key(runtime.get("api" + "_key"))
     base_url = (runtime.get("base_url") or "").rstrip("/")
-    if callable(cred):
-        # A callable credential (Azure Entra ID, etc.) mints a fresh token per request;
-        # resolving it successfully here already exercised that token-acquisition path.
-        return {"ok": True, "provider": provider, "reason": "callable_credential", "detail": ""}
-    if not (isinstance(cred, str) and cred) or not base_url:
+    if not cred or not base_url:
         return {"ok": False, "provider": provider, "reason": "no_credential",
                 "detail": "No usable API key / base URL resolved for the active provider."}
     try:
