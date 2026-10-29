@@ -46,16 +46,23 @@ def test_bootstrap_import_exports_scratch_to_process_and_children(tmp_path):
     assert out.stdout.split() == [expected, expected]
 
 
-def test_prune_removes_only_stale_top_level_entries(tmp_path):
+def test_prune_uses_subtree_idleness_not_the_top_level_directory_mtime(tmp_path):
     scratch = get_scratch_dir(tmp_path, prune=False)
-    stale, fresh = scratch / "stale", scratch / "fresh.txt"
-    stale.mkdir()
-    (stale / "f").write_text("x", encoding="utf-8")
+    stale, active, fresh = scratch / "stale", scratch / "active", scratch / "fresh.txt"
+    stale_child = stale / "nested" / "f"
+    stale_child.parent.mkdir(parents=True)
+    stale_child.write_text("x", encoding="utf-8")
+    active_child = active / "nested" / "f"
+    active_child.parent.mkdir(parents=True)
+    active_child.write_text("still writing", encoding="utf-8")
     fresh.write_text("y", encoding="utf-8")
     ancient = time.time() - 100 * 3600
+    os.utime(stale_child, (ancient, ancient))
+    os.utime(stale_child.parent, (ancient, ancient))
     os.utime(stale, (ancient, ancient))
+    os.utime(active, (ancient, ancient))
     assert prune_scratch_dir(scratch) == 1
-    assert not stale.exists() and fresh.exists()
+    assert not stale.exists() and active_child.exists() and fresh.exists()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory modes")

@@ -1000,7 +1000,8 @@ def apply_subprocess_home_env(env: MutableMapping[str, str]) -> None:
 # --- Scratch dir: Hermes' own temp space, never the system /tmp ---
 # System temp is tmpfs on most Linux distros and containers, so browser profiles, PTY probes,
 # download spools and every ``tempfile.mkdtemp()`` a Hermes-launched script performs eat RAM
-# and vanish on reboot. ``HERMES_HOME/cache/scratch`` is real storage with a fixed retention.
+# and vanish on reboot. ``HERMES_HOME/cache/scratch`` is real storage with an idle retention:
+# a directory remains live while anything beneath it is still being written.
 SCRATCH_TMP_ENV_VARS = ("TMPDIR", "TMP", "TEMP")
 SCRATCH_DIR_MARKER_ENV = "HERMES_SCRATCH_DIR"
 SCRATCH_MAX_AGE_HOURS = 72
@@ -1146,8 +1147,9 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
 
     Every Hermes process and child gets ``TMPDIR``/``TMP``/``TEMP`` pointed here at boot (see
     :func:`export_scratch_tmp_env`), so ``tempfile`` defaults land here without call sites
-    knowing. Entries older than ``SCRATCH_MAX_AGE_HOURS`` are pruned at most once per process
-    and once per hour across processes (stamp file), so a fan-out of children stays cheap.
+    knowing. Entries idle throughout their subtree for ``SCRATCH_MAX_AGE_HOURS`` are pruned at
+    most once per process and once per hour across processes (stamp file), so a fan-out of
+    children stays cheap.
 
     Permissions follow :func:`apply_secure_dir_policy`, so an explicit ``HERMES_HOME_MODE`` or
     a managed/shared home is honored instead of a blanket ``0700`` (#117347).
@@ -1166,29 +1168,16 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
 
 
 def prune_scratch_dir(scratch: Path | None = None, max_age_hours: float = SCRATCH_MAX_AGE_HOURS) -> int:
-    """Delete top-level scratch entries untouched for *max_age_hours*; return the count removed."""
-    import time
+    """Delete only top-level entries idle throughout their subtree.
+
+    Before deleting an entry, terminate same-user processes whose working directory is rooted
+    inside it and prune stale linked-worktree registrations. This leaves no live process with a
+    deleted cwd and prevents git metadata from accumulating after scratch worktrees expire.
+    """
+    from hermes_constants_scratch import prune_idle_entries
+
     root = scratch if scratch is not None else get_scratch_dir(prune=False)
-    cutoff = time.time() - max_age_hours * 3600
-    removed = 0
-    try:
-        entries = list(root.iterdir())
-    except OSError:
-        return 0
-    for entry in entries:
-        if entry.name == _SCRATCH_PRUNE_STAMP:
-            continue
-        try:
-            if entry.lstat().st_mtime >= cutoff:
-                continue
-            if entry.is_dir() and not entry.is_symlink():
-                shutil.rmtree(entry, ignore_errors=True)
-            else:
-                entry.unlink()
-            removed += 1
-        except OSError:
-            continue
-    return removed
+    return prune_idle_entries(root, max_age_hours, frozenset({_SCRATCH_PRUNE_STAMP}))
 
 
 def _prune_scratch_dir_once(scratch: Path) -> None:
