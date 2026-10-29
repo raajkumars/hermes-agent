@@ -1861,6 +1861,10 @@ DEFAULT_CONFIG = {
         # HTTP call per parked profile. Clamped to a 30s minimum; a probe that still fails is
         # re-tried on the next eligible tick, a confirmed pass requeues the parked cards once.
         "config_fatal_recheck_interval_seconds": 300,
+        # Hard ceiling on worker spawns after the most recent terminal completion. This also
+        # stops stale-reclaim loops that never increment failure_limit. 0 blocks every spawn
+        # until a completion is recorded; use a non-negative integer.
+        "max_spawns_without_completion": 20,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
