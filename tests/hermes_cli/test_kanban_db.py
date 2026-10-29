@@ -205,6 +205,25 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
 
 
+@pytest.mark.parametrize("terminal_status", ("done", "archived"))
+def test_terminal_task_claim_is_a_noop_even_when_a_parent_is_not_done(
+    kanban_home, terminal_status,
+):
+    """Terminal cards must not be re-claimed or emit another claim event."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="unfinished parent", body="wait", assignee="a")
+        child = kb.create_task(conn, title="terminal child", body="wait", assignee="a", parents=[parent])
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (terminal_status, child))
+        before = len(kb.list_events(conn, child))
+
+        assert kb.claim_task(conn, child, claimer="worker") is None
+
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == terminal_status
+        assert len(kb.list_events(conn, child)) == before
+
+
 
 
 

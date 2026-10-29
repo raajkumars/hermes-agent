@@ -2273,6 +2273,12 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # A terminal card is not a dependency-recovery candidate.  In
+        # particular, an unfinished parent must not demote a completed or
+        # archived child back to ``todo`` or append a rejection event.
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None or row["status"] in {"done", "archived"}:
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
