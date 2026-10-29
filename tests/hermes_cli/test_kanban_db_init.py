@@ -185,7 +185,7 @@ def test_connect_reinitializes_schema_when_db_file_vanished(tmp_path, monkeypatc
 
     with kbc.connect_closing(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
-    assert "tasks" in _tables(db_path)
+    assert {"tasks", "dispatcher_respawn_state"} <= _tables(db_path)
 
 
 def test_connect_reinitializes_schema_when_db_replaced_by_empty_file(tmp_path, monkeypatch):
@@ -206,7 +206,7 @@ def test_connect_reinitializes_schema_when_db_replaced_by_empty_file(tmp_path, m
             "INSERT INTO tasks (id, title, status, created_at) VALUES ('t-2', 'T', 'ready', 1000)"
         )
         conn.commit()
-    assert "tasks" in _tables(db_path)
+    assert {"tasks", "dispatcher_respawn_state"} <= _tables(db_path)
 
 
 def test_healthy_fast_path_stays_lock_free(tmp_path, monkeypatch):
