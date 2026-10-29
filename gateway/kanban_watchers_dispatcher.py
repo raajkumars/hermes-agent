@@ -38,6 +38,7 @@ class _DispatcherSettings:
     max_spawn: Any
     max_in_progress: Optional[int]
     failure_limit: int
+    max_spawns_without_completion: int
     stale_timeout_seconds: int
     reconcile_orphans: bool
     default_assignee: Optional[str]
@@ -83,6 +84,30 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
                        raw_failure_limit, kb.DEFAULT_FAILURE_LIMIT)
         failure_limit = kb.DEFAULT_FAILURE_LIMIT
 
+    raw_spawn_cap = kanban_cfg.get("max_spawns_without_completion", 20)
+    try:
+        # ``bool`` is an ``int`` subclass, but a true/false retry budget is
+        # almost certainly a configuration mistake.
+        if isinstance(raw_spawn_cap, bool) or (
+            isinstance(raw_spawn_cap, float) and not raw_spawn_cap.is_integer()
+        ):
+            raise ValueError
+        max_spawns_without_completion = int(raw_spawn_cap)
+    except (TypeError, ValueError):
+        logger.warning(
+            "kanban dispatcher: invalid kanban.max_spawns_without_completion=%r; "
+            "using default 20",
+            raw_spawn_cap,
+        )
+        max_spawns_without_completion = 20
+    if max_spawns_without_completion < 0:
+        logger.warning(
+            "kanban dispatcher: kanban.max_spawns_without_completion=%r is below 0; "
+            "using default 20",
+            raw_spawn_cap,
+        )
+        max_spawns_without_completion = 20
+
     # 0 disables stale detection.
     raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
     try:
@@ -107,6 +132,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         max_spawn=max_spawn,
         max_in_progress=effective_max_in_progress,
         failure_limit=failure_limit,
+        max_spawns_without_completion=max_spawns_without_completion,
         stale_timeout_seconds=stale_timeout_seconds,
         # Requeue 'running' cards with broken claim bookkeeping (zombie-card
         # reconciliation); false keeps orphans frozen for manual forensics.
@@ -181,7 +207,14 @@ class _KanbanDispatcher:
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
-        kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        # The respawn guard receives this setting directly from the dispatch
+        # implementation once it owns the guard (rather than forwarding an
+        # unsupported kwarg during this configuration-only rollout).
+        kwargs = {
+            k: v
+            for k, v in asdict(self.settings).items()
+            if k not in {"interval", "max_spawns_without_completion"}
+        }
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).

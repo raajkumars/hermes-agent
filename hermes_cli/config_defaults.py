@@ -1854,6 +1854,10 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Hard ceiling on worker spawns after the most recent terminal completion. This also
+        # stops stale-reclaim loops that never increment failure_limit. 0 blocks every spawn
+        # until a completion is recorded; use a non-negative integer.
+        "max_spawns_without_completion": 20,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
