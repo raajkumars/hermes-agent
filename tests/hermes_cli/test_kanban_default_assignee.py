@@ -97,3 +97,34 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
     assert any(s[0] == task_id and s[1] == "default" for s in res.spawned)
 
 
+@pytest.mark.parametrize("card_type", ["approval-request", "qwick_approval_request"])
+def test_unassigned_approval_request_is_not_auto_assigned(
+    isolated_kanban_home, card_type,
+):
+    """Approval request records stay unassigned for their authority route."""
+    kb, _home = isolated_kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        task_id = kb.create_task(
+            conn,
+            title="Approval request",
+            body=json.dumps({"type": card_type}),
+            assignee=None,
+        )
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=False,
+            default_assignee="default",
+        )
+
+    assert task_id not in res.auto_assigned_default
+    assert task_id in res.skipped_unassigned
+    assert not res.spawned
+    with kbc.connect_closing() as conn:
+        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert row["assignee"] is None
+
+
