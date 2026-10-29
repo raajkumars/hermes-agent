@@ -1056,6 +1056,18 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Dispatcher-owned restart-stable state. Each board has its own database, but
+-- retaining the board key keeps custom database resolvers from mixing windows.
+-- ``cap_blocked`` is sticky until a newly observed successful completion; the
+-- dispatcher guard owns deciding when to set it.
+CREATE TABLE IF NOT EXISTS dispatcher_respawn_state (
+    board                   TEXT PRIMARY KEY,
+    spawns_since_completion INTEGER NOT NULL DEFAULT 0 CHECK (spawns_since_completion >= 0),
+    last_completed_run_id   INTEGER,
+    cap_blocked             INTEGER NOT NULL DEFAULT 0 CHECK (cap_blocked IN (0, 1)),
+    updated_at              INTEGER NOT NULL
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the

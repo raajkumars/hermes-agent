@@ -204,6 +204,69 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        # Bound autonomous fan-out when workers keep failing/reclaiming before
+        # any task completes. The database is authoritative across gateway
+        # restarts; these maps are only the per-tick in-memory mirror.
+        self._spawns_since_completion: dict[str, int] = {}
+        self._last_completed_run_id: dict[str, int | None] = {}
+
+    @staticmethod
+    def _ensure_respawn_state_schema(conn: sqlite3.Connection) -> None:
+        """Create restart state for reduced legacy board schemas."""
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS dispatcher_respawn_state ("
+            "board TEXT PRIMARY KEY, "
+            "spawns_since_completion INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (spawns_since_completion >= 0), "
+            "last_completed_run_id INTEGER, "
+            "cap_blocked INTEGER NOT NULL DEFAULT 0 CHECK (cap_blocked IN (0, 1)), "
+            "updated_at INTEGER NOT NULL)"
+        )
+
+    def _store_respawn_state(
+        self, slug: str, conn: sqlite3.Connection, *, count: int,
+        last_completed_run_id: int | None, cap_blocked: bool,
+    ) -> None:
+        """Atomically persist the dispatch window after every state transition."""
+        with conn:
+            conn.execute(
+                "INSERT INTO dispatcher_respawn_state "
+                "(board, spawns_since_completion, last_completed_run_id, cap_blocked, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(board) DO UPDATE SET "
+                "spawns_since_completion = excluded.spawns_since_completion, "
+                "last_completed_run_id = excluded.last_completed_run_id, "
+                "cap_blocked = excluded.cap_blocked, updated_at = excluded.updated_at",
+                (slug, count, last_completed_run_id, int(cap_blocked), int(time.time())),
+            )
+
+    def _load_respawn_state(
+        self, slug: str, conn: sqlite3.Connection,
+    ) -> tuple[int, int | None, bool]:
+        """Load a durable window and reset it only after a new completion."""
+        self._ensure_respawn_state_schema(conn)
+        row = conn.execute(
+            "SELECT spawns_since_completion, last_completed_run_id, cap_blocked "
+            "FROM dispatcher_respawn_state WHERE board = ?", (slug,),
+        ).fetchone()
+        completed = conn.execute(
+            "SELECT id FROM task_runs WHERE outcome = 'completed' "
+            "ORDER BY ended_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        latest_id = int(completed[0]) if completed is not None else None
+        if row is None:
+            count, completion_id, cap_blocked = 0, latest_id, False
+        else:
+            count, completion_id, cap_blocked = int(row[0]), row[1], bool(row[2])
+            if latest_id != completion_id:
+                count, completion_id, cap_blocked = 0, latest_id, False
+        self._store_respawn_state(
+            slug, conn, count=count, last_completed_run_id=completion_id,
+            cap_blocked=cap_blocked,
+        )
+        self._spawns_since_completion[slug] = count
+        self._last_completed_run_id[slug] = completion_id
+        return count, completion_id, cap_blocked
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -242,6 +305,7 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards.pop(slug, None)
         return True
 
+
     def tick_once_for_board(self, slug: str) -> Optional[object]:
         """Run one dispatch_once for a specific board.
 
@@ -252,9 +316,6 @@ class _KanbanDispatcher:
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
-        # The respawn guard receives this setting directly from the dispatch
-        # implementation once it owns the guard (rather than forwarding an
-        # unsupported kwarg during this configuration-only rollout).
         kwargs = {
             k: v
             for k, v in asdict(self.settings).items()
@@ -264,7 +325,36 @@ class _KanbanDispatcher:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
             conn = _kbc().connect(board=slug)
-            return _kbd().dispatch_once(conn, board=slug, **kwargs)
+            count, completion_id, cap_blocked = self._load_respawn_state(slug, conn)
+            if cap_blocked:
+                logger.warning(
+                    "kanban dispatcher: board %s remains held by sticky respawn cap "
+                    "(%d confirmed starts without a completion)",
+                    slug, count,
+                )
+                return _kbd().DispatchResult(respawn_cap_blocked=True)
+            result = _kbd().dispatch_once(conn, board=slug, **kwargs)
+            # A claim can be retried, and a process launch can fail, without a
+            # worker ever starting. ``DispatchResult.spawned`` is the only
+            # confirmed-start boundary. A completion is sampled before the
+            # dispatch pass, so a just-completed worker always clears the cap
+            # before this board can launch again.
+            count += len(getattr(result, "spawned", ()) or ())
+            cap_blocked = count > self.settings.max_spawns_without_completion
+            self._store_respawn_state(
+                slug, conn, count=count, last_completed_run_id=completion_id,
+                cap_blocked=cap_blocked,
+            )
+            self._spawns_since_completion[slug] = count
+            if cap_blocked:
+                logger.warning(
+                    "kanban dispatcher: board %s reached sticky respawn cap: %d "
+                    "confirmed starts without a completion (limit %d); new spawns "
+                    "will remain blocked until a worker completes",
+                    slug, count, self.settings.max_spawns_without_completion,
+                )
+                result.respawn_cap_blocked = True
+            return result
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
