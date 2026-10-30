@@ -785,6 +785,49 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         assert kb.get_task(conn, t2).status == "blocked"
 
 
+def test_recompute_ready_propagates_effective_priority_to_open_ancestors(kanban_home):
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="root", priority=1)
+        middle = kb.create_task(conn, title="middle", priority=2, parents=[root])
+        leaf = kb.create_task(conn, title="leaf", priority=91, parents=[middle])
+
+        assert kb.recompute_ready(conn) == 0
+        values = {
+            row["id"]: (row["priority"], row["effective_priority"])
+            for row in conn.execute(
+                "SELECT id, priority, effective_priority FROM tasks WHERE id IN (?, ?, ?)",
+                (root, middle, leaf),
+            )
+        }
+        assert values[root] == (1, 91)
+        assert values[middle] == (2, 91)
+        assert values[leaf] == (91, 91)
+
+
+def test_recompute_ready_effective_priority_skips_terminal_and_never_lowers(kanban_home):
+    with kbc.connect() as conn:
+        terminal = kb.create_task(conn, title="terminal", priority=2)
+        child = kb.create_task(conn, title="child", priority=-10, parents=[terminal])
+        conn.execute(
+            "UPDATE tasks SET status='done', effective_priority=77 WHERE id=?", (terminal,)
+        )
+        conn.execute(
+            "UPDATE tasks SET effective_priority=42 WHERE id=?", (child,)
+        )
+        conn.commit()
+
+        assert kb.recompute_ready(conn) == 1
+        rows = {
+            row["id"]: (row["priority"], row["effective_priority"])
+            for row in conn.execute(
+                "SELECT id, priority, effective_priority FROM tasks WHERE id IN (?, ?)",
+                (terminal, child),
+            )
+        }
+        assert rows[terminal] == (2, 77)
+        assert rows[child] == (-10, 42)
+
+
 
 
 # ---------------------------------------------------------------------------
