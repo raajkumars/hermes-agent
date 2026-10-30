@@ -209,6 +209,15 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False) -
     if not (result.get("failed") or result.get("partial") or result.get("completed") is False):
         return 0
     if os.environ.get("HERMES_KANBAN_TASK"):
+        # A compact, content-free record exists independently of whether the dispatcher
+        # later retries, blocks, or marks this process as failed.  Do not send the free-form
+        # provider error: it can contain task data or credentials.
+        reason = result.get("failure_reason") or "worker_failed"
+        try:
+            from agent.monitoring.runtime_diagnostics import report_worker_runtime_error
+            report_worker_runtime_error(reason)
+        except Exception:
+            logger.debug("worker runtime diagnostic report failed", exc_info=True)
         # The DB transition is the runtime equivalent of ``kanban block --kind
         # capability``. Do not let the dispatcher also record a worker crash.
         if _block_kanban_capability_failure(result):

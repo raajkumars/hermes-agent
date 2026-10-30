@@ -75,6 +75,27 @@ def test_dispatcher_spawned_worker_keeps_a_plain_failure_at_one(monkeypatch):
     assert _run_non_quiet(monkeypatch, {"failed": True}) == 1
 
 
+def test_dispatcher_worker_reports_a_content_free_runtime_error(monkeypatch):
+    """The command boundary reports the classified reason, never a provider message."""
+    from agent.monitoring import runtime_diagnostics
+    from hermes_cli.cli_single_query import _single_query_exit_code
+
+    calls = []
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abcd1234")
+    monkeypatch.setattr(
+        runtime_diagnostics,
+        "report_worker_runtime_error",
+        lambda error_type: calls.append(error_type),
+    )
+
+    assert _single_query_exit_code({
+        "failed": True,
+        "failure_reason": "provider_failure",
+        "error": "Bearer secret for user@example.com",
+    }) == 1
+    assert calls == ["provider_failure"]
+
+
 @pytest.mark.parametrize("reason", ["context_window_full", "context_overflow", "repetition_loop"])
 def test_dispatcher_worker_blocks_deterministic_capability_failures(monkeypatch, reason):
     """A full context or repeated output is a capability mismatch, not a crash retry."""

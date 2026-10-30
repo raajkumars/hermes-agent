@@ -50,7 +50,7 @@ _OBSERVABLE_METRIC_NAMES = (
     "hermes.gateway.background_delegations", "hermes.platform.up", "hermes.platform.degraded",
     "hermes.cron.scheduler.heartbeat_age_seconds", "hermes.cron.scheduler.last_success_age_seconds",
     "hermes.cron.scheduler.catch_up_occurrences", "hermes.cron.jobs.enabled", "hermes.cron.jobs.running",
-    "hermes.cron.jobs.overdue",
+    "hermes.cron.jobs.overdue", "hermes.worker.runtime_errors",
 )
 
 
@@ -191,6 +191,14 @@ def _read_runtime_snapshot(config: Dict[str, Any]):
         # the exception *type* (the message could carry paths); exc_info stays on DEBUG.
         logger.warning("cron health snapshot unavailable; cron telemetry not exported (error_type=%s)", type(exc).__name__)
         logger.debug("cron health snapshot traceback", exc_info=True)
+    try:
+        from agent.monitoring.runtime_diagnostics import worker_runtime_error_metrics
+        gateway_snapshot.metrics.extend(
+            GatewayMetric(name=name, value=value, attributes=attributes)
+            for name, value, attributes in worker_runtime_error_metrics()
+        )
+    except Exception:
+        logger.debug("worker-runtime diagnostic metrics unavailable", exc_info=True)
     return gateway_snapshot
 
 
