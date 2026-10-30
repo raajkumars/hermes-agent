@@ -1056,12 +1056,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
--- Dispatcher-owned restart-stable state. Each board has its own database, but
--- retaining the board key keeps custom database resolvers from mixing windows.
--- ``cap_blocked`` is sticky until a newly observed successful completion; the
--- dispatcher guard owns deciding when to set it.
+-- Dispatcher-owned restart-stable state. A task owns its own window: one noisy
+-- card must never freeze unrelated ready work on the same board. ``cap_blocked``
+-- stays set until that card completes or an operator explicitly unblocks it.
 CREATE TABLE IF NOT EXISTS dispatcher_respawn_state (
-    board                   TEXT PRIMARY KEY,
+    task_id                 TEXT PRIMARY KEY,
     spawns_since_completion INTEGER NOT NULL DEFAULT 0 CHECK (spawns_since_completion >= 0),
     last_completed_run_id   INTEGER,
     cap_blocked             INTEGER NOT NULL DEFAULT 0 CHECK (cap_blocked IN (0, 1)),
