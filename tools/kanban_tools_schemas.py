@@ -501,6 +501,15 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
         )),
+        "routing_lane": _prop("string", (
+                "Named kanban.model_routing lane to select the worker model "
+                "from the assignee profile configuration. Cannot be combined "
+                "with an explicit model."
+        )),
+        "min_context_window": _prop("integer", (
+                "Minimum context window required for the selected routing lane. "
+                "Dispatch fails instead of silently using an undersized model."
+        )),
     },
     ["title", "assignee"],
 )

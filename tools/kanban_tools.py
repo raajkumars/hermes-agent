@@ -382,16 +382,20 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract routing_lane min_context_window "
+    "last_failure_error".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
-    "created_at started_at completed_at current_run_id model_override provider_override".split())
+    "created_at started_at completed_at current_run_id model_override provider_override "
+    "routing_lane min_context_window".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
-_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
+_CREATED_FIELDS = (
+    "status", "workspace_kind", "workspace_path", "project_id", "routing_lane",
+    "min_context_window")
 
 
 def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
@@ -1015,6 +1019,10 @@ def _handle_create(args: dict, **kw) -> str:
         _parse_bool_arg(args, "goal_mode"))
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
+    routing_lane = args.get("routing_lane")
+    min_context_window = _opt_int(args.get("min_context_window"))
+    _check(not (routing_lane and model_override),
+           "'routing_lane' cannot be combined with an explicit 'model'")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env
@@ -1046,6 +1054,7 @@ def _handle_create(args: dict, **kw) -> str:
             idempotency_key=args.get("idempotency_key"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
+            routing_lane=routing_lane, min_context_window=min_context_window,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),

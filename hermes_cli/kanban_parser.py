@@ -191,6 +191,12 @@ _SPECS = [
         _arg("--provider", dest="provider_override",
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
+        _arg("--routing-lane", metavar="LANE",
+             help="Configured kanban.model_routing lane (for example orchestration or lead). "
+                  "A missing/invalid lane fails dispatch instead of using the profile default."),
+        _arg("--min-context-window", type=int, metavar="TOKENS",
+             help="Minimum context window required by this card (use for large file-reading work). "
+                  "Requires --routing-lane or a matching priority lane."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",

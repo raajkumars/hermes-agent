@@ -732,6 +732,10 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Declarative routing metadata. ``routing_lane`` selects a configured
+    # kanban.model_routing lane; ``min_context_window`` guards file-reading cards.
+    routing_lane: Optional[str] = None
+    min_context_window: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -762,6 +766,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "routing_lane", "min_context_window",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -966,7 +971,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Declarative routing requirements. NULL preserves legacy profile routing.
+    routing_lane         TEXT,
+    min_context_window   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1260,6 +1268,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    routing_lane: Optional[str] = None,
+    min_context_window: Optional[int] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1282,6 +1292,12 @@ def create_task(
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    routing_lane = str(routing_lane or "").strip() or None
+    if routing_lane and not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", routing_lane):
+        raise ValueError("routing_lane must be a lowercase slug (a-z, 0-9, _ or -)")
+    min_context_window = _opt_int(min_context_window)
+    if min_context_window is not None and min_context_window < 1:
+        raise ValueError("min_context_window must be >= 1")
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -1359,8 +1375,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        routing_lane, min_context_window
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1370,6 +1387,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        routing_lane, min_context_window,
                     ),
                 )
                 for pid in parents:
@@ -1392,6 +1410,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "routing_lane": routing_lane,
+                        "min_context_window": min_context_window,
                     },
                 )
                 if task_status == "blocked":

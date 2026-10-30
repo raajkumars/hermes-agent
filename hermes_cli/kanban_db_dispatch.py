@@ -2645,6 +2645,56 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 _retagged_workspace_roots: set[str] = set()
 
 
+def _resolve_task_model_route(task: Task, hermes_home: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve validated card-weight routing without silently falling back.
+
+    ``kanban.model_routing`` is deliberately opt-in.  Once a card declares a
+    lane (or a priority rule selects one), a missing/bad lane is a dispatch
+    error rather than an accidental run on the profile default.
+    """
+    if not hermes_home:
+        if task.routing_lane or task.min_context_window:
+            raise ValueError("routing metadata requires an assigned profile home")
+        return task.model_override, task.provider_override
+    from hermes_cli.config import load_config
+
+    with _worker_profile_scope(hermes_home):
+        kanban_cfg = (load_config() or {}).get("kanban") or {}
+    routing = kanban_cfg.get("model_routing") or {}
+    lane = task.routing_lane
+    if not lane:
+        rules = routing.get("priority_lanes") or ()
+        if rules and not isinstance(rules, list):
+            raise ValueError("kanban.model_routing.priority_lanes must be a list")
+        for rule in sorted((r for r in rules if isinstance(r, Mapping)),
+                           key=lambda r: int(r.get("min_priority", 0)), reverse=True):
+            if task.priority >= int(rule.get("min_priority", 0)):
+                lane = str(rule.get("lane") or "").strip() or None
+                break
+    if not lane:
+        if task.min_context_window:
+            raise ValueError("min_context_window requires routing_lane or a matching priority_lanes rule")
+        return task.model_override, task.provider_override
+    if task.model_override:
+        raise ValueError("task cannot combine routing_lane with model_override")
+    lanes = routing.get("lanes")
+    if not isinstance(lanes, Mapping) or not isinstance(lanes.get(lane), Mapping):
+        raise ValueError(f"kanban.model_routing has no configured lane {lane!r}")
+    route = lanes[lane]
+    model = str(route.get("model") or "").strip()
+    provider = str(route.get("provider") or "").strip() or None
+    context_window = route.get("context_window")
+    if not model:
+        raise ValueError(f"kanban.model_routing.lanes.{lane} requires model")
+    if not isinstance(context_window, int) or context_window < 1:
+        raise ValueError(f"kanban.model_routing.lanes.{lane} requires integer context_window")
+    if task.min_context_window and context_window < task.min_context_window:
+        raise ValueError(
+            f"lane {lane!r} context_window {context_window} is below task minimum {task.min_context_window}"
+        )
+    return model, provider
+
+
 def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
     """Reclaim pre-tag worker rows in state.db so they leave the session lists.
 
@@ -2688,12 +2738,13 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     for sk in task.skills or ():
         if sk:
             cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
+    routed_model, routed_provider = _resolve_task_model_route(task, hermes_home)
+    if routed_model:
+        cmd.extend(["-m", routed_model])
         # Pin the provider too so the worker resolves the model against the
         # intended backend (model X with provider Y is the classic board-stall).
-        if task.provider_override:
-            cmd.extend(["--provider", task.provider_override])
+        if routed_provider:
+            cmd.extend(["--provider", routed_provider])
     # Independent of the model override — a task can run the profile's own
     # model at a different depth.
     if task.reasoning_effort:

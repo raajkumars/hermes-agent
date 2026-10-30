@@ -85,6 +85,38 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_create_persists_card_weighted_routing_metadata(monkeypatch, worker_env):
+    """Routing constraints are part of the public create/show contract, not
+    dispatcher-only hidden fields."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    created = json.loads(kt._handle_create({
+        "title": "deep architecture review", "assignee": "test-worker",
+        "routing_lane": "deep", "min_context_window": 200000,
+    }))
+    assert created["routing_lane"] == "deep"
+    assert created["min_context_window"] == 200000
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, created["task_id"])
+        assert (task.routing_lane, task.min_context_window) == ("deep", 200000)
+    shown = json.loads(kt._handle_show({"task_id": created["task_id"]}))
+    assert shown["task"]["routing_lane"] == "deep"
+    assert shown["task"]["min_context_window"] == 200000
+
+
+def test_create_rejects_explicit_model_with_routing_lane():
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "ambiguous route", "assignee": "test-worker", "model": "x",
+        "routing_lane": "deep",
+    }))
+    assert "routing_lane" in out["error"]
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

@@ -379,6 +379,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            routing_lane=getattr(args, "routing_lane", None),
+            min_context_window=getattr(args, "min_context_window", None),
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
