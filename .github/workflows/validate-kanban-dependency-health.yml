@@ -1,0 +1,85 @@
+name: Validate Kanban dependency health
+
+# A post-deployment gate for the deployed Hermes API. This workflow deliberately
+# has no pull_request or push trigger: a fork or feature branch must never gain
+# access to the production API credential.
+on:
+  workflow_call:
+    inputs:
+      api_url:
+        description: Base URL of the deployed Hermes API
+        required: true
+        type: string
+      board:
+        description: Optional Kanban board slug
+        required: false
+        type: string
+      timeout_seconds:
+        description: Per-request timeout in seconds
+        required: false
+        default: 10
+        type: number
+      cache_ttl_seconds:
+        description: In-process response cache TTL in seconds
+        required: false
+        default: 30
+        type: number
+    secrets:
+      api_credential:
+        description: Bearer credential for the deployed Hermes API
+        required: true
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: Base URL of the deployed Hermes API
+        required: true
+        type: string
+      board:
+        description: Optional Kanban board slug
+        required: false
+        type: string
+      timeout_seconds:
+        description: Per-request timeout in seconds
+        required: false
+        default: 10
+        type: number
+      cache_ttl_seconds:
+        description: In-process response cache TTL in seconds
+        required: false
+        default: 30
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-health:
+    # Manual dispatches use the repository's protected main workflow only.
+    # Reusable callers must explicitly pass their credential, so no ambient
+    # production secret crosses the trust boundary.
+    if: github.event_name == 'workflow_call' || github.ref == 'refs/heads/main'
+    name: Verify dependency promotion health
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Query deployed dependency health
+        env:
+          HERMES_API_CREDENTIAL: ${{ secrets.api_credential || secrets.HERMES_DEPLOY_API_CREDENTIAL }}
+          API_URL: ${{ inputs.api_url }}
+          BOARD: ${{ inputs.board }}
+          TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+          CACHE_TTL_SECONDS: ${{ inputs.cache_ttl_seconds }}
+        run: |
+          set -euo pipefail
+          args=(
+            --api-url "$API_URL"
+            --credential-env HERMES_API_CREDENTIAL
+            --timeout "$TIMEOUT_SECONDS"
+            --cache-ttl "$CACHE_TTL_SECONDS"
+          )
+          if [ -n "$BOARD" ]; then
+            args+=(--board "$BOARD")
+          fi
+          python3 scripts/observability/validate_kanban_dependency_health.py "${args[@]}"
