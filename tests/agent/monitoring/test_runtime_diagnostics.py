@@ -4,7 +4,7 @@ import json
 import logging
 
 
-def test_worker_runtime_error_emits_redacted_audit_event_and_metric(monkeypatch, caplog):
+def test_worker_runtime_errors_emit_redacted_audit_events_and_increment_metric(monkeypatch, caplog):
     from agent.monitoring import runtime_diagnostics as diagnostics
 
     diagnostics.reset_worker_runtime_error_metrics_for_tests()
@@ -18,6 +18,9 @@ def test_worker_runtime_error_emits_redacted_audit_event_and_metric(monkeypatch,
             event = diagnostics.report_worker_runtime_error(
                 "Provider Failure", exception=exc, correlation_id="t_aedd2ed3",
             )
+            second_event = diagnostics.report_worker_runtime_error(
+                "Provider Failure", exception=exc, correlation_id="t_aedd2ed3",
+            )
 
     assert event.name == "worker.runtime.error"
     assert event.subsystem == "worker.runtime"
@@ -25,23 +28,36 @@ def test_worker_runtime_error_emits_redacted_audit_event_and_metric(monkeypatch,
     assert event.trace_frame_count > 0
     assert event.trace_fingerprint != "none"
     assert event.correlation_id == "t_aedd2ed3"
-    assert emitted == [event]
+    assert emitted == [event, second_event]
     assert "top-secret-token-0123456789" not in caplog.text
     assert "user@example.com" not in caplog.text
-    audit = json.loads(caplog.records[-1].getMessage())
-    assert audit == {
-        "audit_event": "worker_runtime_error",
-        "correlation_id": "t_aedd2ed3",
-        "error_type": "provider_failure",
-        "severity": "error",
-        "stack_trace": {
-            "fingerprint": event.trace_fingerprint,
-            "frame_count": event.trace_frame_count,
+    audits = [json.loads(record.getMessage()) for record in caplog.records]
+    assert audits == [
+        {
+            "audit_event": "worker_runtime_error",
+            "correlation_id": "t_aedd2ed3",
+            "error_type": "provider_failure",
+            "severity": "error",
+            "stack_trace": {
+                "fingerprint": event.trace_fingerprint,
+                "frame_count": event.trace_frame_count,
+            },
+            "timestamp_ns": event.ts_ns,
         },
-        "timestamp_ns": event.ts_ns,
-    }
+        {
+            "audit_event": "worker_runtime_error",
+            "correlation_id": "t_aedd2ed3",
+            "error_type": "provider_failure",
+            "severity": "error",
+            "stack_trace": {
+                "fingerprint": second_event.trace_fingerprint,
+                "frame_count": second_event.trace_frame_count,
+            },
+            "timestamp_ns": second_event.ts_ns,
+        },
+    ]
     assert diagnostics.worker_runtime_error_metrics() == [
-        ("hermes.worker.runtime_errors", 1, {"error_type": "provider_failure"})
+        ("hermes.worker.runtime_errors", 2, {"error_type": "provider_failure"})
     ]
 
 
