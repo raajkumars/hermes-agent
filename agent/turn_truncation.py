@@ -173,10 +173,29 @@ class _Trunc(TruncationVerdict):
         if cleanup:
             agent._cleanup_task_resources(self.effective_task_id)
         agent._persist_session(self.messages, self.conversation_history)
-        return self.done("return", stamp_failure(partial_result(
+        result = stamp_failure(partial_result(
             self.messages if result_messages is None else result_messages, self.api_call_count,
             final_response, error, failed=failed, compression_exhausted=compression_exhausted,
-        ), *failure))
+        ), *failure)
+        # These terminal conditions are actionable only by changing the worker's
+        # capability/configuration, never by re-spawning the same task. Preserve
+        # the measured facts so the Kanban one-shot wrapper can create an auditable
+        # capability blocker instead of letting the dispatcher count a crash.
+        if failure[0] in {"context_window_full", "context_overflow", "repetition_loop"}:
+            usage = getattr(self.response, "usage", None)
+            prompt_tokens = None
+            if usage is not None:
+                prompt_tokens = normalize_usage(
+                    usage, provider=agent.provider, api_mode=agent.api_mode,
+                ).prompt_tokens
+            result["capability_failure"] = {
+                "model": str(getattr(agent, "model", "") or "unknown"),
+                "context_tokens": int(prompt_tokens or 0),
+                "context_limit": int(getattr(
+                    getattr(agent, "context_compressor", None), "context_length", 0,
+                ) or 0),
+            }
+        return self.done("return", result)
 
     @property
     def is_stub(self) -> bool:
@@ -309,6 +328,7 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         return st.end_turn(
             f"{partial_response}\n\n{notice}" if partial_response else notice,
             f"Prompt used {filled[0]} of {filled[1]} context tokens; no room to answer",
+            failure=("context_window_full", False),
         )
     return st.end_turn(
         partial_response or _CEILING_NO_TEXT,
@@ -423,7 +443,8 @@ def recover_from_truncation(
     if abort is not None:
         line, user_response, error = abort
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
-        return st.end_turn(user_response, error)
+        failure = ("repetition_loop", False) if abort == _REPETITION_DOMINATED else ("truncated", True)
+        return st.end_turn(user_response, error, failure=failure)
 
     if agent.api_mode in _CONTINUABLE_MODES:
         cf = _content_filter_fallback(st, _retry)
