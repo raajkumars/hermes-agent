@@ -399,4 +399,13 @@ def _log_spawn_results(results: Optional[list]) -> bool:
         payload = json.dumps(summary, sort_keys=True, separators=(",", ":"))
         log = logger.info if any(summary.values()) else logger.debug
         log("kanban dispatcher [%s] tick summary %s", slug, payload)
+        if summary["stranded_cards"]:
+            # Warning-level gateway logs are exported as diagnostics by the
+            # existing monitoring bridge.  Keep the payload count-only: task
+            # titles/bodies can carry operator data and do not belong in OTLP.
+            logger.warning(
+                "kanban dispatcher [%s]: dependency-stranded cards detected (count=%d)",
+                slug,
+                summary["stranded_cards"],
+            )
     return any_spawned

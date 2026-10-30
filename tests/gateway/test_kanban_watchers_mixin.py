@@ -94,3 +94,17 @@ def test_tick_summary_logs_current_stranded_count_as_json(caplog):
     assert len(messages) == 2
     summaries = [json.loads(message.rsplit(" tick summary ", 1)[1]) for message in messages]
     assert [summary["stranded_cards"] for summary in summaries] == [2, 0]
+
+
+def test_tick_summary_warns_when_dependency_cards_are_stranded(caplog):
+    """The warning-level bridge turns stranded dispatcher findings into monitoring diagnostics."""
+    import logging
+
+    from gateway.kanban_watchers_dispatcher import _log_spawn_results
+    from hermes_cli.kanban_db_dispatch import DispatchResult
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        _log_spawn_results([("default", DispatchResult(dependency_stranded=["t_one"]))])
+
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert warnings == ["kanban dispatcher [default]: dependency-stranded cards detected (count=1)"]
