@@ -24,6 +24,7 @@ integration and explicitly configured Relay subscribers or exporters.
 | Gateway gauges | `/v1/metrics` | `hermes.gateway.up/state/busy/drainable/active_agents/background_work/background_delegations/restart_requested`, `hermes.platform.up/degraded` with bounded `error_code` attributes |
 | Health/lifecycle events | `/v1/traces` | `gateway.lifecycle` state transitions (`starting -> running -> draining -> stopped`, `startup_failed`, exit), `gateway.health_snapshot`, platform state changes |
 | Diagnostics | `/v1/logs` | Warning/error gateway events with a constant body and bounded subsystem, severity, error class, and error code attributes; rendered log messages are never exported |
+| Worker runtime failures | `/v1/metrics` and `/v1/logs` | `hermes.worker.runtime_errors` is a monotonic cumulative counter with bounded `error_type`; each increment also produces a content-free `worker.runtime.error` audit event with an optional safe workflow correlation id and stack-trace fingerprint/count |
 | Cron scheduler gauges | `/v1/metrics` | Ticker heartbeat and last-success age (omitted when unavailable), a monotonic catch-up-occurrence count from the scheduler's stale-window branch, enabled/running job counts, and overdue count derived from persisted `next_run_at` plus the scheduler's existing grace rule |
 | Cron execution lifecycle | `/v1/traces` | Durable `claimed/running/completed/failed/unknown` states, bounded source and error class, opaque hashed job key, elapsed duration when timestamps exist, and delivery outcome when the scheduler knows it; terminal states make a fail-open flush attempt that can delay completion by up to one second |
 
@@ -132,7 +133,40 @@ hermes_cron_jobs_overdue > 0
 # Catch-up counter increased, proving at least one stale occurrence was
 # collapsed and run once after a delay.
 increase(hermes_cron_scheduler_catch_up_occurrences[15m]) > 0
+
+# OTLP-to-Prometheus translation conventionally adds `_total` to this monotonic
+# worker-runtime counter. Retain the bounded error_type in every aggregation.
+sum by (error_type) (rate(hermes_worker_runtime_errors_total[5m]))
+sum(rate(hermes_worker_runtime_errors_total[1m]))
 ```
+
+Use recording rules so alerts and fleet dashboards share the exact same bounded
+aggregation. The threshold values below are examples only; deployment-owned
+configuration must set an agreed error budget and retain the `error_type`
+dimension for triage.
+
+```yaml
+groups:
+  - name: hermes-worker-runtime
+    rules:
+      - record: hermes:worker_runtime_errors:rate5m_by_error_type
+        expr: sum by (error_type) (rate(hermes_worker_runtime_errors_total[5m]))
+      - record: hermes:worker_runtime_errors:rate1m
+        expr: sum(rate(hermes_worker_runtime_errors_total[1m]))
+      - alert: HermesWorkerRuntimeErrorsAboveBudget
+        expr: hermes:worker_runtime_errors:rate1m > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Hermes worker runtime errors are sustained above the configured budget
+```
+
+For a type-specific page or ticket, alert from
+`hermes:worker_runtime_errors:rate5m_by_error_type > <deployment budget>` after
+replacing the placeholder with the deployment's numeric threshold. Never group
+these alerts by rendered exception text, stack frame, user, prompt, path, or
+provider response: those fields are deliberately not telemetry dimensions.
 
 Cron execution lifecycle records arrive as `hermes.cron_execution` spans.
 Alert or derive events from bounded attributes such as:
@@ -152,7 +186,9 @@ Recommended operator views:
 2. scheduler heartbeat, last-success age, running count, overdue count, and
    catch-up increase;
 3. a cron lifecycle feed keyed only by opaque `hermes.job_key`;
-4. separate alerts for box absence, local bridge down, scheduler stale, cron
+4. runtime-error rate by bounded `error_type`, with the configured error-budget
+   alert and an adjacent audit-event feed;
+5. separate alerts for box absence, local bridge down, scheduler stale, cron
    failed/unknown, delivery failure, and overdue/catch-up activity.
 
 Keep alert thresholds and routing in deployment-owned configuration. Do not add
@@ -161,7 +197,7 @@ or account identity merely to make a dashboard easier to read.
 
 ## Release-validation scenarios
 
-Before accepting a deployment, force and verify all five cases through the real
+Before accepting a deployment, force and verify all six cases through the real
 collector and backend:
 
 1. **Cron success:** observe `claimed -> running -> completed`, duration, and a
@@ -175,6 +211,12 @@ collector and backend:
    remain healthy.
 5. **Killed gateway:** terminate one canary, verify missing-series detection,
    restart it, and confirm the same opaque instance identity returns.
+6. **Worker runtime errors:** trigger the runtime-error handler twice with one
+   bounded error type. Verify two content-free audit events and a cumulative
+   counter increase of two, then evaluate the deployment's recording and alert
+   expressions against the captured series. Confirm the alert enters pending
+   and firing only when its configured rate/`for` threshold is met, and clears
+   after the rate window recovers.
 
 Hermes Agent-owned Relay transport health remains in scope. A separate gateway
 or connector service remains authoritative for any shared connected-platform
@@ -192,7 +234,8 @@ python scripts/observability/otel_capture_collector.py \
   --host 127.0.0.1 --port 4318 --log ~/.hermes/cache/scratch/hermes_otel_capture.jsonl
 
 # terminal 2: drive the real exporter through lifecycle transitions,
-# a fatal platform, and a structured warning event, then flush
+# a fatal platform, a structured warning event, and worker-runtime diagnostics,
+# then flush
 python scripts/observability/gateway_health_export_probe.py \
   --endpoint http://127.0.0.1:4318/v1/traces \
   --log ~/.hermes/cache/scratch/hermes_otel_capture.jsonl --wait 8
@@ -221,7 +264,7 @@ string attributes that could touch user input must pass through
 `redaction.redact_for_export` and be truncated (see `_span_attrs` in
 `agent/monitoring/otlp_exporter.py`).
 
-### Adding a new gauge/metric
+### Adding a new gauge or counter
 
 1. Emit it in the snapshot builder (`agent/monitoring/gateway_health.py`
    `build_gateway_health_snapshot`, `cron_health.py` `build_cron_health_snapshot`,
@@ -230,9 +273,11 @@ string attributes that could touch user input must pass through
    collection loop — wrap it and log a **content-free WARNING with the exception
    TYPE name only** (the pattern the cron and background-work readers use), so a
    future regression is visible instead of silently dropping the signal.
-2. Register the dotted metric name in the observable-gauge `metric_names` list in
-   `gateway_health_export.py::_start_metric_provider`. **A gauge that is emitted
-   in the snapshot but not registered here is never observed.**
+2. Register the dotted metric name with the matching OpenTelemetry instrument in
+   `gateway_health_export.py::_start_metric_provider`. Use an observable gauge
+   only for a point-in-time value; use a monotonic counter for occurrences such
+   as worker failures. **A metric that is emitted but not registered here is
+   never observed.**
 3. Add the export-table row and an alert example in this file.
 4. If the deployment fronts the exporter with an OpenTelemetry Collector that
    uses a metric-name allowlist (a `filter/...` processor with `name != "..."`
@@ -294,6 +339,10 @@ python scripts/observability/gateway_health_export_probe.py \
 Decode the captured OTLP payload and assert the new name/attribute is present
 AND that no content leaked. When a real collector sits in front, add its
 allowlist entries and re-verify against the backend, not just the local capture.
+For `hermes.worker.runtime_errors`, assert a cumulative counter (not a gauge),
+an `error_type` drawn from the documented bounded enum, and matching
+content-free `worker.runtime.error` audit records before evaluating the
+recording and alert rules in the destination backend.
 
 ## Boundaries and roadmap
 

@@ -172,7 +172,10 @@ _KEEP_BY_KIND: Dict[str, tuple[str, ...]] = {
         "name", "gateway_state", "old_state", "new_state", "exit_reason", "restart_requested", "active_agents",
         "gateway_busy", "gateway_drainable", "platform_count", "fatal_platform_count", "version", "supervision_mode", "pid",
     ),
-    "gateway_diagnostic": ("name", "subsystem", "error_class", "error_code", "platform", "old_state", "new_state", "version", "severity"),
+    "gateway_diagnostic": (
+        "name", "subsystem", "error_class", "error_code", "platform", "old_state", "new_state", "version", "severity",
+        "correlation_id", "trace_frame_count", "trace_fingerprint",
+    ),
     "cron_execution": ("status", "job_key", "source", "duration_ms", "delivery_outcome", "error_class"),
 }
 

@@ -82,6 +82,21 @@ def test_diagnostic_log_attributes_are_allowlisted_redacted_and_profile_free():
     assert "top-secret-token-0123456789" not in str(attrs)
 
 
+def test_diagnostic_correlation_id_reaches_otlp_dashboard_attributes():
+    from agent.monitoring.otlp_exporter import _span_attrs
+
+    attrs = _span_attrs({
+        "event": "gateway_diagnostic",
+        "name": "worker.runtime.error",
+        "subsystem": "worker.runtime",
+        "correlation_id": "t_aedd2ed3",
+        "error_code": "provider_failure",
+    })
+
+    assert attrs["hermes.correlation_id"] == "t_aedd2ed3"
+    assert attrs["hermes.error_code"] == "provider_failure"
+
+
 
 
 

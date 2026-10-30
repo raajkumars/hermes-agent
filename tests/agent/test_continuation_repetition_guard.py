@@ -77,6 +77,12 @@ class TestContinuationRepetitionGuard:
 
         assert result["completed"] is False
         assert result["partial"] is True
+        assert result["failure_reason"] == "repetition_loop"
+        assert result["failure_retryable"] is True
+        # Repetition is stochastic, not a deterministic worker capability
+        # shortage.  It must use the ordinary retry/failure breaker rather than
+        # parking the task on the first bad provider sample.
+        assert "capability_failure" not in result
         assert "Repetition" in (result["final_response"] or "")
         # The pathological fragment must NOT be appended to the history.
         assert not any(
