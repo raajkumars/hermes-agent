@@ -1587,6 +1587,36 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+def list_dependency_stranded_tasks(conn: sqlite3.Connection) -> list[Task]:
+    """Return todo tasks whose direct parents are all terminal.
+
+    ``archived`` is the board's canonical equivalent of an abandoned parent.
+    Parentless todo tasks are eligible for ordinary dispatch and are deliberately
+    excluded: a dependency-stranded task must have at least one dependency.
+    """
+    rows = conn.execute(
+        """
+        SELECT child.*
+          FROM tasks AS child
+         WHERE child.status = 'todo'
+           AND EXISTS (
+               SELECT 1
+                 FROM task_links AS link
+                WHERE link.child_id = child.id
+           )
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM task_links AS link
+                 JOIN tasks AS parent ON parent.id = link.parent_id
+                WHERE link.child_id = child.id
+                  AND parent.status NOT IN ('done', 'archived')
+           )
+         ORDER BY child.priority DESC, child.created_at ASC, child.id ASC
+        """
+    ).fetchall()
+    return [Task.from_row(row) for row in rows]
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
@@ -2254,8 +2284,10 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     return not _parent_verdict_holds(conn, task_id)
 
 
-_APPROVE_VERDICTS = frozenset({"approve", "approved", "accept", "accepted", "lgtm", "pass", "passed"})
-_REJECTING_SUMMARY_RE = re.compile(r"\b(?:changes?\s+requested|needs?\s+(?:work|changes?)|reject(?:ed|ion)?)\b", re.I)
+_REJECTING_VERDICT_RE = re.compile(
+    r"^(?P<verdict>changes?\s+requested|needs?\s+(?:work|changes?)|reject(?:ed|ion)?)\b",
+    re.I,
+)
 
 
 def _normalise_verdict(value: object) -> Optional[str]:
@@ -2264,20 +2296,28 @@ def _normalise_verdict(value: object) -> Optional[str]:
     return re.sub(r"[\s_-]+", "_", value.strip().lower())
 
 
-def _latest_completed_parent_verdict(conn: sqlite3.Connection, parent_id: str) -> tuple[Optional[str], Optional[str]]:
+def _latest_parent_rejection(conn: sqlite3.Connection, parent_id: str) -> Optional[str]:
+    """Return a recorded rejection from the parent's latest run, if any.
+
+    ``outcome`` is the authoritative lifecycle signal.  Older handoffs may
+    have recorded only ``metadata.verdict``; keep that compatibility path
+    intentionally narrow so a positive value such as ``approved_unmerged``
+    cannot be mistaken for a rejection because it contains incidental prose.
+    """
     row = conn.execute(
-        "SELECT summary, metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+        "SELECT outcome, metadata FROM task_runs WHERE task_id = ? "
         "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1", (parent_id,),
     ).fetchone()
     if row is None:
-        return None, None
+        return None
+    if row["outcome"] == "changes_requested":
+        return "changes_requested"
     metadata = _json_dict(row["metadata"])
-    verdict = _normalise_verdict(metadata.get("verdict"))
-    if verdict:
-        return verdict, "structured"
-    if _REJECTING_SUMMARY_RE.search(str(row["summary"] or "")):
-        return "rejection_summary", "summary"
-    return None, None
+    raw_verdict = metadata.get("verdict")
+    if not isinstance(raw_verdict, str):
+        return None
+    match = _REJECTING_VERDICT_RE.match(raw_verdict.lstrip())
+    return _normalise_verdict(match.group("verdict")) if match else None
 
 
 def _parent_verdict_holds(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str, str, Optional[str]]]:
@@ -2290,8 +2330,8 @@ def _parent_verdict_holds(conn: sqlite3.Connection, task_id: str) -> list[tuple[
         if status not in ("done", "archived"):
             holds.append((parent_id, status, "parent_not_terminal", None))
             continue
-        verdict, _source = _latest_completed_parent_verdict(conn, parent_id)
-        if verdict is not None and verdict not in _APPROVE_VERDICTS:
+        verdict = _latest_parent_rejection(conn, parent_id)
+        if verdict is not None:
             holds.append((parent_id, status, "parent_verdict_not_approve", verdict))
     return holds
 
