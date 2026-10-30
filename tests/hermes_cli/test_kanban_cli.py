@@ -130,6 +130,26 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def test_kanban_diagnostics_surfaces_dependency_stranded_card(kanban_home):
+    """The operator-facing command exposes stranded-card ids and parent ids."""
+    with kbc.connect_closing() as conn:
+        parent_id = kb.create_task(conn, title="finished parent")
+        assert kb.complete_task(conn, parent_id, summary="finished")
+        child_id = kb.create_task(conn, title="stranded child", parents=[parent_id])
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child_id,))
+        conn.commit()
+
+    output = kc.run_slash("diagnostics --severity error")
+    payload = json.loads(kc.run_slash("diagnostics --task " + child_id + " --json"))
+
+    assert child_id in output
+    assert "dependency_stranded" in output
+    assert f"terminal_parent_ids={parent_id}" in output
+    assert payload[0]["task_id"] == child_id
+    diagnostic = next(d for d in payload[0]["diagnostics"] if d["kind"] == "dependency_stranded")
+    assert diagnostic["data"]["terminal_parent_ids"] == [parent_id]
+
+
 def test_kanban_edit_updates_documented_task_fields(kanban_home):
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="old title", body="old body", priority=2)

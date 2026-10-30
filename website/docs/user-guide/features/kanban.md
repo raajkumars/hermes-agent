@@ -1429,6 +1429,25 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
 
+## Deployment validation for stranded dependencies
+
+Before declaring a Hermes deployment healthy, query the deployed dashboard API
+rather than opening its local SQLite database. The API exposes only the board
+and count at `GET /api/plugins/kanban/health/dependencies`, so a deployment
+hook does not need task titles, bodies, or database access.
+
+```bash
+python scripts/observability/validate_kanban_dependency_health.py \
+  --api-url https://hermes.example.com \
+  --board production
+```
+
+The command exits `0` when the count is zero, `1` when dependency-stranded
+tasks exist, and `2` when the API cannot be queried or returns an invalid
+response. Make it a required post-deployment step; a nonzero exit status must
+block rollout completion until the stranded dependency is repaired or the
+deployment is rolled back.
+
 ## Out of scope
 
 Kanban is deliberately single-host. `~/.hermes/kanban.db` is a local SQLite file and the dispatcher spawns workers on the same machine. Running a shared board across two hosts is not supported — there's no coordination primitive for "worker X on host A, worker Y on host B," and the crash-detection path assumes PIDs are host-local. If you need multi-host, run an independent board per host and use `delegate_task` / a message queue to bridge them.

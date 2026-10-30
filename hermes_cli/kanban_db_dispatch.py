@@ -110,6 +110,10 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    dependency_stranded: list[str] = field(default_factory=list)
+    """Todo task ids found with only terminal parents before this tick's
+    dependency recomputation promoted them. Each finding receives a
+    ``dependency_stranded`` task event for dispatcher telemetry."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -2817,6 +2821,27 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _record_dependency_stranded(conn: sqlite3.Connection, result: DispatchResult) -> None:
+    """Emit one-shot telemetry for stale dependency gates before their repair."""
+    rows = conn.execute(
+        """
+        SELECT child.id AS child_id, GROUP_CONCAT(parent.id) AS parent_ids
+        FROM tasks AS child
+        JOIN task_links AS link ON link.child_id = child.id
+        JOIN tasks AS parent ON parent.id = link.parent_id
+        WHERE child.status = 'todo'
+        GROUP BY child.id
+        HAVING COUNT(parent.id) > 0
+           AND SUM(CASE WHEN parent.status IN ('done', 'archived') THEN 0 ELSE 1 END) = 0
+        """
+    ).fetchall()
+    for row in rows:
+        task_id = str(row["child_id"])
+        parent_ids = [parent_id for parent_id in str(row["parent_ids"] or "").split(",") if parent_id]
+        _kb._append_event(conn, task_id, "dependency_stranded", {"terminal_parent_ids": parent_ids})
+        result.dependency_stranded.append(task_id)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -3241,6 +3266,7 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    _record_dependency_stranded(conn, result)
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,

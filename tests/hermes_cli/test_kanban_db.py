@@ -45,6 +45,40 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def test_dispatch_records_dependency_stranded_before_promoting(kanban_home):
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="ira")
+        child = kb.create_task(conn, title="child", assignee="ira", parents=[parent])
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_: None, max_spawn=0)
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (child,)
+        ).fetchall()
+        status = conn.execute("SELECT status FROM tasks WHERE id = ?", (child,)).fetchone()[0]
+
+    assert result.dependency_stranded == [child]
+    assert any(event["kind"] == "dependency_stranded" for event in events)
+    assert status == "ready"
+
+
+def test_list_dependency_stranded_tasks_returns_only_terminal_parent_todo_cards(kanban_home):
+    with kbc.connect() as conn:
+        done_parent = kb.create_task(conn, title="done", assignee="ira")
+        archived_parent = kb.create_task(conn, title="archived", assignee="ira")
+        open_parent = kb.create_task(conn, title="open", assignee="ira")
+        stranded = kb.create_task(conn, title="stranded", assignee="ira", parents=[done_parent, archived_parent])
+        mixed = kb.create_task(conn, title="mixed", assignee="ira", parents=[done_parent, open_parent])
+        parentless = kb.create_task(conn, title="parentless", assignee="ira")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (done_parent,))
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (archived_parent,))
+
+        detected = kb.list_dependency_stranded_tasks(conn)
+
+    assert [task.id for task in detected] == [stranded]
+    assert mixed not in [task.id for task in detected]
+    assert parentless not in [task.id for task in detected]
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------

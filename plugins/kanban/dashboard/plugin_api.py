@@ -342,6 +342,23 @@ async def get_board_endpoint(
     )
 
 
+# --- GET /health/dependencies -----------------------------------------------
+
+@router.get("/health/dependencies")
+def get_dependency_health(board: Optional[str] = _BOARD_Q):
+    """Return the deployed board's stranded dependency count for release checks.
+
+    The payload is deliberately content-free: deployment automation needs a
+    health signal, not task titles or summaries.
+    """
+    with _board_conn(board) as (resolved_board, conn):
+        count = len(kanban_db.list_dependency_stranded_tasks(conn))
+    return {
+        "board": resolved_board or kanban_db.get_current_board(),
+        "dependency_stranded_task_count": count,
+    }
+
+
 # --- GET /tasks/:id ---------------------------------------------------------
 
 @router.get("/tasks/{task_id}")
