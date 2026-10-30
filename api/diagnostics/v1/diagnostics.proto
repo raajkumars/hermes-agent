@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package hermes.diagnostics.v1;
+
+option go_package = "github.com/qwickapps/diagnostics/gen/go/hermes/diagnostics/v1;diagnosticsv1";
+
+// Metadata-first diagnostics ingestion. Producers MUST NOT place raw exception
+// messages, source paths, prompt/message content, request bodies, environment
+// values, or local variables in this contract.
+service DiagnosticsIngestService {
+  // Accepts one event for asynchronous validation, redaction, and export.
+  // The idempotency_key is required for retry-safe delivery.
+  rpc IngestDiagnostic(IngestDiagnosticRequest) returns (IngestDiagnosticResponse);
+}
+
+message IngestDiagnosticRequest {
+  string idempotency_key = 1; // UUID.
+  DiagnosticEvent event = 2;
+}
+
+message IngestDiagnosticResponse {
+  string receipt_id = 1; // UUID.
+  string status = 2; // "accepted".
+}
+
+message DiagnosticEvent {
+  string event_id = 1; // UUID.
+  string observed_at = 2; // RFC 3339 UTC timestamp.
+  string service = 3;
+  string environment = 4; // development|staging|production|test.
+  string severity = 5; // debug|info|warning|error|critical.
+  string correlation_id = 6; // Optional UUID.
+  ErrorDetail error = 7;
+  map<string, string> attributes = 8; // Allowlisted, non-sensitive dimensions only.
+}
+
+message ErrorDetail {
+  string type = 1;
+  string code = 2;
+  string fingerprint = 3; // SHA-256 over the producer's redacted stack representation.
+  repeated StackFrame stack = 4; // 1..64 frames; raw stack text is forbidden.
+}
+
+message StackFrame {
+  string module = 1;
+  string function = 2;
+  int32 line = 3;
+}

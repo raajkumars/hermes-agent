@@ -1,0 +1,224 @@
+openapi: 3.1.0
+info:
+  title: Centralized Error Diagnostics API
+  version: 1.0.0
+  description: |
+    Ingests bounded, structured runtime failure diagnostics for operator-owned
+    monitoring. This API is metadata-first: diagnostic messages, source paths,
+    request bodies, environment values, local variables, and raw stack-trace
+    text are intentionally out of contract.
+servers:
+  - url: https://diagnostics.example.invalid
+security:
+  - diagnosticsIngest: []
+paths:
+  /v1/diagnostics:
+    post:
+      operationId: ingestDiagnostic
+      summary: Ingest one structured diagnostic event
+      description: |
+        The server deduplicates a repeated event when its `Idempotency-Key`
+        and canonical request body match an accepted request during the
+        retention window. A caller retries only the responses marked
+        retryable in this specification.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiagnosticEvent'
+      responses:
+        '202':
+          description: Accepted for asynchronous validation, redaction, and export.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedDiagnostic'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          description: Missing or invalid ingest credentials. Do not retry until credentials change.
+        '403':
+          description: Authenticated producer is not authorized for this service. Do not retry.
+        '409':
+          description: Idempotency key was previously used with a different body. Do not retry with that key.
+        '413':
+          description: Payload exceeds an enforced bound. Do not retry without reducing the payload.
+        '415':
+          description: Content type must be application/json. Do not retry unchanged.
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/RetryableFailure'
+        '503':
+          $ref: '#/components/responses/RetryableFailure'
+components:
+  securitySchemes:
+    diagnosticsIngest:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Producer credential with diagnostics.ingest scope.
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Producer-generated UUID used to safely retry one event.
+      schema:
+        type: string
+        format: uuid
+  responses:
+    ValidationError:
+      description: The event violates the ingestion contract. Correct the event before retrying.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: validation_error
+            retryable: false
+            fields:
+              - path: /error/type
+                rule: pattern
+                message: must be a bounded error taxonomy value
+    RateLimited:
+      description: Per-producer rate limit exceeded. Retry after the indicated delay with the same idempotency key.
+      headers:
+        Retry-After:
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RetryableFailure:
+      description: Transient ingest failure. Retry with exponential backoff and the same idempotency key.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    DiagnosticEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - event_id
+        - observed_at
+        - service
+        - severity
+        - error
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: Stable producer-generated event identifier.
+        observed_at:
+          type: string
+          format: date-time
+          description: UTC RFC 3339 timestamp at which the failure was observed.
+        service:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+          description: Logical producing service name, not a hostname or user identifier.
+        environment:
+          type: string
+          pattern: '^(development|staging|production|test)$'
+        severity:
+          type: string
+          enum: [debug, info, warning, error, critical]
+        correlation_id:
+          type: string
+          format: uuid
+          description: Optional workflow or request correlation identifier.
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
+        attributes:
+          type: object
+          description: Optional allowlisted, non-sensitive dimensions agreed with monitoring.
+          additionalProperties:
+            type: string
+            maxLength: 128
+          maxProperties: 20
+          propertyNames:
+            pattern: '^[a-z][a-z0-9_.-]{0,63}$'
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      required: [type, stack]
+      properties:
+        type:
+          type: string
+          pattern: '^[A-Za-z][A-Za-z0-9_.-]{0,127}$'
+          description: Normalized exception or failure taxonomy, such as `timeout` or `provider.rate_limit`.
+        code:
+          type: string
+          pattern: '^[A-Za-z][A-Za-z0-9_.-]{0,127}$'
+          description: Optional stable machine-readable code.
+        fingerprint:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: SHA-256 fingerprint calculated by the producer from its redacted stack representation.
+        stack:
+          type: array
+          description: Bounded stack representation. Raw traceback text is prohibited.
+          minItems: 1
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/StackFrame'
+    StackFrame:
+      type: object
+      additionalProperties: false
+      required: [module, function, line]
+      properties:
+        module:
+          type: string
+          pattern: '^[A-Za-z_][A-Za-z0-9_.-]{0,127}$'
+        function:
+          type: string
+          maxLength: 128
+          pattern: '^[A-Za-z_<>][A-Za-z0-9_<>.$-]{0,127}$'
+        line:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+    AcceptedDiagnostic:
+      type: object
+      additionalProperties: false
+      required: [receipt_id, status]
+      properties:
+        receipt_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          const: accepted
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [code, retryable]
+      properties:
+        code:
+          type: string
+          enum: [validation_error, unauthorized, forbidden, idempotency_conflict, payload_too_large, unsupported_media_type, rate_limited, unavailable, internal]
+        retryable:
+          type: boolean
+        fields:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: false
+            required: [path, rule]
+            properties:
+              path:
+                type: string
+              rule:
+                type: string
+              message:
+                type: string
+                maxLength: 256
