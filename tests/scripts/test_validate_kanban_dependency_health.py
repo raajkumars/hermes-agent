@@ -3,26 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import sys
 from pathlib import Path
 
-import pytest
-
-from hermes_cli import kanban_db as kb
-from hermes_cli import kanban_db_connect as kbc
-
-
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "observability" / "validate_kanban_dependency_health.py"
-
-
-@pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
-    return home
 
 
 def _load():
@@ -34,20 +20,49 @@ def _load():
     return mod
 
 
-def test_validation_hook_passes_without_stranded_dependencies(kanban_home, capsys):
-    mod = _load()
+def _json_response(payload):
+    return io.BytesIO(json.dumps(payload).encode())
 
-    assert mod.main([]) == 0
+
+def test_validation_hook_passes_when_deployed_api_reports_no_stranded_dependencies(monkeypatch, capsys):
+    mod = _load()
+    called = {}
+
+    def fake_urlopen(url, *, timeout):
+        called.update(url=url, timeout=timeout)
+        return _json_response({"dependency_stranded_task_count": 0})
+
+    monkeypatch.setattr(mod, "urlopen", fake_urlopen)
+
+    assert mod.main(["--api-url", "https://hermes.example/"]) == 0
+    assert called == {
+        "url": "https://hermes.example/api/plugins/kanban/health/dependencies",
+        "timeout": 10.0,
+    }
     assert capsys.readouterr().out == "PASS: no dependency-stranded Kanban tasks detected.\n"
 
 
-def test_validation_hook_fails_for_terminal_parent_todo_dependency(kanban_home, capsys):
-    with kbc.connect() as conn:
-        parent = kb.create_task(conn, title="parent", assignee="ira")
-        kb.create_task(conn, title="child", assignee="ira", parents=[parent])
-        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
-
+def test_validation_hook_fails_for_stranded_dependencies_reported_by_deployed_api(monkeypatch, capsys):
     mod = _load()
+    called = {}
 
-    assert mod.main([]) == 1
+    def fake_urlopen(url, *, timeout):
+        called.update(url=url, timeout=timeout)
+        return _json_response({"dependency_stranded_task_count": 1})
+
+    monkeypatch.setattr(mod, "urlopen", fake_urlopen)
+
+    assert mod.main(["--api-url", "https://hermes.example", "--board", "release board", "--timeout", "3"]) == 1
+    assert called == {
+        "url": "https://hermes.example/api/plugins/kanban/health/dependencies?board=release+board",
+        "timeout": 3.0,
+    }
     assert capsys.readouterr().out == "FAIL: 1 dependency-stranded Kanban task(s) detected.\n"
+
+
+def test_validation_hook_fails_closed_for_invalid_deployed_api_response(monkeypatch, capsys):
+    mod = _load()
+    monkeypatch.setattr(mod, "urlopen", lambda url, *, timeout: _json_response({"dependency_stranded_task_count": "one"}))
+
+    assert mod.main(["--api-url", "https://hermes.example"]) == 2
+    assert "ERROR: dependency health response" in capsys.readouterr().out
