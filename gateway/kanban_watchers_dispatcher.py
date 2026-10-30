@@ -326,13 +326,25 @@ class _KanbanDispatcher:
             # process (see the matching note in the notifier collector).
             conn = _kbc().connect(board=slug)
             count, completion_id, cap_blocked = self._load_respawn_state(slug, conn)
-            if cap_blocked:
+            remaining = self.settings.max_spawns_without_completion - count
+            if cap_blocked or remaining <= 0:
+                cap_blocked = True
+                self._store_respawn_state(
+                    slug, conn, count=count, last_completed_run_id=completion_id,
+                    cap_blocked=cap_blocked,
+                )
+                self._spawns_since_completion[slug] = count
                 logger.warning(
                     "kanban dispatcher: board %s remains held by sticky respawn cap "
                     "(%d confirmed starts without a completion)",
                     slug, count,
                 )
                 return _kbd().DispatchResult(respawn_cap_blocked=True)
+            configured_max_spawn = kwargs.get("max_spawn")
+            kwargs["max_spawn"] = (
+                remaining if configured_max_spawn is None
+                else min(configured_max_spawn, remaining)
+            )
             result = _kbd().dispatch_once(conn, board=slug, **kwargs)
             # A claim can be retried, and a process launch can fail, without a
             # worker ever starting. ``DispatchResult.spawned`` is the only
@@ -340,7 +352,7 @@ class _KanbanDispatcher:
             # dispatch pass, so a just-completed worker always clears the cap
             # before this board can launch again.
             count += len(getattr(result, "spawned", ()) or ())
-            cap_blocked = count > self.settings.max_spawns_without_completion
+            cap_blocked = count >= self.settings.max_spawns_without_completion
             self._store_respawn_state(
                 slug, conn, count=count, last_completed_run_id=completion_id,
                 cap_blocked=cap_blocked,
