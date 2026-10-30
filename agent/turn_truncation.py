@@ -181,7 +181,7 @@ class _Trunc(TruncationVerdict):
         # capability/configuration, never by re-spawning the same task. Preserve
         # the measured facts so the Kanban one-shot wrapper can create an auditable
         # capability blocker instead of letting the dispatcher count a crash.
-        if failure[0] in {"context_window_full", "context_overflow", "repetition_loop"}:
+        if failure[0] in {"context_window_full", "context_overflow"}:
             usage = getattr(self.response, "usage", None)
             prompt_tokens = None
             if usage is not None:
@@ -443,7 +443,10 @@ def recover_from_truncation(
     if abort is not None:
         line, user_response, error = abort
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
-        failure = ("repetition_loop", False) if abort == _REPETITION_DOMINATED else ("truncated", True)
+        # A repetition-dominated reply is stochastic: retrying can succeed with
+        # the same model, and must not turn a Kanban task into a sticky
+        # capability blocker after a single bad sample.
+        failure = ("repetition_loop", True) if abort == _REPETITION_DOMINATED else ("truncated", True)
         return st.end_turn(user_response, error, failure=failure)
 
     if agent.api_mode in _CONTINUABLE_MODES:
