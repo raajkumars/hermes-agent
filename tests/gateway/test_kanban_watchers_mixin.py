@@ -74,3 +74,23 @@ def test_gateway_dispatcher_stuck_warning_names_guard_reason(monkeypatch, caplog
     stuck = [r.getMessage() for r in caplog.records if "dispatcher stuck" in r.getMessage()]
     assert stuck, [r.getMessage() for r in caplog.records]
     assert "Last tick held back: active_pr=1." in stuck[0]
+
+
+def test_tick_summary_logs_current_stranded_count_as_json(caplog):
+    """Each dispatcher tick reports its own dependency diagnostic count."""
+    import json
+    import logging
+
+    from gateway.kanban_watchers_dispatcher import _log_spawn_results
+    from hermes_cli.kanban_db_dispatch import DispatchResult
+
+    first = DispatchResult(dependency_stranded=["t_one", "t_two"])
+    second = DispatchResult()
+    with caplog.at_level(logging.DEBUG, logger="gateway.run"):
+        assert not _log_spawn_results([("default", first)])
+        assert not _log_spawn_results([("default", second)])
+
+    messages = [r.getMessage() for r in caplog.records if "tick summary" in r.getMessage()]
+    assert len(messages) == 2
+    summaries = [json.loads(message.rsplit(" tick summary ", 1)[1]) for message in messages]
+    assert [summary["stranded_cards"] for summary in summaries] == [2, 0]
