@@ -151,6 +151,26 @@ def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
     assert cmd[j + 1] == "openrouter"
 
 
+def test_worker_argv_resolves_configured_routing_lane(monkeypatch, tmp_path):
+    """A declarative lane pins the configured model and provider at spawn."""
+    task = kb.Task(
+        id="t_route", title="deep review", body=None, assignee="worker", status="running",
+        priority=0, created_by=None, created_at=1, started_at=None, completed_at=None,
+        workspace_kind="scratch", workspace_path=None, claim_lock=None, claim_expires=None,
+        tenant=None, routing_lane="deep", min_context_window=200000,
+    )
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"model_routing": {"lanes": {
+            "deep": {"model": "gpt-5.6", "provider": "openai", "context_window": 400000},
+        }}}},
+    )
+    cmd = kbd._worker_argv(task, "worker", str(tmp_path))
+    assert cmd[cmd.index("-m") + 1] == "gpt-5.6"
+    assert cmd[cmd.index("--provider") + 1] == "openai"
+
+
 # ---------------------------------------------------------------------------
 # Dashboard API — PATCH / bulk / create / model-options
 # ---------------------------------------------------------------------------
