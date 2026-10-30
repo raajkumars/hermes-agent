@@ -591,6 +591,28 @@ def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagno
     )]
 
 
+def _rule_dependency_stranded(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Report a dependency-complete todo task without mutating the board."""
+    if _task_field(task, "status") != "todo":
+        return []
+    graph = cfg.get("_graph")
+    if not isinstance(graph, dict):
+        return []
+    parents = [parent for parent in graph.get("parents", []) if isinstance(parent, dict) and parent.get("id")]
+    if not parents or any(parent.get("status") not in ("done", "archived") for parent in parents):
+        return []
+    task_id = str(_task_field(task, "id") or "")
+    parent_ids = [str(parent["id"]) for parent in parents]
+    return [Diagnostic(
+        kind="dependency_stranded", severity="error",
+        title="Dependency-complete task is still in todo",
+        detail="Every direct parent is done or archived, so this task should have been promoted to ready by the dispatcher.",
+        actions=[_cli_hint("Inspect task history", f"hermes kanban log {task_id}", suggested=True)],
+        first_seen_at=now, last_seen_at=now, count=len(parent_ids),
+        data={"terminal_parent_ids": parent_ids},
+    )]
+
+
 def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Blocked for >= cfg["blocked_stale_hours"] (default 24) with no comment
     or unblock since the last ``blocked`` event."""
@@ -797,6 +819,7 @@ _RULES: list[RuleFn] = [
     _rule_repeated_crashes,
     _rule_review_dependency_deadlock,
     _rule_running_with_open_parents,
+    _rule_dependency_stranded,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
@@ -909,6 +932,7 @@ DIAGNOSTIC_KINDS = (
     "repeated_failures",
     "repeated_crashes",
     "review_dependency_deadlock",
+    "dependency_stranded",
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",

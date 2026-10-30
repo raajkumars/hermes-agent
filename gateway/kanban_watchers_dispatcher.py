@@ -8,6 +8,7 @@ the singleton lock and the health telemetry; everything that only needs the
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import sqlite3
 import time
@@ -361,20 +362,50 @@ def _default_profile_secret_scope():
         reset_secret_scope(token)
 
 
+def _tick_summary(res: Any) -> dict[str, int]:
+    """Return the per-board dispatcher metrics emitted after every tick.
+
+    ``dependency_stranded`` is populated by the dispatch pass's diagnostic
+    sweep, so it deliberately reflects this tick rather than an accumulated
+    historical event count.
+    """
+    def _count(value: Any) -> int:
+        return len(value) if hasattr(value, "__len__") else 0
+
+    return {
+        "spawned": _count(getattr(res, "spawned", None)),
+        "reclaimed": int(getattr(res, "reclaimed", 0) or 0),
+        "crashed": _count(getattr(res, "crashed", None)),
+        "timed_out": _count(getattr(res, "timed_out", None)),
+        "promoted": int(getattr(res, "promoted", 0) or 0),
+        "auto_blocked": _count(getattr(res, "auto_blocked", None)),
+        "stranded_cards": _count(getattr(res, "dependency_stranded", None)),
+    }
+
+
 def _log_spawn_results(results: Optional[list]) -> bool:
-    """Log per-board spawn summaries; returns whether any board spawned."""
+    """Log JSON tick summaries and return whether any board spawned.
+
+    An idle tick is debug-level to preserve the gateway's quiet default, but
+    every board result is summarized so ``stranded_cards`` is refreshed on each
+    dispatch cycle instead of retaining a prior diagnostic count.
+    """
     any_spawned = False
     for slug, res in (results or []):
-        if res is not None and getattr(res, "spawned", None):
-            any_spawned = True
-            # Quiet by default: an idle gateway stays silent.
-            logger.info(
-                "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
-                slug, len(res.spawned), res.reclaimed,
-                len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
-                len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
-                res.promoted,
-                len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+        if res is None:
+            continue
+        summary = _tick_summary(res)
+        any_spawned = any_spawned or bool(summary["spawned"])
+        payload = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+        log = logger.info if any(summary.values()) else logger.debug
+        log("kanban dispatcher [%s] tick summary %s", slug, payload)
+        if summary["stranded_cards"]:
+            # Warning-level gateway logs are exported as diagnostics by the
+            # existing monitoring bridge.  Keep the payload count-only: task
+            # titles/bodies can carry operator data and do not belong in OTLP.
+            logger.warning(
+                "kanban dispatcher [%s]: dependency-stranded cards detected (count=%d)",
+                slug,
+                summary["stranded_cards"],
             )
     return any_spawned
