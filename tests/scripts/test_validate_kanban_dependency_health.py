@@ -1,68 +1,143 @@
-"""Post-deployment Kanban dependency health validation contract."""
+"""Authenticated, cached and rate-limited dependency-health client contract."""
 
 from __future__ import annotations
 
+from email.message import Message
 import importlib.util
 import io
 import json
-import sys
 from pathlib import Path
+import sys
+from urllib.error import HTTPError
 
-SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "observability" / "validate_kanban_dependency_health.py"
+import pytest
+
+SCRIPTS = Path(__file__).resolve().parents[2] / "scripts" / "observability"
+CLIENT = SCRIPTS / "kanban_dependency_health_client.py"
+HOOK = SCRIPTS / "validate_kanban_dependency_health.py"
 
 
-def _load():
-    spec = importlib.util.spec_from_file_location("validate_kanban_dependency_health", SCRIPT)
+def _load(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-def _json_response(payload):
+def _response(payload):
     return io.BytesIO(json.dumps(payload).encode())
 
 
-def test_validation_hook_passes_when_deployed_api_reports_no_stranded_dependencies(monkeypatch, capsys):
-    mod = _load()
+def _http_error(code: int, retry_after: str | None = None):
+    headers = Message()
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return HTTPError("https://hermes.example/health", code, "error", headers, None)
+
+
+def test_client_authenticates_and_caches_successful_count():
+    mod = _load(CLIENT, "kanban_dependency_health_client_auth_cache")
+    calls = []
+    now = [100.0]
+
+    def opener(request, *, timeout):
+        calls.append((request.full_url, request.get_header("Authorization"), timeout))
+        return _response({"dependency_stranded_task_count": 2})
+
+    client = mod.DependencyHealthClient(
+        api_url="https://hermes.example/",
+        bearer_credential="credential-for-test-only",
+        cache_ttl=30,
+        opener=opener,
+        clock=lambda: now[0],
+    )
+
+    assert client.stranded_task_count(board="release board") == 2
+    assert client.stranded_task_count(board="release board") == 2
+    assert calls == [
+        (
+            "https://hermes.example/api/plugins/kanban/health/dependencies?board=release+board",
+            "Bearer credential-for-test-only",
+            10.0,
+        )
+    ]
+
+    now[0] += 31
+    assert client.stranded_task_count(board="release board") == 2
+    assert len(calls) == 2
+
+
+def test_client_honors_retry_after_for_rate_limit_then_succeeds():
+    mod = _load(CLIENT, "kanban_dependency_health_client_rate_limit")
+    calls = []
+    sleeps = []
+
+    def opener(request, *, timeout):
+        calls.append(request)
+        if len(calls) == 1:
+            raise _http_error(429, "3")
+        return _response({"dependency_stranded_task_count": 0})
+
+    client = mod.DependencyHealthClient(
+        api_url="https://hermes.example",
+        bearer_credential="credential-for-test-only",
+        opener=opener,
+        sleeper=sleeps.append,
+    )
+
+    assert client.stranded_task_count() == 0
+    assert sleeps == [3.0]
+    assert len(calls) == 2
+
+
+def test_client_fails_closed_for_non_retryable_http_error_without_credential_in_message():
+    mod = _load(CLIENT, "kanban_dependency_health_client_error")
+
+    def opener(request, *, timeout):
+        raise _http_error(401)
+
+    client = mod.DependencyHealthClient(
+        api_url="https://hermes.example",
+        bearer_credential="credential-not-for-output",
+        opener=opener,
+    )
+
+    with pytest.raises(mod.DependencyHealthClientError, match="HTTP 401") as exc_info:
+        client.stranded_task_count()
+    assert "credential-not-for-output" not in str(exc_info.value)
+
+
+def test_hook_requires_credential_environment_before_any_request(monkeypatch, capsys):
+    hook = _load(HOOK, "validate_kanban_dependency_health_missing_credential")
+    monkeypatch.delenv("HERMES_API_CREDENTIAL", raising=False)
+
+    assert hook.main(["--api-url", "https://hermes.example"]) == 2
+    assert capsys.readouterr().out == "ERROR: required API credential environment variable HERMES_API_CREDENTIAL is not set.\n"
+
+
+def test_hook_uses_client_and_fails_for_stranded_dependencies(monkeypatch, capsys):
+    hook = _load(HOOK, "validate_kanban_dependency_health_hook")
+    monkeypatch.setenv("HERMES_API_CREDENTIAL", "credential-for-test-only")
     called = {}
 
-    def fake_urlopen(url, *, timeout):
-        called.update(url=url, timeout=timeout)
-        return _json_response({"dependency_stranded_task_count": 0})
+    class FakeClient:
+        def __init__(self, **kwargs):
+            called.update(kwargs)
 
-    monkeypatch.setattr(mod, "urlopen", fake_urlopen)
+        def stranded_task_count(self, *, board):
+            called["board"] = board
+            return 1
 
-    assert mod.main(["--api-url", "https://hermes.example/"]) == 0
+    monkeypatch.setattr(hook, "DependencyHealthClient", FakeClient)
+
+    assert hook.main(["--api-url", "https://hermes.example", "--board", "release", "--timeout", "3", "--cache-ttl", "4"]) == 1
     assert called == {
-        "url": "https://hermes.example/api/plugins/kanban/health/dependencies",
-        "timeout": 10.0,
-    }
-    assert capsys.readouterr().out == "PASS: no dependency-stranded Kanban tasks detected.\n"
-
-
-def test_validation_hook_fails_for_stranded_dependencies_reported_by_deployed_api(monkeypatch, capsys):
-    mod = _load()
-    called = {}
-
-    def fake_urlopen(url, *, timeout):
-        called.update(url=url, timeout=timeout)
-        return _json_response({"dependency_stranded_task_count": 1})
-
-    monkeypatch.setattr(mod, "urlopen", fake_urlopen)
-
-    assert mod.main(["--api-url", "https://hermes.example", "--board", "release board", "--timeout", "3"]) == 1
-    assert called == {
-        "url": "https://hermes.example/api/plugins/kanban/health/dependencies?board=release+board",
+        "api_url": "https://hermes.example",
+        "bearer_credential": "credential-for-test-only",
         "timeout": 3.0,
+        "cache_ttl": 4.0,
+        "board": "release",
     }
     assert capsys.readouterr().out == "FAIL: 1 dependency-stranded Kanban task(s) detected.\n"
-
-
-def test_validation_hook_fails_closed_for_invalid_deployed_api_response(monkeypatch, capsys):
-    mod = _load()
-    monkeypatch.setattr(mod, "urlopen", lambda url, *, timeout: _json_response({"dependency_stranded_task_count": "one"}))
-
-    assert mod.main(["--api-url", "https://hermes.example"]) == 2
-    assert "ERROR: dependency health response" in capsys.readouterr().out
