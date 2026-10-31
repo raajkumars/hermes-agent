@@ -387,6 +387,49 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+@pytest.mark.parametrize(
+    ("last_save", "workspace_saves", "expected"),
+    [
+        (100, [101, 100], [True, False]),
+        (None, [101, 100], [True, False]),
+    ],
+)
+def test_dead_worker_reap_marks_only_workspaces_saved_after_session_checkpoint(
+    kanban_home, monkeypatch, last_save, workspace_saves, expected,
+):
+    """Crash payloads preserve per-workspace unsaved-work state for recovery."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="recover workspace", assignee="a")
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:worker")
+        assert claimed is not None and claimed.current_run_id is not None
+        workspaces = [
+            {"path": f"/workspace/{i}", "metadata": {"last_saved": saved}}
+            for i, saved in enumerate(workspace_saves)
+        ]
+        metadata = {"workspaces": workspaces}
+        if last_save is not None:
+            metadata["last_save"] = last_save
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (998001, 100, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at=?, metadata=? WHERE id=?",
+            (100, json.dumps(metadata), claimed.current_run_id),
+        )
+        conn.commit()
+
+        assert tid in kbd.detect_crashed_workers(conn)
+        event = next(e for e in kb.list_events(conn, tid) if e.kind == "crashed")
+        recovered = event.payload["workspaces"]
+        assert [workspace["has_unsaved_work"] for workspace in recovered] == expected
+
+
 @pytest.mark.parametrize("lane", ["ready", "review"])
 def test_terminal_provider_exit_blocks_after_one_attempt_in_either_lane(kanban_home, monkeypatch, lane):
     """A worker that exits ``KANBAN_TERMINAL_PROVIDER_EXIT_CODE`` (credential revoked, model

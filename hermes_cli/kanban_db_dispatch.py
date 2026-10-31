@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -1357,12 +1358,29 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
+def _mark_workspace_unsaved_work(workspaces: object, session: Mapping[str, Any]) -> None:
+    """Record whether each crashed-worker workspace changed after its checkpoint."""
+    if not isinstance(workspaces, list):
+        return
+    reference = _kb._to_epoch(session.get("last_save"))
+    if reference is None:
+        reference = _kb._to_epoch(session.get("started_at"))
+    for workspace in workspaces:
+        if not isinstance(workspace, dict):
+            continue
+        metadata = workspace.get("metadata")
+        last_saved = _kb._to_epoch(metadata.get("last_saved")) if isinstance(metadata, dict) else None
+        workspace["has_unsaved_work"] = (
+            reference is not None and last_saved is not None and last_saved > reference
+        )
+
+
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1379,8 +1397,28 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
                 continue
 
+            session: dict[str, Any] = {"started_at": _kb._row_get(row, "started_at")}
+            workspaces: object = None
+            current_run_id = _kb._row_get(row, "current_run_id")
+            if current_run_id is not None:
+                run = conn.execute(
+                    "SELECT started_at, metadata FROM task_runs WHERE id = ?", (current_run_id,)
+                ).fetchone()
+                if run is not None:
+                    raw_metadata = _kb._row_get(run, "metadata")
+                    if isinstance(raw_metadata, str):
+                        with contextlib.suppress(json.JSONDecodeError):
+                            decoded = json.loads(raw_metadata)
+                            if isinstance(decoded, dict):
+                                session.update(decoded)
+                    session.setdefault("started_at", _kb._row_get(run, "started_at"))
+                    workspaces = session.get("workspaces")
+            _mark_workspace_unsaved_work(workspaces, session)
+
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            if isinstance(workspaces, list):
+                dead.event_payload["workspaces"] = workspaces
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
