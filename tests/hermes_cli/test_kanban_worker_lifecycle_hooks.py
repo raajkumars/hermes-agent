@@ -98,6 +98,31 @@ def test_dispatch_spawn_fires_worker_spawned(
     assert "board" in kw
     assert pid_at_fire_time == [4242]
 
+
+@pytest.mark.parametrize("status", ["ready", "review"])
+def test_dispatch_never_claims_needs_input_human_gate(
+    kanban_home, all_assignees_spawnable, status,
+):
+    """A stale lane status cannot cause dispatch to bypass a human gate."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="human gate", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET status = ?, block_kind = 'needs_input' WHERE id = ?",
+            (status, tid),
+        )
+        conn.commit()
+
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
+        row = conn.execute(
+            "SELECT status, block_kind, worker_pid FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert not result.spawned
+    assert tuple(row) == (status, "needs_input", None)
+
 def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypatch):
     """A dead-PID reclaim fires the exit observer with the exit facts."""
     conn = kbc.connect()

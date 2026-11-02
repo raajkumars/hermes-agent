@@ -2222,7 +2222,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, block_kind FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2310,9 +2310,16 @@ def _dispatch_once_locked(
         return result
 
     ready_rows = _lane_rows(conn, "ready")
+    # A needs_input blocker is an explicit human gate, not dispatchable work.
+    # Keep it inert even if an earlier/manual state transition left the card in
+    # ready; dispatch must never manufacture a worker to bypass that gate.
+    ready_rows = [row for row in ready_rows if row["block_kind"] != "needs_input"]
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    # Apply the same human-gate invariant to review dispatch.  This also keeps
+    # needs_input rows out of the review reservation/budget calculation.
+    review_rows = [row for row in review_rows if row["block_kind"] != "needs_input"]
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which
