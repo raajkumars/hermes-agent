@@ -2,9 +2,9 @@ import concurrent.futures
 import contextvars
 import json
 import multiprocessing
-import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -175,7 +175,53 @@ def test_anthropic_usage_429_is_shared_as_a_cooldown_without_another_request(mon
     assert 1 <= int(cooled.value.response.headers["Retry-After"]) <= 47
 
 
-@pytest.mark.skipif(os.name == "nt", reason="the production Windows lock is covered separately")
+@pytest.mark.parametrize("entry_kind", ["cooldown", "payload"])
+def test_anthropic_usage_queued_after_lock_uses_current_time(monkeypatch, tmp_path, entry_kind):
+    """A caller blocked on the lock must not use a timestamp from before it queued."""
+    cache_path = tmp_path / "anthropic-usage.json"
+    scope = account_usage._anthropic_usage_scope("xA", None)
+    fresh_payload = {"five_hour": {"utilization": 0.5}}
+    entry = (
+        {"cooldown_until": time.time() + 0.1}
+        if entry_kind == "cooldown"
+        else {
+            "fetched_at": time.time() - account_usage._ANTHROPIC_USAGE_CACHE_TTL_SECONDS + 0.1,
+            "payload": _anthropic_usage_payload(),
+        }
+    )
+    cache_path.write_text(json.dumps({
+        "version": 1,
+        "entries": {scope: entry},
+    }), encoding="utf-8")
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: cache_path)
+    monkeypatch.setattr(account_usage, "_get_json", lambda *args, **kwargs: fresh_payload)
+
+    original_lock = account_usage._anthropic_usage_cache_lock
+    waiting_for_lock = threading.Event()
+
+    @contextmanager
+    def observed_lock(path):
+        waiting_for_lock.set()
+        with original_lock(path):
+            yield
+
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_lock", observed_lock)
+    result = []
+
+    def fetch_after_lock_release():
+        result.append(account_usage._fetch_anthropic_usage_payload("xA", {}))
+
+    with original_lock(cache_path):
+        worker = threading.Thread(target=fetch_after_lock_release)
+        worker.start()
+        assert waiting_for_lock.wait(timeout=1)
+        time.sleep(2)
+    worker.join(timeout=1)
+
+    assert result == [fresh_payload]
+
+
+@pytest.mark.linux_only
 def test_anthropic_usage_429_cooldown_is_shared_across_processes(tmp_path):
     """One process receives the upstream 429; peers read its cached cooldown."""
     context = multiprocessing.get_context("fork")

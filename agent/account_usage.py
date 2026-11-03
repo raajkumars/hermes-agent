@@ -113,8 +113,8 @@ def _fetch_anthropic_usage_payload(token: str, headers: dict[str, str]) -> dict:
 
     path = _anthropic_usage_cache_path()
     scope = _anthropic_usage_scope(token, headers.get("anthropic-organization"))
-    now = time.time()
     with _anthropic_usage_cache_lock(path):
+        now = time.time()
         data = _read_anthropic_usage_cache(path)
         existing_entries = data["entries"]
         entries = _prune_anthropic_usage_cache(existing_entries, now)
