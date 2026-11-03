@@ -3,8 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import math
+import hashlib
+import os
+import time
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import httpx
@@ -19,10 +24,104 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEPLETED_LINE = "Status: access depleted — top up to restore"
+_ANTHROPIC_USAGE_CACHE_TTL_SECONDS = 60.0
+_ANTHROPIC_USAGE_FALLBACK_COOLDOWN_SECONDS = 60.0
+_ANTHROPIC_USAGE_MAX_COOLDOWN_SECONDS = 3600.0
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _anthropic_usage_cache_path() -> Path:
+    """Fleet-shared (not profile-local) OAuth usage cache, overridable only for isolated tests."""
+    return Path(os.environ.get(
+        "HERMES_ANTHROPIC_USAGE_CACHE_PATH", "~/.qwickapps/state/anthropic_oauth_usage.json",
+    )).expanduser()
+
+
+def _usage_cache_flock(fh, *, lock: bool) -> None:
+    """Exclusive whole-file lock on the shared cache (fcntl on POSIX, msvcrt on Windows)."""
+    if os.name == "nt":
+        import msvcrt
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK if lock else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX if lock else fcntl.LOCK_UN)
+
+
+@contextmanager
+def _anthropic_usage_cache_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_suffix(path.suffix + ".lock"), "a+b") as fh:
+        _usage_cache_flock(fh, lock=True)
+        try:
+            yield
+        finally:
+            with suppress(Exception):
+                _usage_cache_flock(fh, lock=False)
+
+
+def _read_anthropic_usage_cache(path: Path) -> dict[str, Any]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) and isinstance(data.get("entries"), dict) else {"version": 1, "entries": {}}
+    except (OSError, ValueError, TypeError):
+        return {"version": 1, "entries": {}}
+
+
+def _write_anthropic_usage_cache(path: Path, data: dict[str, Any]) -> None:
+    from utils import atomic_json_write
+    atomic_json_write(path, data, mode=0o600, sort_keys=True)
+
+
+def _anthropic_usage_scope(token: str, organization: Optional[str]) -> str:
+    """Stable opaque cache key; the OAuth token and organization are never persisted."""
+    return hashlib.sha256(f"{token}\0{organization or ''}".encode("utf-8")).hexdigest()
+
+
+def _raise_anthropic_usage_cooldown(seconds: float) -> None:
+    request = httpx.Request("GET", "https://api.anthropic.com/api/oauth/usage")
+    response = httpx.Response(429, request=request, headers={"Retry-After": str(max(1, int(seconds)))})
+    raise httpx.HTTPStatusError("Anthropic OAuth usage request is cooling down", request=request, response=response)
+
+
+def _fetch_anthropic_usage_payload(token: str, headers: dict[str, str]) -> dict:
+    """Fetch OAuth usage once per account/host interval and fan out its result to every local caller.
+
+    The file lock is a cross-process single-flight gate. A 429 is cached with its Retry-After so
+    later callers receive the same typed signal without hitting Anthropic again.
+    """
+    from agent.retry_utils import parse_retry_after_seconds
+
+    path = _anthropic_usage_cache_path()
+    scope = _anthropic_usage_scope(token, headers.get("anthropic-organization"))
+    now = time.time()
+    with _anthropic_usage_cache_lock(path):
+        data = _read_anthropic_usage_cache(path)
+        entries = data["entries"]
+        entry = entries.get(scope) if isinstance(entries.get(scope), dict) else {}
+        cooldown_until = entry.get("cooldown_until")
+        if isinstance(cooldown_until, (int, float)) and cooldown_until > now:
+            _raise_anthropic_usage_cooldown(float(cooldown_until) - now)
+        fetched_at, payload = entry.get("fetched_at"), entry.get("payload")
+        if isinstance(fetched_at, (int, float)) and now - fetched_at < _ANTHROPIC_USAGE_CACHE_TTL_SECONDS and isinstance(payload, dict):
+            return payload
+        try:
+            payload = _get_json("https://api.anthropic.com/api/oauth/usage", headers, timeout=15.0)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                retry_after = parse_retry_after_seconds(exc.response.headers)
+                wait = _ANTHROPIC_USAGE_FALLBACK_COOLDOWN_SECONDS if retry_after is None else retry_after
+                wait = min(_ANTHROPIC_USAGE_MAX_COOLDOWN_SECONDS, max(1.0, float(wait)))
+                entries[scope] = {"cooldown_until": now + wait}
+                _write_anthropic_usage_cache(path, data)
+            raise
+        entries[scope] = {"fetched_at": now, "payload": payload}
+        _write_anthropic_usage_cache(path, data)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -607,7 +706,7 @@ def _fetch_anthropic_account_usage(
                "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0"}
     if organization_uuid := _claude_code_organization_uuid():
         headers["x-organization-uuid"] = organization_uuid
-    payload = _get_json("https://api.anthropic.com/api/oauth/usage", headers, timeout=15.0)
+    payload = _fetch_anthropic_usage_payload(token, headers)
     windows = _usage_windows(
         payload, (("five_hour", "Current session"), ("seven_day", "Current week"), ("seven_day_opus", "Opus week"),
                   ("seven_day_sonnet", "Sonnet week")), "utilization", "resets_at", fraction=True,

@@ -4,8 +4,10 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import httpx
 import pytest
 
+from agent import account_usage
 from agent.account_usage import (
     AccountUsageSnapshot,
     AccountUsageWindow,
@@ -70,6 +72,61 @@ class _RoutingClient:
 
     def get(self, url, headers=None):
         return _Response(self._payloads[url])
+
+
+def _anthropic_usage_payload():
+    return {"five_hour": {"utilization": 0.25, "resets_at": "2026-11-03T12:00:00Z"}}
+
+
+def test_anthropic_usage_cache_singleflights_same_account(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: tmp_path / "anthropic-usage.json")
+
+    def fetch_once(*args, **kwargs):
+        calls.append(args)
+        time.sleep(0.02)
+        return _anthropic_usage_payload()
+
+    monkeypatch.setattr(account_usage, "_get_json", fetch_once)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _i: account_usage._fetch_anthropic_usage_payload("xA", {}), range(8)))
+
+    assert len(calls) == 1
+    assert results == [_anthropic_usage_payload()] * 8
+
+
+def test_anthropic_usage_cache_is_scoped_to_oauth_account(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: tmp_path / "anthropic-usage.json")
+    monkeypatch.setattr(account_usage, "_get_json", lambda *args, **kwargs: calls.append(args) or _anthropic_usage_payload())
+
+    account_usage._fetch_anthropic_usage_payload("xA", {})
+    account_usage._fetch_anthropic_usage_payload("xB", {})
+
+    assert len(calls) == 2
+
+
+def test_anthropic_usage_429_is_shared_as_a_cooldown_without_another_request(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: tmp_path / "anthropic-usage.json")
+
+
+    def rate_limited(*args, **kwargs):
+        calls.append(args)
+        request = httpx.Request("GET", "https://api.anthropic.com/api/oauth/usage")
+        response = httpx.Response(429, request=request, headers={"Retry-After": "47"})
+        raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+    monkeypatch.setattr(account_usage, "_get_json", rate_limited)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        account_usage._fetch_anthropic_usage_payload("xA", {})
+    with pytest.raises(httpx.HTTPStatusError) as cooled:
+        account_usage._fetch_anthropic_usage_payload("xA", {})
+
+    assert len(calls) == 1
+    assert cooled.value.response.status_code == 429
+    assert 1 <= int(cooled.value.response.headers["Retry-After"]) <= 47
 
 
 def test_fetch_account_usage_codex(monkeypatch):
