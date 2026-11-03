@@ -130,6 +130,17 @@ def test_anthropic_usage_cache_is_scoped_to_oauth_account(monkeypatch, tmp_path)
     assert len(calls) == 2
 
 
+def test_anthropic_usage_cache_is_scoped_to_organization_uuid(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: tmp_path / "anthropic-usage.json")
+    monkeypatch.setattr(account_usage, "_get_json", lambda *args, **kwargs: calls.append(args) or _anthropic_usage_payload())
+
+    account_usage._fetch_anthropic_usage_payload("xA", {"x-organization-uuid": "org-a"})
+    account_usage._fetch_anthropic_usage_payload("xA", {"x-organization-uuid": "org-b"})
+
+    assert len(calls) == 2
+
+
 def test_anthropic_usage_cache_prunes_stale_and_excess_entries(monkeypatch, tmp_path):
     cache_path = tmp_path / "anthropic-usage.json"
     now = time.time()

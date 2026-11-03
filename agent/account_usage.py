@@ -112,7 +112,7 @@ def _fetch_anthropic_usage_payload(token: str, headers: dict[str, str]) -> dict:
     from agent.retry_utils import parse_retry_after_seconds
 
     path = _anthropic_usage_cache_path()
-    scope = _anthropic_usage_scope(token, headers.get("anthropic-organization"))
+    scope = _anthropic_usage_scope(token, headers.get("x-organization-uuid"))
     with _anthropic_usage_cache_lock(path):
         now = time.time()
         data = _read_anthropic_usage_cache(path)
