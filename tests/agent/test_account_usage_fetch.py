@@ -1,5 +1,6 @@
 import concurrent.futures
 import contextvars
+import json
 import multiprocessing
 import os
 import threading
@@ -127,6 +128,28 @@ def test_anthropic_usage_cache_is_scoped_to_oauth_account(monkeypatch, tmp_path)
     account_usage._fetch_anthropic_usage_payload("xB", {})
 
     assert len(calls) == 2
+
+
+def test_anthropic_usage_cache_prunes_stale_and_excess_entries(monkeypatch, tmp_path):
+    cache_path = tmp_path / "anthropic-usage.json"
+    now = time.time()
+    cache_path.write_text(json.dumps({
+        "version": 1,
+        "entries": {
+            **{f"fresh-{index}": {"fetched_at": now - 1, "payload": _anthropic_usage_payload()}
+               for index in range(account_usage._ANTHROPIC_USAGE_CACHE_MAX_ENTRIES + 5)},
+            "stale": {"fetched_at": now - 120, "payload": _anthropic_usage_payload()},
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: cache_path)
+    monkeypatch.setattr(account_usage, "_get_json", lambda *args, **kwargs: _anthropic_usage_payload())
+
+    account_usage._fetch_anthropic_usage_payload("xA", {})
+
+    entries = json.loads(cache_path.read_text(encoding="utf-8"))["entries"]
+    assert len(entries) == account_usage._ANTHROPIC_USAGE_CACHE_MAX_ENTRIES
+    assert "stale" not in entries
+    assert "xA" not in entries
 
 
 def test_anthropic_usage_429_is_shared_as_a_cooldown_without_another_request(monkeypatch, tmp_path):

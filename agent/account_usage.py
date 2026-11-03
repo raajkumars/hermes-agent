@@ -27,6 +27,7 @@ _DEPLETED_LINE = "Status: access depleted — top up to restore"
 _ANTHROPIC_USAGE_CACHE_TTL_SECONDS = 60.0
 _ANTHROPIC_USAGE_FALLBACK_COOLDOWN_SECONDS = 60.0
 _ANTHROPIC_USAGE_MAX_COOLDOWN_SECONDS = 3600.0
+_ANTHROPIC_USAGE_CACHE_MAX_ENTRIES = 32
 
 
 def _utc_now() -> datetime:
@@ -75,6 +76,22 @@ def _write_anthropic_usage_cache(path: Path, data: dict[str, Any]) -> None:
     atomic_json_write(path, data, mode=0o600, sort_keys=True)
 
 
+def _prune_anthropic_usage_cache(entries: dict[str, Any], now: float) -> dict[str, dict[str, Any]]:
+    """Keep only live entries, newest first, so the shared cache stays bounded."""
+    live: list[tuple[str, dict[str, Any], float]] = []
+    for scope, entry in entries.items():
+        if not isinstance(scope, str) or not isinstance(entry, dict):
+            continue
+        cooldown_until = entry.get("cooldown_until")
+        fetched_at = entry.get("fetched_at")
+        if isinstance(cooldown_until, (int, float)) and cooldown_until > now:
+            live.append((scope, entry, float(cooldown_until)))
+        elif isinstance(fetched_at, (int, float)) and now - fetched_at < _ANTHROPIC_USAGE_CACHE_TTL_SECONDS:
+            live.append((scope, entry, float(fetched_at)))
+    live.sort(key=lambda item: item[2], reverse=True)
+    return {scope: entry for scope, entry, _ in live[:_ANTHROPIC_USAGE_CACHE_MAX_ENTRIES]}
+
+
 def _anthropic_usage_scope(token: str, organization: Optional[str]) -> str:
     """Stable opaque cache key; the OAuth token and organization are never persisted."""
     return hashlib.sha256(f"{token}\0{organization or ''}".encode("utf-8")).hexdigest()
@@ -99,8 +116,14 @@ def _fetch_anthropic_usage_payload(token: str, headers: dict[str, str]) -> dict:
     now = time.time()
     with _anthropic_usage_cache_lock(path):
         data = _read_anthropic_usage_cache(path)
-        entries = data["entries"]
-        entry = entries.get(scope) if isinstance(entries.get(scope), dict) else {}
+        existing_entries = data["entries"]
+        entries = _prune_anthropic_usage_cache(existing_entries, now)
+        data["entries"] = entries
+        if entries != existing_entries:
+            _write_anthropic_usage_cache(path, data)
+        entry = entries.get(scope)
+        if not isinstance(entry, dict):
+            entry = {}
         cooldown_until = entry.get("cooldown_until")
         if isinstance(cooldown_until, (int, float)) and cooldown_until > now:
             _raise_anthropic_usage_cooldown(float(cooldown_until) - now)
@@ -115,9 +138,11 @@ def _fetch_anthropic_usage_payload(token: str, headers: dict[str, str]) -> dict:
                 wait = _ANTHROPIC_USAGE_FALLBACK_COOLDOWN_SECONDS if retry_after is None else retry_after
                 wait = min(_ANTHROPIC_USAGE_MAX_COOLDOWN_SECONDS, max(1.0, float(wait)))
                 entries[scope] = {"cooldown_until": now + wait}
+                data["entries"] = _prune_anthropic_usage_cache(entries, now)
                 _write_anthropic_usage_cache(path, data)
             raise
         entries[scope] = {"fetched_at": now, "payload": payload}
+        data["entries"] = _prune_anthropic_usage_cache(entries, now)
         _write_anthropic_usage_cache(path, data)
         return payload
 
