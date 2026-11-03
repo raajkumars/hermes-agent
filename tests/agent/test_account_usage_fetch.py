@@ -1,8 +1,11 @@
 import concurrent.futures
 import contextvars
+import multiprocessing
+import os
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -78,6 +81,26 @@ def _anthropic_usage_payload():
     return {"five_hour": {"utilization": 0.25, "resets_at": "2026-11-03T12:00:00Z"}}
 
 
+def _fetch_rate_limited_usage_in_process(cache_path: str, calls_path: str, ready, result) -> None:
+    """Fork-only helper proving the cache/lock coordinates separate processes."""
+    account_usage._anthropic_usage_cache_path = lambda: Path(cache_path)
+
+    def rate_limited(*args, **kwargs):
+        with open(calls_path, "a", encoding="utf-8") as handle:
+            handle.write("1")
+        time.sleep(0.05)
+        request = httpx.Request("GET", "https://api.anthropic.com/api/oauth/usage")
+        response = httpx.Response(429, request=request, headers={"Retry-After": "47"})
+        raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+    account_usage._get_json = rate_limited
+    ready.wait(5)
+    try:
+        account_usage._fetch_anthropic_usage_payload("xA", {})
+    except httpx.HTTPStatusError as exc:
+        result.put(exc.response.status_code)
+
+
 def test_anthropic_usage_cache_singleflights_same_account(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: tmp_path / "anthropic-usage.json")
@@ -127,6 +150,29 @@ def test_anthropic_usage_429_is_shared_as_a_cooldown_without_another_request(mon
     assert len(calls) == 1
     assert cooled.value.response.status_code == 429
     assert 1 <= int(cooled.value.response.headers["Retry-After"]) <= 47
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the production Windows lock is covered separately")
+def test_anthropic_usage_429_cooldown_is_shared_across_processes(tmp_path):
+    """One process receives the upstream 429; peers read its cached cooldown."""
+    context = multiprocessing.get_context("fork")
+    cache_path = tmp_path / "anthropic-usage.json"
+    calls_path = tmp_path / "upstream-calls"
+    ready = context.Barrier(2)
+    result = context.Queue()
+    processes = [
+        context.Process(target=_fetch_rate_limited_usage_in_process,
+                        args=(str(cache_path), str(calls_path), ready, result))
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(5)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert sorted(result.get(timeout=1) for _ in processes) == [429, 429]
+    assert calls_path.read_text(encoding="utf-8") == "1"
 
 
 def test_fetch_account_usage_codex(monkeypatch):

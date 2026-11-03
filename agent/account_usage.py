@@ -34,10 +34,8 @@ def _utc_now() -> datetime:
 
 
 def _anthropic_usage_cache_path() -> Path:
-    """Fleet-shared (not profile-local) OAuth usage cache, overridable only for isolated tests."""
-    return Path(os.environ.get(
-        "HERMES_ANTHROPIC_USAGE_CACHE_PATH", "~/.qwickapps/state/anthropic_oauth_usage.json",
-    )).expanduser()
+    """Fleet-shared (not profile-local) OAuth usage cache."""
+    return Path("~/.qwickapps/state/anthropic_oauth_usage.json").expanduser()
 
 
 def _usage_cache_flock(fh, *, lock: bool) -> None:
