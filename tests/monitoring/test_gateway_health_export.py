@@ -131,3 +131,46 @@ def test_install_id_persists_across_calls(tmp_path, monkeypatch):
     assert first in (tmp_path / "config.yaml").read_text()
 
 
+def test_runtime_error_metric_registers_as_an_observable_counter(monkeypatch):
+    """The cumulative runtime-error series must export as a monotonic counter."""
+    from agent.monitoring import gateway_health_export
+
+    registrations = {"gauges": [], "counters": []}
+
+    class FakeMeter:
+        def create_observable_gauge(self, name, *, callbacks):
+            registrations["gauges"].append((name, callbacks))
+
+        def create_observable_counter(self, name, *, callbacks):
+            registrations["counters"].append((name, callbacks))
+
+    class FakeProvider:
+        def __init__(self, *, metric_readers, resource):
+            self.metric_readers = metric_readers
+            self.resource = resource
+
+        def get_meter(self, _name):
+            return FakeMeter()
+
+    class FakeResource:
+        @staticmethod
+        def create(attributes):
+            return attributes
+
+    monkeypatch.setattr(gateway_health_export, "_exporter_kwargs", lambda *_: {})
+    monkeypatch.setattr(gateway_health_export, "_gateway_health_config", lambda _config: {"export_interval_seconds": 60})
+    monkeypatch.setattr(gateway_health_export, "_runtime_resource_attributes", lambda *_args, **_kwargs: {})
+    sdk = {
+        "OTLPMetricExporter": lambda **_kwargs: object(),
+        "PeriodicExportingMetricReader": lambda exporter, **_kwargs: (exporter, _kwargs),
+        "Resource": FakeResource,
+        "MeterProvider": FakeProvider,
+        "Observation": lambda value, attributes: (value, attributes),
+    }
+
+    gateway_health_export._start_metric_provider({}, sdk)
+
+    assert "hermes.worker.runtime_errors" not in {name for name, _ in registrations["gauges"]}
+    assert {name for name, _ in registrations["counters"]} == {"hermes.worker.runtime_errors"}
+
+

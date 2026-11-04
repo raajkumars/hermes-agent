@@ -143,7 +143,7 @@ _TERMINAL_PROVIDER_REASONS = frozenset({
 
 
 _CAPABILITY_BLOCK_REASONS = frozenset({
-    "context_window_full", "context_overflow", "repetition_loop",
+    "context_window_full", "context_overflow",
 })
 
 

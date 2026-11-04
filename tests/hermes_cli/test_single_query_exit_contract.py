@@ -96,7 +96,7 @@ def test_dispatcher_worker_reports_a_content_free_runtime_error(monkeypatch):
     assert calls == ["provider_failure"]
 
 
-@pytest.mark.parametrize("reason", ["context_window_full", "context_overflow", "repetition_loop"])
+@pytest.mark.parametrize("reason", ["context_window_full", "context_overflow"])
 def test_dispatcher_worker_blocks_deterministic_capability_failures(monkeypatch, reason):
     """A full context or repeated output is a capability mismatch, not a crash retry."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
@@ -123,6 +123,20 @@ def test_dispatcher_worker_blocks_deterministic_capability_failures(monkeypatch,
         "kind": "capability",
         "expected_run_id": 41,
     })]
+
+
+def test_dispatcher_worker_retries_a_repetition_loop(monkeypatch):
+    """A stochastic repetition sample follows the ordinary worker failure breaker."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    calls = []
+    import hermes_cli.kanban_db as kb
+    import hermes_cli.kanban_db_connect as kbc
+
+    monkeypatch.setattr(kbc, "connect_closing", lambda: nullcontext(object()))
+    monkeypatch.setattr(kb, "block_task", lambda conn, task_id, **kw: calls.append((task_id, kw)) or True)
+
+    assert _run_non_quiet(monkeypatch, {"failed": True, "failure_reason": "repetition_loop"}) == 1
+    assert calls == []
 
 
 @pytest.mark.parametrize(

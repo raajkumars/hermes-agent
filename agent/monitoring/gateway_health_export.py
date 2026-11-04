@@ -44,14 +44,15 @@ _METRICS_SDK = (
     "BatchLogRecordProcessor", "MeterProvider", "PeriodicExportingMetricReader", "Resource",
 )
 # Every gauge the runtime snapshot can emit MUST be listed here or it is silently dropped.
-_OBSERVABLE_METRIC_NAMES = (
+_OBSERVABLE_GAUGE_NAMES = (
     "hermes.gateway.up", "hermes.gateway.state", "hermes.gateway.active_agents", "hermes.gateway.busy",
     "hermes.gateway.drainable", "hermes.gateway.restart_requested", "hermes.gateway.background_work",
     "hermes.gateway.background_delegations", "hermes.platform.up", "hermes.platform.degraded",
     "hermes.cron.scheduler.heartbeat_age_seconds", "hermes.cron.scheduler.last_success_age_seconds",
     "hermes.cron.scheduler.catch_up_occurrences", "hermes.cron.jobs.enabled", "hermes.cron.jobs.running",
-    "hermes.cron.jobs.overdue", "hermes.worker.runtime_errors",
+    "hermes.cron.jobs.overdue",
 )
+_OBSERVABLE_COUNTER_NAMES = ("hermes.worker.runtime_errors",)
 
 
 def _diagnostic_log_attributes(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -231,8 +232,10 @@ def _start_metric_provider(config: Dict[str, Any], sdk: Dict[str, Any]) -> Any:
 
         return _cb
 
-    for metric_name in _OBSERVABLE_METRIC_NAMES:
+    for metric_name in _OBSERVABLE_GAUGE_NAMES:
         meter.create_observable_gauge(metric_name, callbacks=[callback(metric_name)])
+    for metric_name in _OBSERVABLE_COUNTER_NAMES:
+        meter.create_observable_counter(metric_name, callbacks=[callback(metric_name)])
     return provider
 
 
