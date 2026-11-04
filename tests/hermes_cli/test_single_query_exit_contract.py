@@ -93,11 +93,13 @@ def test_dispatcher_worker_reports_and_flushes_a_content_free_runtime_error(monk
     monkeypatch.setattr(gateway_health_export, "start_worker_runtime_error_export", lambda cfg: calls.append(cfg) or Runtime())
     monkeypatch.setattr(runtime_diagnostics, "report_worker_runtime_error", lambda error_type: calls.append(error_type))
 
-    assert _single_query_exit_code({
+    result = {
         "failed": True,
         "failure_reason": "provider_failure",
         "error": "Bearer secret for user@example.com",
-    }) == 1
+    }
+    assert _single_query_exit_code(result) == 1
+    assert _single_query_exit_code(result) == 1
     assert calls == [{"monitoring": {}}, "provider_failure", "shutdown"]
 
 
@@ -177,3 +179,38 @@ def test_quiet_kanban_worker_exits_tempfail_when_credentials_are_rate_limited(mo
     with pytest.raises(SystemExit) as exc:
         cli._run_single_query_mode(stub, "do the thing", None, True, True)
     assert exc.value.code == expected
+
+
+def test_quiet_worker_failure_reports_runtime_diagnostic_once(monkeypatch):
+    """Quiet mode calculates the failure exit twice but exports one worker error."""
+    from agent.monitoring import gateway_health_export, runtime_diagnostics
+    from hermes_cli import config, quiet_single_query
+
+    calls = []
+
+    class Runtime:
+        def shutdown(self):
+            calls.append("shutdown")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abcd1234")
+    monkeypatch.setattr(config, "load_config", lambda: {"monitoring": {}})
+    monkeypatch.setattr(gateway_health_export, "start_worker_runtime_error_export", lambda cfg: calls.append(cfg) or Runtime())
+    monkeypatch.setattr(runtime_diagnostics, "report_worker_runtime_error", lambda reason: calls.append(reason))
+    monkeypatch.setattr(quiet_single_query, "take_turn_report_path", lambda: None)
+    monkeypatch.setattr(quiet_single_query, "bind_quiet_session_key", lambda _key: nullcontext())
+    monkeypatch.setattr(quiet_single_query, "write_turn_report", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(quiet_single_query, "exit_single_query", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+    monkeypatch.setattr(cli, "_sync_cli_session_id_from_agent", lambda _cli: None)
+
+    worker = SimpleNamespace(
+        session_id="s1",
+        conversation_history=[],
+        agent=SimpleNamespace(run_conversation=lambda **_kwargs: {
+            "failed": True, "failure_reason": "provider_failure", "error": "secret",
+        }),
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli._run_quiet_single_query(worker, "do the thing")
+
+    assert exc.value.code == 1
+    assert calls == [{"monitoring": {}}, "provider_failure", "shutdown"]
