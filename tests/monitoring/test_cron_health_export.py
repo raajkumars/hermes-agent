@@ -84,8 +84,8 @@ def test_terminal_execution_emission_flushes_and_failures_are_fail_open(monkeypa
 
 
 def test_registered_observable_metric_names_cover_snapshot_metrics(monkeypatch):
-    """Every gauge emitted in the runtime snapshot must also be registered in the
-    observable-gauge metric_names list, or the OTLP exporter never observes it.
+    """Every metric emitted in the runtime snapshot must also be registered in the
+    appropriate observable instrument list, or the OTLP exporter never observes it.
 
     This asserts the vocabulary-registration invariant documented in
     website/docs/developer-guide/gateway-monitoring.md: an emitted-but-unregistered gauge is
@@ -119,10 +119,13 @@ def test_registered_observable_metric_names_cover_snapshot_metrics(monkeypatch):
 
     snapshot_names = {m.name for m in gateway_health_export._read_runtime_snapshot({}).metrics}
 
-    registered = set(gateway_health_export._OBSERVABLE_METRIC_NAMES)
+    registered = (
+        set(gateway_health_export._OBSERVABLE_GAUGE_NAMES)
+        | set(gateway_health_export._OBSERVABLE_COUNTER_NAMES)
+    )
 
     missing = snapshot_names - registered
-    assert not missing, f"gauges emitted but NOT registered in metric_names (will be silently dropped): {sorted(missing)}"
+    assert not missing, f"metrics emitted but NOT registered in an observable instrument (will be silently dropped): {sorted(missing)}"
 
 
 def test_monitoring_docs_distinguish_relay_health_scope_and_terminal_flush():

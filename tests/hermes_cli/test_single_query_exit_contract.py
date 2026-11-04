@@ -9,6 +9,7 @@ protocol violation (#111770, #101800; salvage of #110917 / #97623).
 from __future__ import annotations
 
 from types import SimpleNamespace
+from contextlib import nullcontext
 
 import pytest
 
@@ -74,6 +75,77 @@ def test_dispatcher_spawned_worker_keeps_a_plain_failure_at_one(monkeypatch):
     assert _run_non_quiet(monkeypatch, {"failed": True}) == 1
 
 
+def test_dispatcher_worker_reports_and_flushes_a_content_free_runtime_error(monkeypatch):
+    """The isolated worker starts its own exporter and flushes before it exits."""
+    from agent.monitoring import runtime_diagnostics
+    from agent.monitoring import gateway_health_export
+    from hermes_cli import config
+    from hermes_cli.cli_single_query import _single_query_exit_code
+
+    calls = []
+
+    class Runtime:
+        def shutdown(self):
+            calls.append("shutdown")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abcd1234")
+    monkeypatch.setattr(config, "load_config", lambda: {"monitoring": {}})
+    monkeypatch.setattr(gateway_health_export, "start_worker_runtime_error_export", lambda cfg: calls.append(cfg) or Runtime())
+    monkeypatch.setattr(runtime_diagnostics, "report_worker_runtime_error", lambda error_type: calls.append(error_type))
+
+    result = {
+        "failed": True,
+        "failure_reason": "provider_failure",
+        "error": "Bearer secret for user@example.com",
+    }
+    assert _single_query_exit_code(result) == 1
+    assert _single_query_exit_code(result) == 1
+    assert calls == [{"monitoring": {}}, "provider_failure", "shutdown"]
+
+
+@pytest.mark.parametrize("reason", ["context_window_full", "context_overflow"])
+def test_dispatcher_worker_blocks_deterministic_capability_failures(monkeypatch, reason):
+    """A full context or repeated output is a capability mismatch, not a crash retry."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "41")
+    calls = []
+    import hermes_cli.kanban_db as kb
+    import hermes_cli.kanban_db_connect as kbc
+
+    monkeypatch.setattr(kbc, "connect_closing", lambda: nullcontext(object()))
+    monkeypatch.setattr(kb, "block_task", lambda conn, task_id, **kw: calls.append((task_id, kw)) or True)
+    result = {
+        "failed": True,
+        "failure_reason": reason,
+        "capability_failure": {"model": "gpt-test", "context_tokens": 72525, "context_limit": 81920},
+    }
+
+    assert _run_non_quiet(monkeypatch, result) == 0
+    assert calls == [("t_abc123", {
+        "reason": (
+            f"Worker capability exhausted ({reason}); model=gpt-test; "
+            "context_tokens=72525; context_limit=81920. "
+            "Change the model/context budget or reduce task context before retrying."
+        ),
+        "kind": "capability",
+        "expected_run_id": 41,
+    })]
+
+
+def test_dispatcher_worker_retries_a_repetition_loop(monkeypatch):
+    """A stochastic repetition sample follows the ordinary worker failure breaker."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    calls = []
+    import hermes_cli.kanban_db as kb
+    import hermes_cli.kanban_db_connect as kbc
+
+    monkeypatch.setattr(kbc, "connect_closing", lambda: nullcontext(object()))
+    monkeypatch.setattr(kb, "block_task", lambda conn, task_id, **kw: calls.append((task_id, kw)) or True)
+
+    assert _run_non_quiet(monkeypatch, {"failed": True, "failure_reason": "repetition_loop"}) == 1
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     ("turn_result", "expected"),
     [
@@ -107,3 +179,38 @@ def test_quiet_kanban_worker_exits_tempfail_when_credentials_are_rate_limited(mo
     with pytest.raises(SystemExit) as exc:
         cli._run_single_query_mode(stub, "do the thing", None, True, True)
     assert exc.value.code == expected
+
+
+def test_quiet_worker_failure_reports_runtime_diagnostic_once(monkeypatch):
+    """Quiet mode calculates the failure exit twice but exports one worker error."""
+    from agent.monitoring import gateway_health_export, runtime_diagnostics
+    from hermes_cli import config, quiet_single_query
+
+    calls = []
+
+    class Runtime:
+        def shutdown(self):
+            calls.append("shutdown")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abcd1234")
+    monkeypatch.setattr(config, "load_config", lambda: {"monitoring": {}})
+    monkeypatch.setattr(gateway_health_export, "start_worker_runtime_error_export", lambda cfg: calls.append(cfg) or Runtime())
+    monkeypatch.setattr(runtime_diagnostics, "report_worker_runtime_error", lambda reason: calls.append(reason))
+    monkeypatch.setattr(quiet_single_query, "take_turn_report_path", lambda: None)
+    monkeypatch.setattr(quiet_single_query, "bind_quiet_session_key", lambda _key: nullcontext())
+    monkeypatch.setattr(quiet_single_query, "write_turn_report", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(quiet_single_query, "exit_single_query", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+    monkeypatch.setattr(cli, "_sync_cli_session_id_from_agent", lambda _cli: None)
+
+    worker = SimpleNamespace(
+        session_id="s1",
+        conversation_history=[],
+        agent=SimpleNamespace(run_conversation=lambda **_kwargs: {
+            "failed": True, "failure_reason": "provider_failure", "error": "secret",
+        }),
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli._run_quiet_single_query(worker, "do the thing")
+
+    assert exc.value.code == 1
+    assert calls == [{"monitoring": {}}, "provider_failure", "shutdown"]

@@ -60,6 +60,11 @@ class GatewayDiagnosticEvent(_MonitoringEvent):
     severity: str = "warning"
     ts_ns: int = field(default_factory=time.time_ns)
     source_logger: Optional[str] = None
+    # Stable, content-free workflow join key (for example, a Kanban task id).
+    correlation_id: Optional[str] = None
+    # Metadata only: no traceback text, paths, source lines, locals, or exception message.
+    trace_frame_count: int = 0
+    trace_fingerprint: Optional[str] = None
 
 
 @dataclass(slots=True)
