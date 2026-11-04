@@ -178,6 +178,83 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        # The database is authoritative across gateway restarts; these maps are
+        # only per-tick mirrors for diagnostics.
+        self._spawns_since_completion: dict[tuple[str, str], int] = {}
+        self._last_completed_run_id: dict[tuple[str, str], int | None] = {}
+
+    @staticmethod
+    def _ensure_respawn_state_schema(conn: sqlite3.Connection) -> None:
+        """Create task-scoped restart state for reduced legacy board schemas."""
+        info = list(conn.execute("PRAGMA table_info(dispatcher_respawn_state)"))
+        columns = {row[1] for row in info}
+        pk_columns = [row[1] for row in sorted(info, key=lambda row: row[5]) if row[5]]
+        expected_columns = {
+            "board", "task_id", "spawns_since_completion", "last_completed_run_id",
+            "cap_blocked", "updated_at",
+        }
+        if columns and (columns != expected_columns or pk_columns != ["board", "task_id"]):
+            # A legacy board-wide row, or a previously attempted task-only
+            # table, cannot be safely assigned to this composite key.
+            conn.execute("DROP TABLE dispatcher_respawn_state")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS dispatcher_respawn_state ("
+            "board TEXT NOT NULL, task_id TEXT NOT NULL, "
+            "spawns_since_completion INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (spawns_since_completion >= 0), "
+            "last_completed_run_id INTEGER, "
+            "cap_blocked INTEGER NOT NULL DEFAULT 0 CHECK (cap_blocked IN (0, 1)), "
+            "updated_at INTEGER NOT NULL, PRIMARY KEY (board, task_id))"
+        )
+
+    def _store_respawn_state(
+        self, slug: str, task_id: str, conn: sqlite3.Connection, *, count: int,
+        last_completed_run_id: int | None, cap_blocked: bool,
+    ) -> None:
+        """Atomically persist one card's dispatch window."""
+        self._ensure_respawn_state_schema(conn)
+        with conn:
+            conn.execute(
+                "INSERT INTO dispatcher_respawn_state "
+                "(board, task_id, spawns_since_completion, last_completed_run_id, cap_blocked, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(board, task_id) DO UPDATE SET "
+                "spawns_since_completion = excluded.spawns_since_completion, "
+                "last_completed_run_id = excluded.last_completed_run_id, "
+                "cap_blocked = excluded.cap_blocked, updated_at = excluded.updated_at",
+                (slug, task_id, count, last_completed_run_id, int(cap_blocked), int(time.time())),
+            )
+
+    def _load_respawn_state(
+        self, slug: str, task_id: str, conn: sqlite3.Connection,
+    ) -> tuple[int, int | None, bool]:
+        """Load one task's durable window and reset only for its completion."""
+        self._ensure_respawn_state_schema(conn)
+        row = conn.execute(
+            "SELECT spawns_since_completion, last_completed_run_id, cap_blocked "
+            "FROM dispatcher_respawn_state WHERE board = ? AND task_id = ?",
+            (slug, task_id),
+        ).fetchone()
+        completed = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+            "ORDER BY ended_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        latest_id = int(completed[0]) if completed is not None else None
+        if row is None:
+            count, completion_id, cap_blocked = 0, latest_id, False
+        else:
+            count, completion_id, cap_blocked = int(row[0]), row[1], bool(row[2])
+            if latest_id != completion_id:
+                count, completion_id, cap_blocked = 0, latest_id, False
+        self._store_respawn_state(
+            slug, task_id, conn, count=count, last_completed_run_id=completion_id,
+            cap_blocked=cap_blocked,
+        )
+        key = (slug, task_id)
+        self._spawns_since_completion[key] = count
+        self._last_completed_run_id[key] = completion_id
+        return count, completion_id, cap_blocked
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
