@@ -94,6 +94,8 @@ class GatewayHealthExportRuntime:
         def _close() -> None:
             for item in closeables:
                 with suppress(Exception):
+                    item.force_flush()
+                with suppress(Exception):
                     item.shutdown()
 
         if closeables:
@@ -213,7 +215,7 @@ def _emit_snapshot_events(config: Dict[str, Any]) -> None:
         logger.debug("gateway health snapshot emit failed", exc_info=True)
 
 
-def _start_metric_provider(config: Dict[str, Any], sdk: Dict[str, Any]) -> Any:
+def _start_metric_provider(config: Dict[str, Any], sdk: Dict[str, Any], *, metric_names: tuple[str, ...] = _OBSERVABLE_GAUGE_NAMES + _OBSERVABLE_COUNTER_NAMES) -> Any:
     exporter = sdk["OTLPMetricExporter"](**_exporter_kwargs(config, "metrics"))
     interval_ms = max(5, int(_gateway_health_config(config).get("export_interval_seconds", 60))) * 1000
     reader = sdk["PeriodicExportingMetricReader"](exporter, export_interval_millis=interval_ms)
@@ -233,9 +235,11 @@ def _start_metric_provider(config: Dict[str, Any], sdk: Dict[str, Any]) -> Any:
         return _cb
 
     for metric_name in _OBSERVABLE_GAUGE_NAMES:
-        meter.create_observable_gauge(metric_name, callbacks=[callback(metric_name)])
+        if metric_name in metric_names:
+            meter.create_observable_gauge(metric_name, callbacks=[callback(metric_name)])
     for metric_name in _OBSERVABLE_COUNTER_NAMES:
-        meter.create_observable_counter(metric_name, callbacks=[callback(metric_name)])
+        if metric_name in metric_names:
+            meter.create_observable_counter(metric_name, callbacks=[callback(metric_name)])
     return provider
 
 
@@ -285,6 +289,40 @@ def _fail(runtime: GatewayHealthExportRuntime, log: Callable[..., None], msg: st
     log(msg, exc_info=True)
     runtime.shutdown()
     return GatewayHealthExportRuntime(enabled=False, reason=reason)
+
+
+def start_worker_runtime_error_export(config: Dict[str, Any]) -> GatewayHealthExportRuntime:
+    """Start a short-lived OTLP export path for an isolated Kanban worker failure.
+
+    Workers do not share the gateway process's emitter or in-memory counter.  This
+    narrow runtime exports only the worker error counter and its redacted diagnostic
+    log, then callers immediately ``shutdown()`` to force a bounded flush.
+    """
+    if not _enabled(config):
+        return GatewayHealthExportRuntime(enabled=False, reason="disabled")
+    gh = _gateway_health_config(config)
+    metrics_on = gh.get("metrics_enabled", True)
+    diagnostics_on = gh.get("diagnostic_events_enabled", True)
+    runtime = GatewayHealthExportRuntime(enabled=True, reason="enabled")
+    try:
+        sdk = otlp_exporter._require_sdk(_METRICS_SDK, auto_install=True, prompt=False)
+    except Exception:
+        logger.warning("monitoring.gateway_health_export.enabled but OTLP SDK is unavailable; install 'hermes-agent[otlp]'", exc_info=True)
+        return GatewayHealthExportRuntime(enabled=False, reason="otlp_unavailable")
+    if metrics_on:
+        try:
+            runtime.metric_provider = _start_metric_provider(
+                config, sdk, metric_names=_OBSERVABLE_COUNTER_NAMES,
+            )
+        except Exception:
+            return _fail(runtime, logger.warning, "worker runtime OTLP metrics failed to start", "metrics_start_failed")
+    if diagnostics_on:
+        try:
+            runtime.log_streamer = GatewayDiagnosticLogStreamer(config, sdk)
+            emitter.get_emitter().subscribe(runtime.log_streamer)
+        except Exception:
+            return _fail(runtime, logger.debug, "worker runtime diagnostic OTLP export failed to start", "diagnostics_start_failed")
+    return runtime
 
 
 def start_gateway_health_export(config: Dict[str, Any]) -> GatewayHealthExportRuntime:
@@ -344,7 +382,7 @@ def start_gateway_health_export(config: Dict[str, Any]) -> GatewayHealthExportRu
     return runtime
 
 
-__all__ = ["GatewayHealthExportRuntime", "start_gateway_health_export"]
+__all__ = ["GatewayHealthExportRuntime", "start_gateway_health_export", "start_worker_runtime_error_export"]
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

@@ -75,25 +75,30 @@ def test_dispatcher_spawned_worker_keeps_a_plain_failure_at_one(monkeypatch):
     assert _run_non_quiet(monkeypatch, {"failed": True}) == 1
 
 
-def test_dispatcher_worker_reports_a_content_free_runtime_error(monkeypatch):
-    """The command boundary reports the classified reason, never a provider message."""
+def test_dispatcher_worker_reports_and_flushes_a_content_free_runtime_error(monkeypatch):
+    """The isolated worker starts its own exporter and flushes before it exits."""
     from agent.monitoring import runtime_diagnostics
+    from agent.monitoring import gateway_health_export
+    from hermes_cli import config
     from hermes_cli.cli_single_query import _single_query_exit_code
 
     calls = []
+
+    class Runtime:
+        def shutdown(self):
+            calls.append("shutdown")
+
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abcd1234")
-    monkeypatch.setattr(
-        runtime_diagnostics,
-        "report_worker_runtime_error",
-        lambda error_type: calls.append(error_type),
-    )
+    monkeypatch.setattr(config, "load_config", lambda: {"monitoring": {}})
+    monkeypatch.setattr(gateway_health_export, "start_worker_runtime_error_export", lambda cfg: calls.append(cfg) or Runtime())
+    monkeypatch.setattr(runtime_diagnostics, "report_worker_runtime_error", lambda error_type: calls.append(error_type))
 
     assert _single_query_exit_code({
         "failed": True,
         "failure_reason": "provider_failure",
         "error": "Bearer secret for user@example.com",
     }) == 1
-    assert calls == ["provider_failure"]
+    assert calls == [{"monitoring": {}}, "provider_failure", "shutdown"]
 
 
 @pytest.mark.parametrize("reason", ["context_window_full", "context_overflow"])

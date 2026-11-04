@@ -214,8 +214,14 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False) -
         # provider error: it can contain task data or credentials.
         reason = result.get("failure_reason") or "worker_failed"
         try:
+            from hermes_cli.config import load_config
+            from agent.monitoring.gateway_health_export import start_worker_runtime_error_export
             from agent.monitoring.runtime_diagnostics import report_worker_runtime_error
-            report_worker_runtime_error(reason)
+            runtime = start_worker_runtime_error_export(load_config())
+            try:
+                report_worker_runtime_error(reason)
+            finally:
+                runtime.shutdown()
         except Exception:
             logger.debug("worker runtime diagnostic report failed", exc_info=True)
         # The DB transition is the runtime equivalent of ``kanban block --kind

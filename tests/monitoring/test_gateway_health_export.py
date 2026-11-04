@@ -174,3 +174,40 @@ def test_runtime_error_metric_registers_as_an_observable_counter(monkeypatch):
     assert {name for name, _ in registrations["counters"]} == {"hermes.worker.runtime_errors"}
 
 
+def test_worker_runtime_exporter_flushes_its_own_diagnostic_emitter(monkeypatch):
+    """A short-lived worker has no gateway emitter, so it exports and flushes locally."""
+    from agent.monitoring import emitter, gateway_health_export, runtime_diagnostics
+
+    emitted = []
+
+    class Streamer:
+        def __init__(self, _config, _sdk):
+            pass
+
+        def __call__(self, batch):
+            emitted.extend(batch)
+
+        def force_flush(self):
+            pass
+
+        def shutdown(self):
+            pass
+
+    runtime_diagnostics.reset_worker_runtime_error_metrics_for_tests()
+    emitter.reset_emitter_for_tests(emitter.MonitoringEmitter())
+    monkeypatch.setattr(gateway_health_export, "_enabled", lambda _config: True)
+    monkeypatch.setattr(gateway_health_export, "_gateway_health_config", lambda _config: {
+        "metrics_enabled": False, "diagnostic_events_enabled": True,
+    })
+    monkeypatch.setattr(gateway_health_export.otlp_exporter, "_require_sdk", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(gateway_health_export, "GatewayDiagnosticLogStreamer", Streamer)
+
+    runtime = gateway_health_export.start_worker_runtime_error_export({})
+    runtime_diagnostics.report_worker_runtime_error("provider_failure")
+    runtime.shutdown()
+
+    assert [(event["name"], event["error_code"]) for event in emitted] == [
+        ("worker.runtime.error", "provider_failure"),
+    ]
+
+
