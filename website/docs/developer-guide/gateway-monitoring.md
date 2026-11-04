@@ -135,9 +135,11 @@ hermes_cron_jobs_overdue > 0
 increase(hermes_cron_scheduler_catch_up_occurrences[15m]) > 0
 
 # OTLP-to-Prometheus translation conventionally adds `_total` to this monotonic
-# worker-runtime counter. Retain the bounded error_type in every aggregation.
-sum by (error_type) (rate(hermes_worker_runtime_errors_total[5m]))
+# worker-runtime counter. Retain the bounded error_type in every aggregation and
+# evaluate short, operational, and sustained windows.
 sum(rate(hermes_worker_runtime_errors_total[1m]))
+sum by (error_type) (rate(hermes_worker_runtime_errors_total[5m]))
+sum(rate(hermes_worker_runtime_errors_total[15m]))
 ```
 
 Use recording rules so alerts and fleet dashboards share the exact same bounded
