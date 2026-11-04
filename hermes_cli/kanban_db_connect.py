@@ -952,6 +952,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 _add_column_if_missing(conn, "task_runs", name, ddl)
         _backfill_legacy_inflight_runs(conn)
 
+    _migrate_dispatcher_respawn_state(conn)
+
     # One-shot event-kind rename: old names still worked but were awkward on
     # the wire. Fires once per DB — after the UPDATE no rows match.
     for old, new in (
@@ -962,6 +964,40 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
 
     _rebuild_drifted_tables(conn)
+
+
+def _migrate_dispatcher_respawn_state(conn: sqlite3.Connection) -> None:
+    """Replace the former board-wide respawn window with per-card state.
+
+    A legacy row cannot be safely attributed to one task, so preserving it
+    would falsely hold an unrelated card. Dropping that table is the explicit,
+    fail-open migration; the dispatcher recreates rows after confirmed starts.
+    """
+    if not _table_exists(conn, "dispatcher_respawn_state"):
+        return
+    columns = _column_names(conn, "dispatcher_respawn_state")
+    pk_columns = [
+        row["name"]
+        for row in sorted(
+            conn.execute("PRAGMA table_info(dispatcher_respawn_state)"),
+            key=lambda row: row["pk"],
+        )
+        if row["pk"]
+    ]
+    if columns != {
+        "board", "task_id", "spawns_since_completion", "last_completed_run_id",
+        "cap_blocked", "updated_at",
+    } or pk_columns != ["board", "task_id"]:
+        conn.execute("DROP TABLE dispatcher_respawn_state")
+        conn.execute(
+            "CREATE TABLE dispatcher_respawn_state ("
+            "board TEXT NOT NULL, task_id TEXT NOT NULL, "
+            "spawns_since_completion INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (spawns_since_completion >= 0), "
+            "last_completed_run_id INTEGER, "
+            "cap_blocked INTEGER NOT NULL DEFAULT 0 CHECK (cap_blocked IN (0, 1)), "
+            "updated_at INTEGER NOT NULL, PRIMARY KEY (board, task_id))"
+        )
 
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:

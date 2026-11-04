@@ -237,3 +237,26 @@ def test_healthy_fast_path_stays_lock_free(tmp_path, monkeypatch):
     with kbc.connect_closing(db_path):
         pass
     assert len(locks) == 1
+
+
+def test_respawn_state_migrates_board_window_to_per_card_composite_key(tmp_path, monkeypatch):
+    db_path = _default_board_db(tmp_path, monkeypatch)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(kb.SCHEMA_SQL)
+        conn.execute("DROP TABLE dispatcher_respawn_state")
+        conn.execute(
+            "CREATE TABLE dispatcher_respawn_state ("
+            "board TEXT PRIMARY KEY, spawns_since_completion INTEGER NOT NULL, "
+            "last_completed_run_id INTEGER, cap_blocked INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO dispatcher_respawn_state VALUES ('default', 3, NULL, 1, 100)"
+        )
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with kbc.connect_closing(db_path) as conn:
+        info = list(conn.execute("PRAGMA table_info(dispatcher_respawn_state)"))
+        assert [row["name"] for row in sorted(info, key=lambda row: row["pk"]) if row["pk"]] == [
+            "board", "task_id",
+        ]
+        assert conn.execute("SELECT COUNT(*) FROM dispatcher_respawn_state").fetchone()[0] == 0

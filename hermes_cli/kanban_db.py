@@ -1057,6 +1057,21 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Dispatcher-owned restart-stable state. Each board has its own database, but
+-- retaining the board dimension protects custom database resolvers. A task
+-- owns its own respawn window, so one noisy card cannot freeze unrelated ready
+-- work on the same board. ``cap_blocked`` stays set until that card completes
+-- or an operator explicitly unblocks it.
+CREATE TABLE IF NOT EXISTS dispatcher_respawn_state (
+    board                   TEXT NOT NULL,
+    task_id                 TEXT NOT NULL,
+    spawns_since_completion INTEGER NOT NULL DEFAULT 0 CHECK (spawns_since_completion >= 0),
+    last_completed_run_id   INTEGER,
+    cap_blocked             INTEGER NOT NULL DEFAULT 0 CHECK (cap_blocked IN (0, 1)),
+    updated_at              INTEGER NOT NULL,
+    PRIMARY KEY (board, task_id)
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
