@@ -40,7 +40,7 @@ from agent.turn_retry_state import TurnRetryState
 from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
-from agent.turn_failure_copy import failed_turn_notice, site_copy
+from agent.turn_failure_copy import capability_failure_facts, failed_turn_notice, site_copy
 from agent.turn_final_response import finish_text_response
 from agent.turn_finalizer import finalize_turn
 from agent.turn_iteration_prep import (
@@ -1051,12 +1051,14 @@ def _provider_overflow_exhausted_result(
     # matches interrupt aborts (#48879 / #52592) so the next user turn is not tool→user for strict
     # providers.
     agent._persist_session(messages, conversation_history)
-    return _partial_turn_result(
+    result = _partial_turn_result(
         site_copy("context_overflow", model=agent.model),
         messages, api_call_count, failed=True, compression_exhausted=True,
         turn_exit_reason="context_compression_exhausted",
         failure_reason="context_overflow", failure_retryable=False,
     )
+    result["capability_failure"] = capability_failure_facts(agent, request_pressure_tokens)
+    return result
 
 
 def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool:
@@ -1278,11 +1280,13 @@ def _preflight_timeout_result(agent, exc, conversation_history) -> Dict[str, Any
     note_turn_persisted(agent)
     # Not _COMPRESSION_TIMEOUT_FINAL_RESPONSE — that describes a different state
     # (compression ran, could not reduce); the exception text carries the guidance.
-    return _partial_turn_result(
+    result = _partial_turn_result(
         str(exc), list(conversation_history or []), 0,
         failed=True, compression_exhausted=True, turn_exit_reason="context_compression_timeout",
         failure_reason="context_overflow", failure_retryable=False,
     )
+    result["capability_failure"] = capability_failure_facts(agent)
+    return result
 
 
 @dataclass
