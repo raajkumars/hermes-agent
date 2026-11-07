@@ -142,6 +142,48 @@ _TERMINAL_PROVIDER_REASONS = frozenset({
 })
 
 
+_CAPABILITY_BLOCK_REASONS = frozenset({
+    "context_window_full", "context_overflow", "repetition_loop",
+})
+
+
+def _block_kanban_capability_failure(result: Any) -> bool:
+    """Persist a typed capability block for a deterministic worker mismatch."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id or not isinstance(result, dict):
+        return False
+    reason = result.get("failure_reason")
+    if reason not in _CAPABILITY_BLOCK_REASONS:
+        return False
+    facts = result.get("capability_failure")
+    if not isinstance(facts, dict):
+        facts = {}
+    model = str(facts.get("model") or "unknown")
+    tokens = _int_or(facts.get("context_tokens"), 0)
+    limit = _int_or(facts.get("context_limit"), 0)
+    detail = (
+        f"Worker capability exhausted ({reason}); model={model}; "
+        f"context_tokens={tokens}; context_limit={limit}. "
+        "Change the model/context budget or reduce task context before retrying."
+    )
+    raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        expected_run_id = int(raw_run_id) if raw_run_id else None
+    except ValueError:
+        expected_run_id = None
+    try:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_db_connect as _kbc
+        with _kbc.connect_closing() as conn:
+            return bool(_kb.block_task(
+                conn, task_id, reason=detail, kind="capability", expected_run_id=expected_run_id,
+            ))
+    except Exception as exc:
+        # Retain the normal failure exit if the board transition cannot be saved.
+        logger.warning("could not record Kanban capability blocker for %s: %s", task_id, exc)
+        return False
+
+
 def _single_query_exit_code(result, *, credentials_rate_limited: bool = False) -> int:
     """Map a one-shot turn result onto a process exit code, for both `-q` and `-Q`.
 
@@ -167,6 +209,10 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False) -
     if not (result.get("failed") or result.get("partial") or result.get("completed") is False):
         return 0
     if os.environ.get("HERMES_KANBAN_TASK"):
+        # The DB transition is the runtime equivalent of ``kanban block --kind
+        # capability``. Do not let the dispatcher also record a worker crash.
+        if _block_kanban_capability_failure(result):
+            return 0
         reason = result.get("failure_reason")
         if reason in _TRANSIENT_PROVIDER_REASONS:
             from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE

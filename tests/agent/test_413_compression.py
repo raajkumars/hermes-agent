@@ -1551,6 +1551,7 @@ class TestOverflowWithCompactionDisabled:
     def test_413_does_not_compress_when_disabled(self, agent):
         """413 must NOT call _compress_context when compaction is disabled."""
         agent.compression_enabled = False
+        agent.model = "gpt-measured"
         err_413 = _make_413_error()
         # If the guard fails, a second (success) response would be consumed.
         agent.client.chat.completions.create.side_effect = [err_413, _mock_response()]
@@ -1568,4 +1569,7 @@ class TestOverflowWithCompactionDisabled:
         assert result.get("failed") is True
         assert result.get("compaction_disabled") is True
         assert result["failure_reason"] == "context_overflow" and result["failure_retryable"] is False
+        assert result["capability_failure"]["model"] == "gpt-measured"
+        assert result["capability_failure"]["context_tokens"] > 0
+        assert result["capability_failure"]["context_limit"] > 0
         assert "/compress" in result["error"] and "compression.enabled" in result["error"]

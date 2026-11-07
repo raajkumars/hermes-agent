@@ -31,7 +31,7 @@ from agent.thinking_timeout_guidance import build_thinking_timeout_guidance, is_
 from agent.vision_message_prep import _provider_model_key
 from agent.turn_failure_copy import (
     CONTENT_POLICY_NEXT_STEPS, content_policy_copy, exhausted_copy, limit_reset_copy, nonretryable_copy,
-    provider_label_for, site_copy, stamp_failure,
+    capability_failure_facts, provider_label_for, site_copy, stamp_failure,
 )
 from agent.turn_retry_state import TurnRetryState
 from hermes_constants import display_hermes_home
@@ -1754,11 +1754,19 @@ def route_classified_error(
         )
         agent._persist_session(messages, conversation_history)
         _final_response = site_copy("compression_disabled", model=agent.model)
-        return _verdict("return", stamp_failure({
+        result = stamp_failure({
             "final_response": _final_response, "messages": messages, "completed": False,
             "api_calls": api_call_count, "error": _final_response, "partial": True, "failed": True,
             "compaction_disabled": True,
-        }, "context_overflow", False))
+        }, "context_overflow", False)
+        try:
+            request_tokens = estimate_request_tokens_rough(
+                api_messages, system_prompt=active_system_prompt, tools=agent.tools or None,
+            )
+        except Exception:
+            request_tokens = 0
+        result["capability_failure"] = capability_failure_facts(agent, request_tokens)
+        return _verdict("return", result)
 
     # Anthropic 429 "Extra usage is required for long context requests" is a
     # subscription-tier limit, not transient: cap at 200k and compress.
