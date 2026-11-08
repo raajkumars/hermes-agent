@@ -13,7 +13,8 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
   each same-cause re-block after an unblock increments ``block_recurrences``,
   and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
 * ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
-  amnesia that let the loop run unbounded).
+  amnesia that let the loop run unbounded), but clears the live-only
+  ``block_kind`` field.
 * A successful ``complete_task`` resets the loop memory.
 """
 
@@ -76,6 +77,8 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         tid = _running_task(conn)
         kb.block_task(conn, tid, reason="x", kind="capability")
         kb.unblock_task(conn, tid)
+        unblocked = kb.get_task(conn, tid)
+        assert (unblocked.status, unblocked.block_kind, unblocked.block_recurrences) == ("ready", None, 1)
         _make_running_again(conn, tid)
         kb.block_task(conn, tid, reason="x", kind="capability")
         events = [e for e in kb.list_events(conn, tid)
@@ -173,7 +176,7 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
         for _ in range(kb.BLOCK_RECURRENCE_LIMIT + 1):
             assert kb.block_task(conn, child, reason="wait", kind="dependency")
             parked = kb.get_task(conn, child)
-            assert (parked.status, parked.block_kind, parked.block_recurrences) == ("todo", "dependency", 0)
+            assert (parked.status, parked.block_kind, parked.block_recurrences) == ("todo", None, 0)
             with kb.write_txn(conn):
                 conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))
         assert kb.block_task(conn, child, reason="wait", kind="dependency")
@@ -191,6 +194,44 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
 # ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------
+
+
+def test_non_blocked_tasks_never_carry_a_live_block_kind(kanban_home: Path) -> None:
+    """``block_kind`` is current-state metadata, not historical triage data."""
+    with kbc.connect_closing() as conn:
+        dependency_parent = kb.create_task(conn, title="open parent", assignee="worker")
+        dependency_child = _running_task(conn, title="dependency child")
+        active_run = kb.get_task(conn, dependency_child).current_run_id
+        assert active_run is not None
+        kb.link_tasks(
+            conn, parent_id=dependency_parent, child_id=dependency_child, expected_child_run_id=active_run,
+        )
+        assert kb.block_task(conn, dependency_child, reason="wait", kind="dependency", expected_run_id=active_run)
+
+        capability = _running_task(conn, title="capability")
+        assert kb.block_task(conn, capability, reason="need tool", kind="capability")
+        assert kb.unblock_task(conn, capability)
+
+        transient = _running_task(conn, title="transient")
+        assert kb.block_task(conn, transient, reason="retry later", kind="transient")
+        ok, reason = kb.promote_task(conn, transient, actor="operator", reason="cleared")
+        assert (ok, reason) == (True, None)
+
+        triage = _running_task(conn, title="triage")
+        assert kb.block_task(conn, triage, reason="first", kind="needs_input")
+        assert kb.unblock_task(conn, triage)
+        _make_running_again(conn, triage)
+        assert kb.block_task(conn, triage, reason="again", kind="needs_input")
+        assert kb.get_task(conn, triage).status == "triage"
+
+        stale = _running_task(conn, title="archive")
+        assert kb.block_task(conn, stale, reason="archive", kind="capability")
+        assert kb.archive_task(conn, stale)
+
+        rows = conn.execute(
+            "SELECT id, status, block_kind FROM tasks WHERE status != 'blocked' AND block_kind IS NOT NULL"
+        ).fetchall()
+        assert rows == []
 
 
 # ---------------------------------------------------------------------------
