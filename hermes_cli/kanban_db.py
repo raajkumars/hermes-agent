@@ -986,11 +986,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- completion gate (``unsatisfied_decomposed_children``) — see there
     -- for why a dependency edge back to the creator is excluded.
     creator_task_id       TEXT,
-    -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
-    -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
-    -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
-    -- to ``blocked`` for a human. Preserved across unblock so a re-block for
-    -- the SAME kind can be recognised as a loop.
+    -- Typed reason for a task that is currently ``blocked`` (one of
+    -- VALID_BLOCK_KINDS, or NULL for legacy/un-typed blocks). ``dependency``
+    -- never sits in ``blocked`` (it goes to ``todo`` for parent-gating); the
+    -- other types wait in ``blocked`` for a human. Cleared when the task
+    -- leaves ``blocked``; recurrence comparison reads the event trail.
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
@@ -2744,7 +2744,7 @@ def reclaim_task(
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, block_kind = NULL, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?", (retry_status, task_id, prev_lock),

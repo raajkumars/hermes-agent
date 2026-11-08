@@ -253,6 +253,22 @@ def test_init_db_backfills_legacy_nonblocked_block_kind(kanban_home: Path) -> No
         assert tuple(row) == ("ready", None)
 
 
+def test_reclaiming_a_leaked_blocked_claim_clears_block_kind(kanban_home: Path) -> None:
+    """Reclaim must not release a stale typed block into the ready pool."""
+    with kbc.connect_closing() as conn:
+        task_id = _running_task(conn, title="leaked blocked claim")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'capability' WHERE id = ?",
+                (task_id,),
+            )
+
+        assert kb.reclaim_task(conn, task_id, reason="repair", signal_fn=lambda *_args: None)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert (task.status, task.block_kind) == ("ready", None)
+
+
 # ---------------------------------------------------------------------------
 # Validation + back-compat
 # ---------------------------------------------------------------------------
