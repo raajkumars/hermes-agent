@@ -234,6 +234,25 @@ def test_non_blocked_tasks_never_carry_a_live_block_kind(kanban_home: Path) -> N
         assert rows == []
 
 
+def test_init_db_backfills_legacy_nonblocked_block_kind(kanban_home: Path) -> None:
+    """Opening an upgraded board repairs stale classifications immediately."""
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="legacy stale kind", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', block_kind = 'capability' WHERE id = ?",
+                (task_id,),
+            )
+
+    kb.init_db()
+
+    with kbc.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        assert tuple(row) == ("ready", None)
+
+
 # ---------------------------------------------------------------------------
 # Validation + back-compat
 # ---------------------------------------------------------------------------
