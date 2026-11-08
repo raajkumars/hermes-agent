@@ -104,6 +104,57 @@ def test_dispatcher_worker_blocks_deterministic_capability_failures(monkeypatch,
     })]
 
 
+def test_dispatcher_worker_keeps_context_and_repetition_blockers_separate(monkeypatch):
+    """Sequential terminal outcomes must retain their own type and measured facts.
+
+    A worker can see either terminal path across attempts.  They are individually
+    actionable, but must not be coalesced into an ambiguous generic blocker.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    calls = []
+    import hermes_cli.kanban_db as kb
+    import hermes_cli.kanban_db_connect as kbc
+
+    monkeypatch.setattr(kbc, "connect_closing", lambda: nullcontext(object()))
+    monkeypatch.setattr(kb, "block_task", lambda conn, task_id, **kw: calls.append((task_id, kw)) or True)
+
+    for run_id, reason, tokens, limit in (
+        (41, "context_window_full", 72525, 81920),
+        (42, "repetition_loop", 1024, 16384),
+    ):
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        assert _run_non_quiet(monkeypatch, {
+            "failed": True,
+            "failure_reason": reason,
+            "capability_failure": {
+                "model": "gpt-test",
+                "context_tokens": tokens,
+                "context_limit": limit,
+            },
+        }) == 0
+
+    assert calls == [
+        ("t_abc123", {
+            "reason": (
+                "Worker capability exhausted (context_window_full); model=gpt-test; "
+                "context_tokens=72525; context_limit=81920. "
+                "Change the model/context budget or reduce task context before retrying."
+            ),
+            "kind": "capability",
+            "expected_run_id": 41,
+        }),
+        ("t_abc123", {
+            "reason": (
+                "Worker capability exhausted (repetition_loop); model=gpt-test; "
+                "context_tokens=1024; context_limit=16384. "
+                "Change the model/context budget or reduce task context before retrying."
+            ),
+            "kind": "capability",
+            "expected_run_id": 42,
+        }),
+    ]
+
+
 @pytest.mark.parametrize(
     ("turn_result", "expected"),
     [

@@ -77,6 +77,13 @@ class TestContinuationRepetitionGuard:
 
         assert result["completed"] is False
         assert result["partial"] is True
+        assert result["failure_reason"] == "repetition_loop"
+        assert result["failure_retryable"] is False
+        assert result["capability_failure"] == {
+            "model": str(loop_agent.model or "unknown"),
+            "context_tokens": 0,
+            "context_limit": loop_agent.context_compressor.context_length,
+        }
         assert "Repetition" in (result["final_response"] or "")
         # The pathological fragment must NOT be appended to the history.
         assert not any(
