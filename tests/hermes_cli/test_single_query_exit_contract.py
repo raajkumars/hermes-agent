@@ -104,6 +104,92 @@ def test_dispatcher_worker_blocks_deterministic_capability_failures(monkeypatch,
     })]
 
 
+def test_dispatcher_worker_keeps_context_and_repetition_blockers_separate(monkeypatch):
+    """Sequential terminal outcomes must retain their own type and measured facts.
+
+    A worker can see either terminal path across attempts.  They are individually
+    actionable, but must not be coalesced into an ambiguous generic blocker.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    calls = []
+    import hermes_cli.kanban_db as kb
+    import hermes_cli.kanban_db_connect as kbc
+
+    monkeypatch.setattr(kbc, "connect_closing", lambda: nullcontext(object()))
+    monkeypatch.setattr(kb, "block_task", lambda conn, task_id, **kw: calls.append((task_id, kw)) or True)
+
+    for run_id, reason, tokens, limit in (
+        (41, "context_window_full", 72525, 81920),
+        (42, "repetition_loop", 1024, 16384),
+    ):
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        assert _run_non_quiet(monkeypatch, {
+            "failed": True,
+            "failure_reason": reason,
+            "capability_failure": {
+                "model": "gpt-test",
+                "context_tokens": tokens,
+                "context_limit": limit,
+            },
+        }) == 0
+
+    assert calls == [
+        ("t_abc123", {
+            "reason": (
+                "Worker capability exhausted (context_window_full); model=gpt-test; "
+                "context_tokens=72525; context_limit=81920. "
+                "Change the model/context budget or reduce task context before retrying."
+            ),
+            "kind": "capability",
+            "expected_run_id": 41,
+        }),
+        ("t_abc123", {
+            "reason": (
+                "Worker capability exhausted (repetition_loop); model=gpt-test; "
+                "context_tokens=1024; context_limit=16384. "
+                "Change the model/context budget or reduce task context before retrying."
+            ),
+            "kind": "capability",
+            "expected_run_id": 42,
+        }),
+    ]
+
+
+def test_quiet_dispatcher_worker_blocks_a_capability_failure_once(monkeypatch):
+    """The quiet turn report and final process exit share the block transition.
+
+    ``_single_query_exit_code`` writes the capability block, so evaluating it
+    once for the report and again for process exit would make the second call
+    fail its expected-run guard and turn a successful block into exit code 1.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "41")
+    calls = []
+    import hermes_cli.kanban_db as kb
+    import hermes_cli.kanban_db_connect as kbc
+
+    monkeypatch.setattr(kbc, "connect_closing", lambda: nullcontext(object()))
+    monkeypatch.setattr(kb, "block_task", lambda conn, task_id, **kw: calls.append((task_id, kw)) or True)
+    agent = SimpleNamespace(
+        session_id="s1",
+        run_conversation=lambda **_kwargs: {
+            "failed": True,
+            "failure_reason": "context_window_full",
+            "capability_failure": {"model": "gpt-test", "context_tokens": 72525, "context_limit": 81920},
+        },
+    )
+    quiet_cli = SimpleNamespace(agent=agent, conversation_history=[], session_id="s1")
+
+    with pytest.raises(SystemExit) as exc:
+        cli._run_quiet_single_query(quiet_cli, "do the thing")
+
+    assert exc.value.code == 0
+    assert len(calls) == 1
+    assert calls[0][0] == "t_abc123"
+    assert calls[0][1]["kind"] == "capability"
+    assert calls[0][1]["expected_run_id"] == 41
+
+
 @pytest.mark.parametrize(
     ("turn_result", "expected"),
     [

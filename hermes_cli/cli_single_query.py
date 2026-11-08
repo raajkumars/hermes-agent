@@ -263,14 +263,19 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
         # notify_on_complete replies and is NOT part of the spawner's delivery (#113608). The
         # report carries what this run will print, so a spawner booking a child still lingering
         # at its cap relays the answer instead of a timeout (#114980).
-        def _report_turn(res) -> None:
+        # Capability failure recording is a state transition, not a pure exit-code
+        # lookup.  Reuse the value written to the report at final exit so a quiet
+        # Kanban worker does not try to block the same expected run twice.
+        result_exit_code = _single_query_exit_code(result)
+
+        def _report_turn(res, exit_code: int) -> None:
             write_turn_report(
-                turn_report_path, exit_code=_single_query_exit_code(res),
+                turn_report_path, exit_code=exit_code,
                 error=str(res.get("error") or "") if isinstance(res, dict) else "agent turn did not run",
                 reply=res.get("final_response", "") if isinstance(res, dict) else str(res),
             )
 
-        _report_turn(result)
+        _report_turn(result, result_exit_code)
         if isinstance(result, dict) and not result.get("failed"):
             history = result.get("messages") or cli.conversation_history
 
@@ -303,8 +308,9 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 cli._quiet_notify_linger_done = True
             if isinstance(continued, dict):
                 result = continued
+                result_exit_code = _single_query_exit_code(result)
                 # A teammate's reply displaced the answer this run prints; tell the spawner.
-                _report_turn(result)
+                _report_turn(result, result_exit_code)
         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
     # Surface backend errors that produced no visible output (e.g. invalid model slug
     # -> provider 4xx) on stderr so piped stdout stays clean.
@@ -329,7 +335,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     if emitter is None:
         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
-    _exit_code = _single_query_exit_code(result)
+    _exit_code = result_exit_code
     if emitter is not None:
         _exit_code = emitter.emit_result(result, session_id=cli.session_id or "", exit_code=_exit_code)
     exit_single_query(_exit_code)
