@@ -749,7 +749,8 @@ class Task:
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
     session_id: Optional[str] = None         # originating HERMES_SESSION_ID; NULL from CLI/dashboard
-    # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
+    # VALID_BLOCK_KINDS only while status is ``blocked``; loop history lives in
+    # task_events so non-blocked tasks are never stale-classified.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
@@ -985,11 +986,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- completion gate (``unsatisfied_decomposed_children``) — see there
     -- for why a dependency edge back to the creator is excluded.
     creator_task_id       TEXT,
-    -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
-    -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
-    -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
-    -- to ``blocked`` for a human. Preserved across unblock so a re-block for
-    -- the SAME kind can be recognised as a loop.
+    -- Typed reason for a task that is currently ``blocked`` (one of
+    -- VALID_BLOCK_KINDS, or NULL for legacy/un-typed blocks). ``dependency``
+    -- never sits in ``blocked`` (it goes to ``todo`` for parent-gating); the
+    -- other types wait in ``blocked`` for a human. Cleared when the task
+    -- leaves ``blocked``; recurrence comparison reads the event trail.
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
@@ -2216,12 +2217,12 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                     if failures >= effective_limit:
                         continue
                     conn.execute(
-                        "UPDATE tasks SET status = ? "
+                        "UPDATE tasks SET status = ?, block_kind = NULL "
                         "WHERE id = ? AND status = 'blocked'", (resume_status, task_id),
                     )
                 else:
                     conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                        "UPDATE tasks SET status = ?, block_kind = NULL WHERE id = ? AND status = 'todo'",
                         (resume_status, task_id),
                     )
                 _append_event(
@@ -2743,7 +2744,7 @@ def reclaim_task(
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, block_kind = NULL, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?", (retry_status, task_id, prev_lock),
@@ -3525,7 +3526,7 @@ def block_task(
             kind = "needs_input"
             rekind_reason = "no_open_parent"
         new_status, event_kind, set_sql, params, payload = _route_block(
-            kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
+            kind, reason, source_status, prev_kind=_last_block_kind(conn, task_id),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
         if rekind_reason:
@@ -3560,6 +3561,28 @@ def block_task(
     return True
 
 
+def _last_block_kind(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Most recent typed block from the event trail.
+
+    ``block_kind`` describes only the card's *current* blocked state.  Exit
+    transitions clear it so non-blocked rows cannot be misclassified by board
+    queries; the loop breaker instead reads its historical comparison value
+    from the append-only event trail.
+    """
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('blocked', 'dependency_wait', 'block_loop_detected') "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        payload = _json_dict(row["payload"])
+        if "kind" in payload:
+            value = payload["kind"]
+            return value if isinstance(value, str) or value is None else None
+    return None
+
+
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
     prev_kind: Optional[str], prev_recurrences: int,
@@ -3572,20 +3595,19 @@ def _route_block(
     incomplete parent are re-kinded to ``needs_input`` before this runs
     (see :func:`block_task`). Every other kind counts unblock-loop
     recurrences: block_task only fires from running/ready (AFTER an unblock
-    returned the task to the pool), so a stored ``block_kind`` equal to the
-    incoming one means blocked -> unblocked -> re-block for the same cause
-    (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    returned the task to the pool), and compares the incoming kind with the
+    most recent typed block event. At ``BLOCK_RECURRENCE_LIMIT`` the task
+    routes to ``triage`` for a human.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
-        return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
+        return "todo", "dependency_wait", "block_kind = NULL,\n                       block_recurrences = 0", (), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
+        return "triage", "block_loop_detected", "block_kind = NULL,\n                       block_recurrences = ?", (recurrences,), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
 
@@ -3862,7 +3884,7 @@ def promote_task(
 
     with write_txn(conn):
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
+            "UPDATE tasks SET status = 'ready', block_kind = NULL "
             "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
         )
         if upd.rowcount != 1:
@@ -3966,7 +3988,7 @@ def recover_stale_failure(
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, block_kind = NULL "
             "WHERE id = ? AND status = ?",
             (new_status, task_id, old_status),
         )
@@ -4010,12 +4032,13 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock.
-        # So do failure state and its retry budget: an unblock is not evidence
-        # that a stale provider hold cleared.  recover_stale_failure owns that
-        # narrow, digest-audited reset.
+        # ``block_kind`` describes a live block only, so no non-blocked row
+        # may retain it.  The loop counter deliberately survives: re-blocking
+        # compares against the prior event trail rather than stale row state.
+        # Failure state and its retry budget also survive; an unblock is not
+        # evidence that a stale provider hold cleared.
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL "
+            "UPDATE tasks SET status = ?, current_run_id = NULL, block_kind = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -4243,7 +4266,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         was_running = row["status"] == "running"
         prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
         cur = conn.execute(
-            "UPDATE tasks SET status = 'archived', "
+            "UPDATE tasks SET status = 'archived', block_kind = NULL, "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
             "WHERE id = ? AND status != 'archived'", (task_id,),
         )
@@ -4306,6 +4329,7 @@ def schedule_task(
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
+                   block_kind   = NULL,
                    claim_lock   = NULL,
                    claim_expires= NULL,
                    worker_pid   = NULL

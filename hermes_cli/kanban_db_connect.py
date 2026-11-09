@@ -832,7 +832,8 @@ _LATER_TASK_COLUMNS = (
     ("goal_max_turns", "goal_max_turns INTEGER"),
     ("completion_contract", "completion_contract TEXT"),
     ("session_id", "session_id TEXT"),
-    # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
+    # Typed reason for a currently blocked task (VALID_BLOCK_KINDS); NULL for
+    # every non-blocked task and generic human blockers.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
@@ -897,6 +898,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     for name, ddl in _LATER_TASK_COLUMNS:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
+
+    # ``block_kind`` is live-state metadata, not the loop-breaker's history.
+    # Older releases retained it after a task left ``blocked``; remove those
+    # stale classifications on every open so old boards immediately satisfy
+    # the invariant.  The update is idempotent and historical recurrence data
+    # remains in block_recurrences plus task_events.
+    conn.execute(
+        "UPDATE tasks SET block_kind = NULL "
+        "WHERE status != 'blocked' AND block_kind IS NOT NULL"
+    )
 
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,
