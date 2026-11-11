@@ -471,6 +471,8 @@ class TestWebServerEndpoints:
             for session_id, source in (("profile-chat", "cli"), ("profile-worker", "a2a"), ("profile-cron", "cron")):
                 db.create_session(session_id, source=source)
                 db.append_message(session_id, role="user", content="hi")
+            assert db.set_session_pinned("profile-chat", True)
+            assert db.set_session_pinned("profile-worker", True)
         finally:
             db.close()
 
@@ -483,9 +485,24 @@ class TestWebServerEndpoints:
         all_rows = self.client.get("/api/profiles/sessions?kind=all&limit=50").json()["sessions"]
         assert {row["id"] for row in all_rows} == {"profile-chat", "profile-worker", "profile-cron"}
 
-        sidebar = self.client.get("/api/profiles/sessions/sidebar?recents_limit=19").json()
+        sidebar = self.client.get(
+            "/api/profiles/sessions/sidebar?recents_limit=19&recents_exclude=cron"
+        ).json()
         assert {row["id"] for row in sidebar["recents"]["sessions"]} == {"profile-chat"}
+        assert {row["session_kind"] for row in sidebar["recents"]["sessions"]} == {"interactive"}
         assert {row["id"] for row in sidebar["cron"]["sessions"]} == {"profile-cron"}
+        assert sidebar["cron"]["sessions"][0]["session_kind"] == "background"
+
+        # Pins are back-filled only after all source/kind filters apply: an
+        # interactive pin cannot leak into a background-only sidebar request.
+        background_sidebar = self.client.get(
+            "/api/profiles/sessions/sidebar?kind=background&recents_limit=1&recents_exclude=cron"
+        ).json()
+        assert {row["id"] for row in background_sidebar["recents"]["sessions"]} == {"profile-worker"}
+        assert {row["session_kind"] for row in background_sidebar["recents"]["sessions"]} == {"background"}
+        # Cron has an explicit source selector and deliberately bypasses the
+        # interactive default, mirroring the standalone list endpoint.
+        assert {row["id"] for row in background_sidebar["cron"]["sessions"]} == {"profile-cron"}
 
     @pytest.mark.parametrize(
         "missing_column", ["archived", "pinned", "last_activity_at"]

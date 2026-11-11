@@ -492,6 +492,10 @@ def get_profiles_sessions_sidebar(
         messaging_sources, messaging_exclude_list = session_kind_scope(
             kind, source=None, sources=None, exclude_sources=messaging_exclude_list or None,
         )
+        # The shared scope helper represents no exclusions as None; cache keys
+        # are immutable tuples, so normalize that absence before caching.
+        recents_exclude_list = recents_exclude_list or []
+        messaging_exclude_list = messaging_exclude_list or []
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # (source, sources, exclude) per slice; source=cron deliberately bypasses kind filtering.
