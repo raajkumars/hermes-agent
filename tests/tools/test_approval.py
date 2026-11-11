@@ -1386,6 +1386,31 @@ class TestDetectSudoStdin:
             is_dangerous, _, _ = detect_dangerous_command(cmd)
             assert is_dangerous is False, cmd
 
+    def test_program_arguments_after_sudo_command_do_not_count_as_sudo_flags(self):
+        for cmd in (
+            "sudo -n -u ci-runner python3 x.py --apply",
+            "sudo -u root whoami -s",
+            "sudo --user=root whoami --askpass",
+            "sudo -n -u root whoami -S",
+            "echo password | sudo -n -u root whoami -s",
+        ):
+            is_dangerous, _, _ = detect_dangerous_command(cmd)
+            assert is_dangerous is False, cmd
+
+    def test_sudo_privilege_flags_before_the_command_remain_detected(self):
+        for cmd in (
+            "sudo -S whoami",
+            "sudo -A whoami",
+            "sudo -s",
+            "sudo --stdin whoami",
+            "sudo --askpass whoami",
+            "sudo -nS whoami",
+            "sudo -u root -s",
+            "sudo --user root -s",
+        ):
+            is_dangerous, _, _ = detect_dangerous_command(cmd)
+            assert is_dangerous is True, cmd
+
 
 class TestMacOSPrivateSystemPaths:
     """Inspired by Claude Code 2.1.113 "dangerous path protection".

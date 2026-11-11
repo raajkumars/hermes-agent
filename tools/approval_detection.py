@@ -167,6 +167,51 @@ def _mask_quoted_prose(command: str) -> str:
 # a guessed password via stdin (brute-force vector). Unconditional block.
 _SUDO_STDIN_RE = re.compile(r'(?:^|[;&|`\n]|&&|\|\||\$\()\s*sudo\s+-S\b', re.IGNORECASE)
 
+_SUDO_PRIVILEGE_FLAGS = {"-S", "-A", "-s", "-a"}
+_SUDO_PRIVILEGE_LONG_FLAGS = {"--stdin", "--askpass"}
+_SUDO_OPTIONS_WITH_ARGUMENT = {
+    "-C", "-D", "-g", "-h", "-r", "-t", "-T", "-u",
+    "--chdir", "--close-from", "--command-timeout", "--group", "--host",
+    "--role", "--type", "--user",
+}
+
+
+def _sudo_privilege_flag_finding(command: str) -> str | None:
+    """Return the risky sudo flag used by a real sudo command position, if any.
+
+    Parse only the sudo argument list. Regexes that scan an entire command conflate
+    a later argument such as ``sudo -u root whoami -s`` with a sudo flag, even though
+    ``-s`` belongs to the launched program, not sudo.
+    """
+    for _, sudo_end, sudo_word in _iter_shell_command_word_spans(command):
+        if os.path.basename(_deobfuscate_shell_word_for_detection(sudo_word)) != "sudo":
+            continue
+        pos = sudo_end
+        while pos < len(command):
+            redirect = _SHELL_REDIRECTION_RE.match(command, _skip_shell_whitespace(command, pos))
+            if redirect:
+                _, pos, _ = _read_shell_word(command, redirect.end())
+                continue
+            _, word_end, word = _read_shell_word(command, pos)
+            if not word:
+                break
+            pos = word_end
+            token = _deobfuscate_shell_word_for_detection(word)
+            if token == "--" or not token.startswith("-") or token == "-":
+                break
+            option = token.split("=", 1)[0]
+            if option in _SUDO_PRIVILEGE_LONG_FLAGS or option in _SUDO_PRIVILEGE_FLAGS:
+                return option
+            if option.startswith("-") and not option.startswith("--"):
+                for flag in _SUDO_PRIVILEGE_FLAGS:
+                    if flag[1:] in option[1:]:
+                        return flag
+            if "=" not in token and option in _SUDO_OPTIONS_WITH_ARGUMENT:
+                _, pos, argument = _read_shell_word(command, pos)
+                if not argument:
+                    break
+    return None
+
 
 def _check_sudo_stdin_guard(command: str) -> tuple:
     """Detect ``sudo -S`` without configured SUDO_PASSWORD -> (is_blocked, description). When
@@ -427,15 +472,7 @@ DANGEROUS_PATTERNS = [
     (r'\bgit\s+branch\b[^;|&\n]*?(?:-f\b|--force\b)[^;|&\n]*?(?:-d\b|--delete\b)', "git branch force delete (long flags, force-first)"),
     # chmod +x then immediate run: the script content may hold dangerous commands individual patterns miss.
     (r'\bchmod\s+\+x\b.*[;&|]+\s*\./', "chmod +x followed by immediate execution"),
-    # Sudo stdin/askpass/shell/list-privs flags. The agent has no TTY, so sudo invocations that succeed
-    # non-interactively read the password from stdin (-S) or askpass (-A); -s (shell) and -a (list) are gated as
-    # privilege chains (read SUDO_PASSWORD from .env -> sudo -S -s). Plain `sudo cmd` is TTY-bound and excluded. Input
-    # is lowercased, so S/s and A/a collapse. Lazy `[^;|&\n]*?` allows flag args without spanning separators. sudo
-    # resolves unambiguous long-flag prefixes: `--stdin` is the only long option starting with "st", `--askpass` the
-    # only one starting with "a".
-    (r'\bsudo\b[^;|&\n]*?\s+(?:-s\b|--st[a-z]*\b|-a\b|--a[a-z]*\b)', "sudo with privilege flag (stdin/askpass/shell/list)"),
-    # Combined short-flag form (-nS, -sa, -las).
-    (r'\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b', "sudo with combined-flag privilege escalation"),
+
     # Package-manager uninstall commands can remove installed software outside
     # the current project (notably `npm uninstall -g`). Treat their destructive
     # subcommands like other state-removing operations while leaving installs
@@ -1520,6 +1557,9 @@ def detect_dangerous_command(command: str) -> tuple:
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
     for command_variant in _command_detection_variants(command):
+        if command_variant and _sudo_privilege_flag_finding(command_variant) is not None:
+            description = "sudo with privilege flag (stdin/askpass/shell/list)"
+            return (True, description, description)
         command_lower = _lower_preserving_flags(command_variant)
         masked_lower: str | None = None
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
