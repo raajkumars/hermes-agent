@@ -435,6 +435,58 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
+    def test_session_kind_defaults_to_interactive_and_explicit_source_bypasses_it(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            for session_id, source in (("chat", "desktop"), ("worker", "kanban"), ("cron", "cron")):
+                db.create_session(session_id, source=source)
+                db.append_message(session_id, role="user", content="hi")
+            assert db.set_session_pinned("chat", True)
+        finally:
+            db.close()
+
+        default = self.client.get("/api/sessions?limit=50").json()
+        assert {row["id"] for row in default["sessions"]} == {"chat"}
+        assert {row["session_kind"] for row in default["sessions"]} == {"interactive"}
+
+        background = self.client.get("/api/sessions?kind=background&limit=50").json()
+        assert {row["id"] for row in background["sessions"]} == {"worker", "cron"}
+        assert {row["session_kind"] for row in background["sessions"]} == {"background"}
+
+        all_rows = self.client.get("/api/sessions?kind=all&limit=50").json()["sessions"]
+        assert {row["id"] for row in all_rows} == {"chat", "worker", "cron"}
+        assert self.client.get("/api/sessions?kind=unknown&limit=50").status_code == 400
+
+        explicit = self.client.get("/api/sessions?source=cron&limit=50").json()
+        assert [row["id"] for row in explicit["sessions"]] == ["cron"]
+        assert explicit["sessions"][0]["session_kind"] == "background"
+
+    def test_profiles_session_kind_filters_and_preserves_source_sections(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            for session_id, source in (("profile-chat", "cli"), ("profile-worker", "a2a"), ("profile-cron", "cron")):
+                db.create_session(session_id, source=source)
+                db.append_message(session_id, role="user", content="hi")
+        finally:
+            db.close()
+
+        default = self.client.get("/api/profiles/sessions?limit=50").json()
+        assert {row["id"] for row in default["sessions"]} == {"profile-chat"}
+        assert default["sessions"][0]["session_kind"] == "interactive"
+
+        background = self.client.get("/api/profiles/sessions?kind=background&limit=50").json()
+        assert {row["id"] for row in background["sessions"]} == {"profile-worker", "profile-cron"}
+        all_rows = self.client.get("/api/profiles/sessions?kind=all&limit=50").json()["sessions"]
+        assert {row["id"] for row in all_rows} == {"profile-chat", "profile-worker", "profile-cron"}
+
+        sidebar = self.client.get("/api/profiles/sessions/sidebar?recents_limit=19").json()
+        assert {row["id"] for row in sidebar["recents"]["sessions"]} == {"profile-chat"}
+        assert {row["id"] for row in sidebar["cron"]["sessions"]} == {"profile-cron"}
+
     @pytest.mark.parametrize(
         "missing_column", ["archived", "pinned", "last_activity_at"]
     )

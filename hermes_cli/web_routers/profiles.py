@@ -35,6 +35,7 @@ from hermes_cli.web_server_config import (
 )
 from hermes_cli.web_server_gateway import _strip_session_list_rows
 from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
+from hermes_cli.web_routers.session_kind import session_kind_scope
 from hermes_cli.web_server_profiles import (
     _fallback_profile_dicts, _hub_action_name, _write_profile_mcp_servers,
 )
@@ -45,6 +46,7 @@ from hermes_cli.web_models import (
     ProfileSoulUpdate, ProfileDescriptionUpdate, ProfileModelUpdate, ProfileDescribeAuto,
     SessionPrScanBody)
 from hermes_cli.web_server_profiles import _config_profile_scope, _hermes_home_scope
+from hermes_state_sessions import session_kind
 
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -229,6 +231,7 @@ def _tag_rows(rows: List[Dict[str, Any]], name: str, now: float) -> List[Dict[st
     for s in rows:
         s["profile"] = name
         s["is_default_profile"] = name == "default"
+        s["session_kind"] = session_kind(s)
         s["is_active"] = (
             s.get("ended_at") is None and (now - s.get("last_active", s.get("started_at", 0))) < 300
         )
@@ -404,7 +407,8 @@ def get_profiles_sessions(
     # over-fetches ``limit + offset``.
     limit: int = Query(20, ge=0, le=500), offset: int = Query(0, ge=0), min_messages: int = 0,
     archived: str = "exclude", order: str = "recent", profile: str = "all",
-    source: str = None, sources: str = None, exclude_sources: str = None, full: bool = False):
+    source: str = None, sources: str = None, exclude_sources: str = None, full: bool = False,
+    kind: str = "interactive"):
     """Unified, read-only session list aggregated across ALL profiles: opens each profile's
     ``state.db`` directly (no dashboard backend per profile) and tags rows with their owning
     ``profile``. Rows omit ``system_prompt`` / ``model_config`` unless ``full=1`` — same
@@ -419,9 +423,18 @@ def get_profiles_sessions(
 
     # Source scoping (see /api/sessions): recents pass exclude_sources=cron, the cron-jobs
     # section source=cron — two independent lists so cron sessions can't starve recents.
+    source_list = _csv_list(sources)
+    exclude_list = _csv_list(exclude_sources)
+    try:
+        source_list, exclude_list = session_kind_scope(
+            kind, source=source or None, sources=source_list or None,
+            exclude_sources=exclude_list or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     filters = dict(
-        source=source or None, sources=_csv_list(sources) or None,
-        exclude_sources=_csv_list(exclude_sources) or None, min_message_count=max(0, min_messages),
+        source=source or None, sources=source_list or None,
+        exclude_sources=exclude_list or None, min_message_count=max(0, min_messages),
         include_archived=archived == "include", archived_only=archived == "only")
     # Over-fetch per profile so the merged+sorted window is correct for the requested page.
     # Capped so a huge profile can't blow up the response.
@@ -454,7 +467,8 @@ def get_profiles_sessions(
 @_sidebar_singleflight_cache
 def get_profiles_sessions_sidebar(
     recents_profile: str = "all", recents_limit: int = 20, recents_exclude: str = None,
-    cron_limit: int = 50, messaging_limit: int = 100, messaging_exclude: str = None):
+    cron_limit: int = 50, messaging_limit: int = 100, messaging_exclude: str = None,
+    kind: str = "interactive"):
     """Batched sidebar session slices (recents / cron / messaging) — one profile-DB open per
     refresh instead of three ``/api/profiles/sessions`` calls. Same row projection and 300s
     active heuristic as the per-slice endpoint; all slices use ``min_messages=1`` /
@@ -471,9 +485,19 @@ def get_profiles_sessions_sidebar(
     recents_scope = (recents_profile or "all").strip() or "all"
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
     messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
-    # (source, exclude) per slice; ``source=cron`` is the implicit cron taxonomy.
-    slice_scope = {"recents": (None, recents_exclude_list), "cron": ("cron", None),
-                   "messaging": (None, messaging_exclude_list)}
+    try:
+        recents_sources, recents_exclude_list = session_kind_scope(
+            kind, source=None, sources=None, exclude_sources=recents_exclude_list or None,
+        )
+        messaging_sources, messaging_exclude_list = session_kind_scope(
+            kind, source=None, sources=None, exclude_sources=messaging_exclude_list or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # (source, sources, exclude) per slice; source=cron deliberately bypasses kind filtering.
+    slice_scope = {"recents": (None, recents_sources, recents_exclude_list),
+                   "cron": ("cron", None, None),
+                   "messaging": (None, messaging_sources, messaging_exclude_list)}
     cap = {"recents": min(max(recents_limit, 1), 500), "cron": min(max(cron_limit, 1), 500),
            "messaging": min(max(messaging_limit, 1), 500)}
     rows: Dict[str, List[Dict[str, Any]]] = {k: [] for k in slice_scope}
@@ -483,11 +507,11 @@ def get_profiles_sessions_sidebar(
     now = time.time()
 
     def _slice(db, key):
-        source, exclude = slice_scope[key]
+        source, sources, exclude = slice_scope[key]
         # include_pinned: a pinned conversation must reach the sidebar even when it has aged
         # past the window, or its Pinned row renders empty.
         return db.list_sessions_rich(
-            source=source, exclude_sources=exclude or None, limit=cap[key], offset=0,
+            source=source, sources=sources or None, exclude_sources=exclude or None, limit=cap[key], offset=0,
             min_message_count=1, include_archived=False, archived_only=False,
             order_by_last_active=True, compact_rows=True, include_pinned=True)
 
@@ -505,7 +529,7 @@ def get_profiles_sessions_sidebar(
         db_path = Path(home) / "state.db"
         if not db_path.exists():
             continue
-        profile_cache_key = (str(db_path), _sidebar_db_fingerprint(db_path), cap["recents"],
+        profile_cache_key = (str(db_path), _sidebar_db_fingerprint(db_path), kind, cap["recents"],
                              tuple(recents_exclude_list), cap["cron"], cap["messaging"],
                              tuple(messaging_exclude_list))
         slices = _sidebar_profile_cache_get(profile_cache_key)

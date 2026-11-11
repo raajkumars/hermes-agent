@@ -23,8 +23,10 @@ from hermes_cli.web_server_sessions import _maybe_auto_archive_for_profile, _ses
 from hermes_cli.web_models import (
     BulkDeleteSessions, SessionImport, SessionOwnerBackfill, SessionPrune, SessionRename)
 from hermes_cli.web_routers._common import log as _log, destructive_profile, http_failure
+from hermes_cli.web_routers.session_kind import session_kind_scope
 from hermes_state import is_malformed_db_error
 from hermes_state_errors import is_transient_sqlite_error
+from hermes_state_sessions import session_kind
 
 list_router = APIRouter()
 search_router = APIRouter()
@@ -167,7 +169,7 @@ def get_sessions(
     limit: int = Query(20, ge=0, le=100), offset: int = Query(0, ge=0), min_messages: int = 0,
     archived: str = "exclude", order: str = "created", source: str = None, sources: str = None,
     exclude_sources: str = None, cwd_prefix: str = None, full: bool = False,
-    profile: Optional[str] = None):
+    profile: Optional[str] = None, kind: str = "interactive"):
     """List sessions.
 
     ``order=recent`` sorts by latest activity across the compression chain, so
@@ -193,6 +195,13 @@ def get_sessions(
             # the cron-jobs section (source=cron) into two independent lists.
             source_list = _csv(sources)
             exclude_list = _csv(exclude_sources)
+            try:
+                source_list, exclude_list = session_kind_scope(
+                    kind, source=source or None, sources=source_list or None,
+                    exclude_sources=exclude_list or None,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             scope = dict(
                 source=source or None, sources=source_list or None,
                 exclude_sources=exclude_list or None, cwd_prefix=(cwd_prefix or None),
@@ -214,6 +223,7 @@ def get_sessions(
                 s["is_active"] = _is_active(s, now)
                 s["profile"] = row_profile
                 s["is_default_profile"] = row_profile == "default"
+                s["session_kind"] = session_kind(s)
                 # SQLite stores the flags as 0/1; expose real JSON booleans.
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
