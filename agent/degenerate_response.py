@@ -92,15 +92,15 @@ def detect_degenerate_response(content: Any, tool_calls: Any = None) -> Degenera
         max_window_scripts = max(max_window_scripts, len(set(window)))
         max_window_switches = max(max_window_switches, _switches(window))
 
-    # Script switching and balanced parentheses are ordinary in multilingual prose.
-    # Require a corruption marker or materially unbalanced parenthetical noise as an
-    # independent signal before treating an HTTP-200 response as provider failure.
-    suspicious_shape = (
-        (parentheses >= 20 and unbalanced >= 6)
-        or (parentheses >= 16 and script_switches >= 8)
-        or (parentheses >= 10 and max_window_scripts >= 4 and max_window_switches >= 8)
+    # Parentheticals (even unbalanced ones) occur in ordinary prose and code.  A
+    # positive therefore needs a corruption marker and either dense mixed-script
+    # switching or unusually dense punctuation with the parenthetical imbalance.
+    mixed_script_noise = max_window_scripts >= 4 and max_window_switches >= 8
+    punctuation_noise = sum(not char.isalnum() and not char.isspace() for char in content)
+    suspicious = corruption_markers >= 1 and (
+        (parentheses >= 10 and mixed_script_noise)
+        or (parentheses >= 20 and unbalanced >= 6 and punctuation_noise >= 20)
     )
-    suspicious = suspicious_shape and (unbalanced >= 6 or corruption_markers >= 1)
     if not suspicious:
         return None
     return DegenerateResponseReport(

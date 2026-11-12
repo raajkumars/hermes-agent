@@ -61,6 +61,20 @@ def test_balanced_multilingual_parentheticals_do_not_trigger_provider_fallback()
     assert detect_degenerate_response(multilingual_parentheticals) is None
 
 
+def test_unbalanced_ascii_parentheticals_do_not_trigger_provider_fallback():
+    # Readable prose can contain a dense, imperfect parenthetical reference list.
+    # Parenthesis imbalance alone is not evidence of a corrupted provider response.
+    ascii_parentheticals = (
+        "Release notes: (API) (CLI) (docs) (migration) (compatibility) (tests) "
+        "The upgrade remains safe; see the appendix (rollout (support (owners (timeline "
+    ) * 5
+
+    assert len(ascii_parentheticals) < 800
+    assert ascii_parentheticals.count("(") == 50
+    assert ascii_parentheticals.count("(") - ascii_parentheticals.count(")") == 20
+    assert detect_degenerate_response(ascii_parentheticals) is None
+
+
 def test_tool_calls_bypass_text_detector_to_preserve_tool_rounds():
     garbled = _REAL_GARBLED_SAMPLES[2]
 
