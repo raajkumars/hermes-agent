@@ -80,6 +80,10 @@ def detect_degenerate_response(content: Any, tool_calls: Any = None) -> Degenera
     script_switches = _switches(written)
     parentheses = content.count("(") + content.count(")")
     unbalanced = abs(content.count("(") - content.count(")"))
+    corruption_markers = content.count("\ufffd") + sum(
+        unicodedata.category(char) in {"Cc", "Cf"} and char not in "\n\r\t"
+        for char in content
+    )
 
     max_window_scripts = 0
     max_window_switches = 0
@@ -88,11 +92,15 @@ def detect_degenerate_response(content: Any, tool_calls: Any = None) -> Degenera
         max_window_scripts = max(max_window_scripts, len(set(window)))
         max_window_switches = max(max_window_switches, _switches(window))
 
-    suspicious = (
+    # Script switching and balanced parentheses are ordinary in multilingual prose.
+    # Require a corruption marker or materially unbalanced parenthetical noise as an
+    # independent signal before treating an HTTP-200 response as provider failure.
+    suspicious_shape = (
         (parentheses >= 20 and unbalanced >= 6)
         or (parentheses >= 16 and script_switches >= 8)
         or (parentheses >= 10 and max_window_scripts >= 4 and max_window_switches >= 8)
     )
+    suspicious = suspicious_shape and (unbalanced >= 6 or corruption_markers >= 1)
     if not suspicious:
         return None
     return DegenerateResponseReport(

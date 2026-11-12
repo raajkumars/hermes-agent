@@ -49,6 +49,18 @@ def test_legitimate_multilingual_and_code_heavy_text_are_not_reported():
     assert detect_degenerate_response(code_heavy) is None
 
 
+def test_balanced_multilingual_parentheticals_do_not_trigger_provider_fallback():
+    # A real explanation can alternate four writing systems inside references or
+    # translations while keeping every parenthesis balanced.  This used to meet the
+    # broad script-switching branch and incorrectly consume a fallback.
+    multilingual_parentheticals = (
+        "(English हिन्दी 日本語 العربية) "
+    ) * 16
+
+    assert multilingual_parentheticals.count("(") == multilingual_parentheticals.count(")") == 16
+    assert detect_degenerate_response(multilingual_parentheticals) is None
+
+
 def test_tool_calls_bypass_text_detector_to_preserve_tool_rounds():
     garbled = _REAL_GARBLED_SAMPLES[2]
 
