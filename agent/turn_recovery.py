@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.conversation_compression import COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE
+from agent.degenerate_response import detect_degenerate_response
 from agent.model_metadata import is_output_cap_error, parse_available_output_tokens_from_error
 from agent.retry_utils import is_zai_coding_overload_error, zai_coding_overload_retry_ceiling
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -1451,7 +1452,34 @@ def validate_response_shape(agent: Any, response: Any) -> Tuple[bool, List[str]]
     error_details)``. A Codex ``failed``/``cancelled`` status (e.g. quota exhaustion) is
     invalid so the fallback chain triggers; an empty Codex ``output`` with non-empty
     ``output_text`` is deferred to normalization."""
-    if agent._get_transport().validate_response(response):
+    transport = agent._get_transport()
+    if transport.validate_response(response):
+        # A HTTP-200 shape-valid reply can still be unusable token salad. Normalize through the
+        # selected transport so Chat Completions, Codex Responses, Anthropic, and Bedrock share
+        # the same gate. Detector failures deliberately fail open: a safety check must not turn a
+        # provider-specific normalization quirk into a new outage.
+        try:
+            normalized = transport.normalize_response(response)
+            report = detect_degenerate_response(normalized.content, normalized.tool_calls)
+        except Exception:
+            report = None
+        if report is not None:
+            count = getattr(agent, "_degenerate_provider_response_count", 0) + 1
+            agent._degenerate_provider_response_count = count
+            logger.error(
+                "Degenerate provider response detected; retryable provider failure "
+                "provider=%s model=%s digest=%s length=%d parentheses=%d "
+                "unbalanced_parentheses=%d scripts=%d switches=%d window_scripts=%d "
+                "window_switches=%d count=%d",
+                getattr(agent, "provider", ""), getattr(agent, "model", ""), report.digest,
+                report.length, report.parentheses, report.unbalanced_parentheses,
+                report.script_count, report.script_switches, report.window_script_count,
+                report.window_script_switches, count,
+            )
+            return True, [
+                "degenerate_provider_output "
+                f"digest={report.digest} length={report.length} count={count}"
+            ]
         return False, []
     if response is None:
         return True, ["response is None"]
