@@ -1782,7 +1782,8 @@ def _trip_profile_config_fatal(
         for row in rows:
             task_id = row["id"]
             conn.execute(
-                "UPDATE tasks SET status = 'blocked', last_failure_error = ? WHERE id = ?",
+                "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                "last_failure_error = ? WHERE id = ?",
                 (reason[:500], task_id),
             )
             _kb._append_event(conn, task_id, "config_fatal", {
@@ -1867,6 +1868,37 @@ def _run_credential_probe(profile: str, *, timeout: float = 20.0) -> Optional[di
         return None
 
 
+def select_runnable_assignee(requested: str, *, fallback: Optional[str] = None) -> str:
+    """Return a profile whose active provider is usable before new work is assigned.
+
+    A profile directory is not proof that it can execute a worker.  In particular,
+    temporary or dispatcher-only profiles can be present in the roster while their
+    provider credential is absent.  Try the requested profile first, then one
+    explicitly supplied fallback, and fail closed when neither passes the same
+    scoped provider probe used by config-fatal recovery.  The result deliberately
+    exposes no credential/provider detail to callers.
+    """
+    candidates: list[str] = []
+    for raw in (requested, fallback):
+        candidate = (raw or "").strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    if not candidates:
+        raise ValueError("assignee is required")
+    for candidate in candidates:
+        try:
+            probe = _run_credential_probe(candidate, timeout=15.0)
+        except Exception:
+            probe = None
+        if probe and probe.get("ok"):
+            return candidate
+    if fallback and fallback.strip() and fallback.strip() != requested.strip():
+        raise ValueError(
+            f"assignee {requested!r} is not runnable and configured fallback {fallback!r} is not runnable"
+        )
+    raise ValueError(f"assignee {requested!r} is not runnable (no usable active-provider credential)")
+
+
 def _recover_profile_config_fatal(
     conn: sqlite3.Connection, assignee: str, *, probe_timeout: float = 20.0,
 ) -> list[str]:
@@ -1923,8 +1955,8 @@ def _recover_profile_config_fatal(
                 except Exception:
                     prev_status = "ready"
             conn.execute(
-                "UPDATE tasks SET status = ?, consecutive_failures = 0, last_failure_error = NULL "
-                "WHERE id = ?",
+                "UPDATE tasks SET status = ?, block_kind = NULL, consecutive_failures = 0, "
+                "last_failure_error = NULL WHERE id = ?",
                 (prev_status, task_id),
             )
             _kb._append_event(conn, task_id, "config_fatal_recovered", {
