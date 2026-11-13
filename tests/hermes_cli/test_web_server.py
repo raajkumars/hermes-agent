@@ -458,6 +458,10 @@ class TestWebServerEndpoints:
         all_rows = self.client.get("/api/sessions?kind=all&limit=50").json()["sessions"]
         assert {row["id"] for row in all_rows} == {"chat", "worker", "cron"}
         assert self.client.get("/api/sessions?kind=unknown&limit=50").status_code == 400
+        # An explicit source bypasses kind filtering but never kind validation.
+        bad_with_source = self.client.get("/api/sessions?kind=automation&source=cron&limit=50")
+        assert bad_with_source.status_code == 400
+        assert "kind must be one of" in bad_with_source.json()["detail"]
 
         explicit = self.client.get("/api/sessions?source=cron&limit=50").json()
         assert [row["id"] for row in explicit["sessions"]] == ["cron"]

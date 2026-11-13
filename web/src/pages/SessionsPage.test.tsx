@@ -158,6 +158,55 @@ describe("SessionsPage tabs query the backend by kind", () => {
     expect(listKinds().at(-1)).toBe("interactive");
     expect(listKinds()[0]).toBe("interactive");
   });
+
+  it("scopes message search to the active tab's kind", async () => {
+    await renderSessionsPage([row("sid-chat", "cli", "Chat row")]);
+    apiMocks.searchSessions.mockResolvedValue({ results: [] });
+    const searchKinds = () =>
+      (apiMocks.searchSessions.mock.calls as [string, { kind?: string }][]).map(([, options]) => options.kind);
+    const typeSearch = async (value: string) => {
+      const input = document.querySelector<HTMLInputElement>('input[placeholder="Search message content..."]');
+      if (!input) throw new Error("search input not rendered");
+      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+      await act(async () => {
+        setValue.call(input, value);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    };
+
+    await typeSearch("needle");
+    await waitFor(() => apiMocks.searchSessions.mock.calls.length > 0);
+    expect(searchKinds().at(-1)).toBe("interactive");
+
+    for (const [label, kind] of [["Automation", "background"], ["All", "all"]] as const) {
+      const before = apiMocks.searchSessions.mock.calls.length;
+      await act(async () => click(tab(label)));
+      await waitFor(() => apiMocks.searchSessions.mock.calls.length > before);
+      expect(searchKinds().at(-1)).toBe(kind);
+    }
+  });
+
+  it("keeps the page usable when the backend rejects a tab's kind", async () => {
+    await renderSessionsPage([row("sid-chat", "cli", "Chat row")]);
+    apiMocks.getSessions.mockImplementation(async (limit: number, _offset: number, options: { kind: string }) => {
+      if (limit < 50 && options.kind === "background") {
+        throw new Error("kind must be one of: interactive, background, all");
+      }
+      const sessions = limit >= 50 ? [] : [row("sid-chat", "cli", "Chat row")];
+      return { sessions, total: sessions.length, limit, offset: 0 };
+    });
+
+    await act(async () => click(tab("Automation")));
+    await waitFor(() => listKinds().at(-1) === "background");
+    // The rejection is contained: the page stays mounted and tabs still work.
+    expect(tab("Chats")).not.toBeNull();
+
+    const before = listKinds().length;
+    await act(async () => click(tab("Chats")));
+    await waitFor(() => listKinds().length > before);
+    expect(listKinds().at(-1)).toBe("interactive");
+    await waitFor(() => document.body.textContent?.includes("Chat row") === true);
+  });
 });
 
 describe("SessionsPage per-row profile routing (#99387)", () => {
