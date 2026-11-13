@@ -118,6 +118,48 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+describe("SessionsPage tabs query the backend by kind", () => {
+  const row = (id: string, source: string, title: string) => ({
+    id, profile: "default", source, model: null, title, started_at: 1, ended_at: null, last_active: 1,
+    is_active: false, message_count: 2, tool_call_count: 0, input_tokens: 1, output_tokens: 1, preview: title,
+  });
+  const tab = (label: string) =>
+    Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === label) ?? null;
+  const listKinds = () =>
+    (apiMocks.getSessions.mock.calls as [number, number, { kind?: string }][])
+      .filter(([limit]) => limit < 50)
+      .map(([, , options]) => options.kind);
+
+  it("fetches each tab's kind and renders only the rows the server returned for it", async () => {
+    const rowsByKind: Record<string, ReturnType<typeof row>[]> = {
+      interactive: [row("sid-chat", "cli", "Chat row")],
+      background: [row("sid-cron", "cron", "Cron row")],
+      all: [row("sid-chat", "cli", "Chat row"), row("sid-cron", "cron", "Cron row")],
+    };
+    await renderSessionsPage(rowsByKind.interactive);
+    apiMocks.getSessions.mockImplementation(async (limit: number, _offset: number, options: { kind: string }) => {
+      const sessions = limit >= 50 ? [] : rowsByKind[options.kind] ?? [];
+      return { sessions, total: sessions.length, limit, offset: 0 };
+    });
+
+    await act(async () => click(tab("Automation")));
+    await waitFor(() => document.body.textContent?.includes("Cron row") === true);
+    expect(document.body.textContent).not.toContain("Chat row");
+    expect(listKinds().at(-1)).toBe("background");
+
+    await act(async () => click(tab("All")));
+    await waitFor(() => document.body.textContent?.includes("Chat row") === true);
+    expect(document.body.textContent).toContain("Cron row");
+    expect(listKinds().at(-1)).toBe("all");
+
+    await act(async () => click(tab("Chats")));
+    await waitFor(() => document.body.textContent?.includes("Cron row") === false);
+    expect(document.body.textContent).toContain("Chat row");
+    expect(listKinds().at(-1)).toBe("interactive");
+    expect(listKinds()[0]).toBe("interactive");
+  });
+});
+
 describe("SessionsPage per-row profile routing (#99387)", () => {
   it("sends every per-row request to the row's owning profile, not the management default", async () => {
     await renderSessionsPage([

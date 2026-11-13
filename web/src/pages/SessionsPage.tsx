@@ -41,7 +41,9 @@ import {
 } from "@/lib/session-import";
 import type {
   SessionInfo,
+  SessionKind,
   SessionMessage,
+  SessionQueryOptions,
   SessionSearchResult,
   SessionStoreStats,
   StatusResponse,
@@ -99,21 +101,31 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
     webhook: { icon: Globe, color: "text-warning" },
   };
 
-const AUTOMATION_SESSION_SOURCES = [
+// Row filtering is server-side (``kind``). This mirror of the backend's
+// BACKGROUND_SESSION_SOURCES (hermes_state_sessions.py) only groups the
+// source-picker options under the matching tab.
+const AUTOMATION_SESSION_SOURCE_SET = new Set([
+  "kanban",
+  "subagent",
   "cron",
-  "tool",
+  "a2a",
   "oneshot",
-  "api_server",
+  "tool",
+  "webhook",
   "acp",
   "hermes_flow",
   "vulcan_delegate",
-  "webhook",
-];
-const AUTOMATION_SESSION_SOURCE_SET = new Set(AUTOMATION_SESSION_SOURCES);
+]);
 const NO_MATCHING_SESSION_SOURCE = "__hermes_dashboard_no_matching_source__";
 
 type SessionFilterCategory = "chats" | "automation" | "all";
 type SourceSelectionsByCategory = Record<SessionFilterCategory, string[] | null>;
+
+const SESSION_KIND_BY_CATEGORY: Record<SessionFilterCategory, SessionKind> = {
+  chats: "interactive",
+  automation: "background",
+  all: "all",
+};
 
 function isAutomationSource(source: string): boolean {
   return AUTOMATION_SESSION_SOURCE_SET.has(source);
@@ -907,35 +919,19 @@ export default function SessionsPage() {
     [allSourceOptions],
   );
 
-  const sessionQueryOptions = useMemo(() => {
-    if (selectedSources !== null) {
-      if (selectedSources.length === 0) {
-        return allSourceNames.length > 0
-          ? { excludeSources: allSourceNames }
-          : { source: NO_MATCHING_SESSION_SOURCE };
-      }
-      if (selectedSources.length === 1) {
-        return { source: selectedSources[0] };
-      }
-      const selected = new Set(selectedSources);
-      const excludedSources = allSourceNames.filter(
-        (source) => !selected.has(source),
-      );
-      return excludedSources.length > 0 ? { excludeSources: excludedSources } : {};
+  // The backend classifies rows by ``kind``; an explicit source pick is an
+  // exact selector that the backend honours over ``kind``.
+  const sessionQueryOptions = useMemo((): SessionQueryOptions => {
+    const kind = SESSION_KIND_BY_CATEGORY[sessionCategory];
+    if (selectedSources === null) return { kind };
+    if (selectedSources.length === 0) {
+      return { kind, source: NO_MATCHING_SESSION_SOURCE };
     }
-    if (sessionCategory === "chats") {
-      return { excludeSources: AUTOMATION_SESSION_SOURCES };
+    if (selectedSources.length === 1) {
+      return { kind, source: selectedSources[0] };
     }
-    if (sessionCategory === "automation") {
-      const excludedSources = allSourceNames.filter(
-        (source) => !isAutomationSource(source),
-      );
-      return excludedSources.length > 0
-        ? { excludeSources: excludedSources }
-        : { sources: AUTOMATION_SESSION_SOURCES };
-    }
-    return {};
-  }, [selectedSources, sessionCategory, allSourceNames]);
+    return { kind, sources: selectedSources };
+  }, [selectedSources, sessionCategory]);
 
   const categoryDefaultSources = useMemo(() => {
     return allSourceNames.filter((source) =>

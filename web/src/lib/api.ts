@@ -368,9 +368,13 @@ function appendQueryParam(url: string, key: string, value?: string): string {
   return `${url}${url.includes("?") ? "&" : "?"}${key}=${encodeURIComponent(value)}`;
 }
 
+/** Server-side session classification; the backend owns which sources are background. */
+export type SessionKind = "interactive" | "background" | "all";
+
 export interface SessionQueryOptions {
   profile?: string;
   order?: "created" | "recent";
+  kind?: SessionKind;
   source?: string | null;
   sources?: string[];
   excludeSources?: string[];
@@ -392,6 +396,7 @@ function normalizeSessionQueryOptions(
 
 function appendSessionFilters(url: string, options: SessionQueryOptions): string {
   let next = url;
+  next = appendQueryParam(next, "kind", options.kind);
   next = appendQueryParam(next, "source", options.source ?? undefined);
   if (options.sources && options.sources.length > 0) {
     next = appendQueryParam(next, "sources", options.sources.join(","));

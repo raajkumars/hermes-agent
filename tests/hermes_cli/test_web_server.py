@@ -463,6 +463,29 @@ class TestWebServerEndpoints:
         assert [row["id"] for row in explicit["sessions"]] == ["cron"]
         assert explicit["sessions"][0]["session_kind"] == "background"
 
+    def test_session_search_kind_scopes_results_like_the_list(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            for session_id, source in (("s-chat", "cli"), ("s-worker", "kanban")):
+                db.create_session(session_id, source=source)
+                db.append_message(session_id, role="user", content="kindprobe needle")
+        finally:
+            db.close()
+
+        def hits(query: str) -> set:
+            resp = self.client.get(f"/api/sessions/search?q=kindprobe{query}")
+            assert resp.status_code == 200
+            return {row["session_id"] for row in resp.json()["results"]}
+
+        # Each tab's search returns exactly what its list returns.
+        for kind in ("interactive", "background", "all"):
+            listed = self.client.get(f"/api/sessions?kind={kind}&limit=50").json()["sessions"]
+            assert hits(f"&kind={kind}") == {row["id"] for row in listed}
+        assert hits("") == {"s-chat", "s-worker"}
+        assert self.client.get("/api/sessions/search?q=kindprobe&kind=bogus").status_code == 400
+
     def test_profiles_session_kind_filters_and_preserves_source_sections(self):
         from hermes_state import SessionDB
 

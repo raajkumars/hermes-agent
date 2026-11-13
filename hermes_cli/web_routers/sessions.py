@@ -264,7 +264,7 @@ def _is_compression_edge(child: dict, parent: dict) -> bool:
 @search_router.get("/api/sessions/search")
 async def search_sessions(
     q: str = "", limit: int = 20, profile: Optional[str] = None, source: str = None,
-    sources: str = None, exclude_sources: str = None):
+    sources: str = None, exclude_sources: str = None, kind: str = "all"):
     """Search sessions by ID (first) plus FTS5 message content.
 
     Results are deduped by compression lineage, not raw ``session_id``:
@@ -272,6 +272,15 @@ async def search_sessions(
     in the FTS index.  Branches also use ``parent_session_id`` but are real
     alternate conversations — they are NOT collapsed into the parent.
     """
+    # ``kind`` defaults to "all" here (unlike the list endpoint) so existing
+    # search callers keep their unscoped results.
+    try:
+        kind_sources, kind_excludes = session_kind_scope(
+            kind, source=source or None, sources=_csv(sources) or None,
+            exclude_sources=_csv(exclude_sources) or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not q or not q.strip():
         return {"results": []}
     with http_failure("GET /api/sessions/search failed", 500, detail="Search failed"):
@@ -280,9 +289,8 @@ async def search_sessions(
         def _search(db):
             safe_limit = max(1, min(int(limit or 20), 100))
             source_filter = source or None
-            source_list = _csv(sources)
-            include_sources = [source_filter] if source_filter else (source_list or None)
-            exclude_list = _csv(exclude_sources)
+            include_sources = [source_filter] if source_filter else (kind_sources or None)
+            exclude_list = kind_excludes or []
             now = time.time()
 
             def get_session(sid):
@@ -378,7 +386,7 @@ async def search_sessions(
             # Direct ID matches first (pasted ids never appear in message text).
             for row in db.search_sessions_by_id(
                 q, limit=safe_limit, include_archived=True, source=source_filter,
-                sources=source_list or None, exclude_sources=exclude_list or None):
+                sources=kind_sources or None, exclude_sources=exclude_list or None):
                 sid = row.get("id")
                 preview = (row.get("preview") or "").strip()
                 snippet = preview or f"Session ID: {sid}"
