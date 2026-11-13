@@ -1467,6 +1467,8 @@ export interface SessionStoreStats {
   archived: number;
   messages: number;
   by_source: Record<string, number>;
+  /** Sources the backend classifies as ``kind=background``. */
+  background_sources: string[];
 }
 
 export interface SessionImportResponse {

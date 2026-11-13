@@ -101,21 +101,6 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
     webhook: { icon: Globe, color: "text-warning" },
   };
 
-// Row filtering is server-side (``kind``). This mirror of the backend's
-// BACKGROUND_SESSION_SOURCES (hermes_state_sessions.py) only groups the
-// source-picker options under the matching tab.
-const AUTOMATION_SESSION_SOURCE_SET = new Set([
-  "kanban",
-  "subagent",
-  "cron",
-  "a2a",
-  "oneshot",
-  "tool",
-  "webhook",
-  "acp",
-  "hermes_flow",
-  "vulcan_delegate",
-]);
 const NO_MATCHING_SESSION_SOURCE = "__hermes_dashboard_no_matching_source__";
 
 type SessionFilterCategory = "chats" | "automation" | "all";
@@ -127,17 +112,15 @@ const SESSION_KIND_BY_CATEGORY: Record<SessionFilterCategory, SessionKind> = {
   all: "all",
 };
 
-function isAutomationSource(source: string): boolean {
-  return AUTOMATION_SESSION_SOURCE_SET.has(source);
-}
-
+// Row filtering is server-side (``kind``); the backend also owns which
+// sources are background, delivered on /api/sessions/stats.
 function sourceBelongsToCategory(
   source: string,
   category: SessionFilterCategory,
+  backgroundSources: ReadonlySet<string>,
 ): boolean {
   if (category === "all") return true;
-  if (category === "automation") return isAutomationSource(source);
-  return !isAutomationSource(source);
+  return backgroundSources.has(source) === (category === "automation");
 }
 
 function sourceLabel(source: string): string {
@@ -933,19 +916,25 @@ export default function SessionsPage() {
     return { kind, sources: selectedSources };
   }, [selectedSources, sessionCategory]);
 
+  const backgroundSources = useMemo(
+    () => new Set(stats?.background_sources ?? []),
+    [stats],
+  );
+
   const categoryDefaultSources = useMemo(() => {
     return allSourceNames.filter((source) =>
-      sourceBelongsToCategory(source, sessionCategory),
+      sourceBelongsToCategory(source, sessionCategory, backgroundSources),
     );
-  }, [sessionCategory, allSourceNames]);
+  }, [sessionCategory, allSourceNames, backgroundSources]);
 
   const sourceOptions = useMemo(() => {
     const selected = new Set(selectedSources ?? []);
     return allSourceOptions.filter(
       ([source]) =>
-        sourceBelongsToCategory(source, sessionCategory) || selected.has(source),
+        sourceBelongsToCategory(source, sessionCategory, backgroundSources) ||
+        selected.has(source),
     );
-  }, [allSourceOptions, selectedSources, sessionCategory]);
+  }, [allSourceOptions, selectedSources, sessionCategory, backgroundSources]);
 
   const effectiveSelectedSources = selectedSources ?? categoryDefaultSources;
 

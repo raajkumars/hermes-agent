@@ -26,7 +26,7 @@ from hermes_cli.web_routers._common import log as _log, destructive_profile, htt
 from hermes_cli.web_routers.session_kind import session_kind_scope
 from hermes_state import is_malformed_db_error
 from hermes_state_errors import is_transient_sqlite_error
-from hermes_state_sessions import session_kind
+from hermes_state_sessions import BACKGROUND_SESSION_SOURCES, session_kind
 
 list_router = APIRouter()
 search_router = APIRouter()
@@ -490,7 +490,9 @@ async def get_session_stats(profile: Optional[str] = None):
             "total": db.session_count(include_archived=True),
             "active_store": db.session_count(include_archived=False),
             "archived": db.session_count(archived_only=True), "messages": db.message_count(),
-            "by_source": {}}
+            "by_source": {},
+            # The dashboard groups its source picker by tab from this; the set is backend-owned.
+            "background_sources": sorted(BACKGROUND_SESSION_SOURCES)}
         try:
             out["by_source"] = db.session_count_by_source(
                 include_archived=True, exclude_children=True)
