@@ -53,6 +53,25 @@ def test_legitimate_multilingual_and_code_heavy_text_are_not_reported():
     assert detect_degenerate_response(code_heavy) is None
 
 
+def test_normal_profile_state_code_heavy_reply_is_not_reported():
+    """A trimmed normal Tara state.db reply; function and CLI-heavy, not corruption."""
+    profile_reply = (
+        "## Summary\n\n"
+        "I've completed the kanban task which fixed the `--ref` mode in "
+        "`kanban-review-now` to honor the verified `Kanban: t_x` PR-body binding.\n\n"
+        "### Changes Made\n\n"
+        "**File:** `hermes-plugins/qwick-guard/kanban_review_now.py`\n\n"
+        "1. Added `_auto_discover_binding_pr()` to list open PRs and find exactly "
+        "one whose body carries a `Kanban:` trailer naming a task in the task's "
+        "decompose lineage.\n"
+        "2. In `--ref` mode, `--pr` is optional; zero matches produce guidance and "
+        "multiple matches require an explicit `--pr`.\n"
+        "3. The event payload records `binding_pr` for the verified PR URL.\n"
+    )
+
+    assert detect_degenerate_response(profile_reply) is None
+
+
 def test_balanced_multilingual_parentheticals_do_not_trigger_provider_fallback():
     # A real explanation can alternate four writing systems inside references or
     # translations while keeping every parenthesis balanced.  This used to meet the
