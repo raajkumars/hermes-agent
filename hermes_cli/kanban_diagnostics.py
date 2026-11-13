@@ -465,11 +465,26 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
 
     threshold = int(cfg.get("crash_threshold", 2))
+    # A crash streak older than this is stale: don't keep an alert alive on
+    # ancient history. 72h matches the operator expectation that a "this is
+    # happening right now" signal should age out once nobody could still be
+    # staring at the same incident.
+    window_seconds = 72 * 3600
     # Count trailing consecutive 'crashed' outcomes; a success (or manual
     # reclaim) breaks the streak, other outcomes neither count nor break it.
     consecutive = 0
     last_err = None
     for r in _runs_newest_first(runs):
+        # Runs are scanned newest-first, so the first run whose own timestamp
+        # falls outside the 72h window means every run from here on is also
+        # outside it (or has no usable timestamp) -- stop the scan instead of
+        # letting a stale crash streak count towards (or re-fire) the rule.
+        # Prefer ended_at (when the run actually finished/crashed); fall back
+        # to started_at for a run that has no end time recorded. A run with
+        # neither is left in (can't prove it's stale, so don't drop it).
+        run_ts = _task_field(r, "ended_at") or _task_field(r, "started_at")
+        if run_ts and (now - run_ts) > window_seconds:
+            break
         outcome = _task_field(r, "outcome")
         if outcome == "crashed":
             consecutive += 1
