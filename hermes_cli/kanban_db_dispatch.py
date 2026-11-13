@@ -156,6 +156,14 @@ class DispatchResult:
     dispatched from any lane, including the embedded gateway dispatcher.
     """
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    skipped_function_pool_capped: list[tuple[str, str, str, int]] = field(default_factory=list)
+    # Machine-readable admission denials.  Keep the older capped bucket
+    # unchanged so dashboards and existing callers remain compatible.
+    function_pool_limit_errors: list[tuple[str, str, str, str]] = field(default_factory=list)
+    # Current running-worker slots by assignee, refreshed at the start of
+    # each tick and incremented after every successful claim. This is a
+    # metric even when max_in_progress_per_profile is disabled.
+    profile_slot_utilization: dict[str, int] = field(default_factory=dict)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
@@ -2548,6 +2556,134 @@ def _disk_pressure_level(
     return "warning" if free <= warn_gib * gib else "ok"
 
 
+# The aliases make the two directional indexes explicit: pool policy is keyed
+# by pool name, while profile assignment is keyed by profile name.  Keep the
+# raw config argument at the boundary; validation owns rejecting malformed
+# values before dispatch, but this normalization remains defensive.
+FunctionPoolPolicy = dict[str, int]
+FunctionPoolPolicies = dict[str, FunctionPoolPolicy]
+ProfilePoolAssignments = dict[str, str]
+PoolSlotUsage = dict[str, int]
+# The optional final value is set only for denials, allowing callers to keep
+# the existing boolean-first admission contract while inspecting the reason.
+FunctionPoolSlotDecision = tuple[bool, str, int, Optional[str]]
+
+
+def _function_pool_policy(raw: Any) -> tuple[FunctionPoolPolicies, ProfilePoolAssignments]:
+    """Normalize raw policy into lookup tables and default unmapped profiles.
+
+    A zero ``max_slots`` or ``reserved_slots`` means that particular limit is
+    disabled.  This preserves the existing optional-limit convention while
+    making the downstream quota check operate on normalized integer values.
+    """
+    pools: FunctionPoolPolicies = {}
+    profile_pools: ProfilePoolAssignments = {}
+    if not isinstance(raw, dict):
+        return pools, profile_pools
+    for pool, value in raw.items():
+        if not isinstance(pool, str) or not isinstance(value, dict):
+            continue
+        name = pool.strip()
+        if not name:
+            continue
+        policy = {key: _positive_int(value.get(key), 0) for key in ("max_slots", "reserved_slots")}
+        pools[name] = policy
+        profiles = value.get("profiles", [])
+        if isinstance(profiles, str):
+            profiles = [profiles]
+        if isinstance(profiles, (list, tuple, set)):
+            for profile in profiles:
+                if isinstance(profile, str) and profile.strip():
+                    profile_pools.setdefault(profile.strip(), name)
+    return pools, profile_pools
+
+
+def _function_pool_for_profile(profile: str, profile_pools: ProfilePoolAssignments) -> str:
+    """Resolve a profile's configured pool or the auditable engineering fallback."""
+    pool = profile_pools.get(profile)
+    if pool:
+        return pool
+    return "engineering"
+
+
+# Stable admission-denial codes.  GLOBAL_LIMIT_EXCEEDED means shared
+# capacity (including protected reservations) is unavailable; POOL_CAPACITY_EXCEEDED
+# means this pool reached its own configured max_slots value.
+GLOBAL_LIMIT_EXCEEDED = "GLOBAL_LIMIT_EXCEEDED"
+POOL_CAPACITY_EXCEEDED = "POOL_CAPACITY_EXCEEDED"
+
+
+def _audit_function_pool_fallback(
+    conn: sqlite3.Connection, task_id: str, profile: str, profile_pools: ProfilePoolAssignments,
+) -> None:
+    """Persist and log an unknown-profile fallback before spawning its worker.
+
+    ``KANBAN_UNKNOWN_PROFILE_FUNCTION_POOL`` identifies a policy fallback,
+    rather than a failed claim: the task remains eligible in ``engineering``.
+    """
+    timestamp = int(time.time())
+    payload = {
+        "timestamp": timestamp,
+        "error_code": "KANBAN_UNKNOWN_PROFILE_FUNCTION_POOL",
+        "profile": profile,
+        "assigned_pool": "engineering",
+        "validation_context": {
+            "profile_mapping": "missing",
+            "configured_profile_count": len(profile_pools),
+            "fallback_policy": "engineering",
+        },
+    }
+    with _kb.write_txn(conn):
+        _kb._append_event(conn, task_id, "function_pool_fallback", payload)
+    _kb._log.warning(
+        "kanban dispatch: function-pool fallback",
+        extra={
+            "timestamp": timestamp,
+            "error_code": "KANBAN_UNKNOWN_PROFILE_FUNCTION_POOL",
+            "profile": profile,
+            "assigned_pool": "engineering",
+            "task_id": task_id,
+        },
+    )
+
+
+def _function_pool_allows_spawn(
+    assignee: str,
+    pools: FunctionPoolPolicies,
+    profile_pools: ProfilePoolAssignments,
+    pool_running: PoolSlotUsage,
+    *,
+    max_in_progress: Optional[int],
+) -> FunctionPoolSlotDecision:
+    """Return admission state and a stable reason when capacity is exhausted.
+
+    Shared capacity is evaluated before a pool-local cap so a simultaneous
+    global exhaustion is consistently reported as ``GLOBAL_LIMIT_EXCEEDED``.
+    At the shared boundary, only another pool's unmet reservation is protected;
+    the candidate pool may consume its own reserved capacity.  ``pool_running``
+    is incremented after every successful claim, so callers must pass the live
+    in-tick snapshot rather than a start-of-tick total.  Success returns ``None``
+    as its final value.
+    """
+    pool = _function_pool_for_profile(assignee, profile_pools)
+    policy = pools.get(pool, {})
+    current = pool_running.get(pool, 0)
+    cap = policy.get("max_slots", 0)
+    if max_in_progress is not None:
+        # pool_running changes after each claim, including earlier claims in
+        # this tick, so reserve checks cannot oversubscribe the shared budget.
+        total_running = sum(pool_running.values())
+        protected = sum(
+            max(0, policy.get("reserved_slots", 0) - pool_running.get(name, 0))
+            for name, policy in pools.items() if name != pool
+        )
+        if total_running >= max_in_progress - protected:
+            return False, pool, current, GLOBAL_LIMIT_EXCEEDED
+    if cap and current >= cap:
+        return False, pool, current, POOL_CAPACITY_EXCEEDED
+    return True, pool, current, None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -2561,6 +2697,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    function_pools: Any = None,
     reconcile_orphans: bool = True,
     gateway_dispatcher: bool = False,
 ) -> DispatchResult:
@@ -2585,6 +2722,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            function_pools=function_pools,
             reconcile_orphans=reconcile_orphans,
             gateway_dispatcher=gateway_dispatcher,
         )
@@ -2636,6 +2774,10 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    function_pools: FunctionPoolPolicies,
+    profile_pools: ProfilePoolAssignments,
+    pool_running: PoolSlotUsage,
+    max_in_progress: Optional[int],
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2657,6 +2799,17 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    allowed, pool, pool_current, error_code = _function_pool_allows_spawn(
+        assignee, function_pools, profile_pools, pool_running,
+        max_in_progress=max_in_progress,
+    )
+    if not allowed:
+        result.skipped_function_pool_capped.append((task_id, assignee, pool, pool_current))
+        # The structured code is additive: existing consumers retain the
+        # historical capped bucket while new callers can branch without text parsing.
+        assert error_code is not None
+        result.function_pool_limit_errors.append((task_id, assignee, pool, error_code))
+        return False
     # Primary provider hard rate-limited: hold the row in its lane until the reset instead of
     # spawning a worker that would fail over onto the fallback subscription (t_5b853ddb). No
     # event is appended -- this re-evaluates every tick; the dispatcher logs one line per hold.
@@ -2681,8 +2834,12 @@ def _dispatch_lane_task(
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
-        if per_profile_cap is not None and name:
+        # Keep the profile metric even when the per-profile enforcement cap is disabled.
+        if name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
+            result.profile_slot_utilization[name] = per_profile_running[name]
+        pool = _function_pool_for_profile(name, profile_pools)
+        pool_running[pool] = pool_running.get(pool, 0) + 1
 
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
@@ -2692,6 +2849,8 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    if assignee not in profile_pools:
+        _audit_function_pool_fallback(conn, claimed.id, assignee, profile_pools)
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -2962,6 +3121,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    function_pools: Any = None,
     reconcile_orphans: bool = True,
     gateway_dispatcher: bool = False,
 ) -> DispatchResult:
@@ -3019,6 +3179,16 @@ def _dispatch_once_locked(
         and max_in_progress_per_profile > 0
     ) else None
     per_profile_running: dict[str, int] = {}
+    function_pools, profile_pools = _function_pool_policy(function_pools)
+    pool_running: dict[str, int] = {}
+    # Collect slot utilization regardless of whether profile caps are enabled.
+    for prow in conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status = 'running' AND assignee IS NOT NULL "
+        "GROUP BY assignee"
+    ):
+        per_profile_running[prow["assignee"]] = int(prow["n"])
+    result.profile_slot_utilization = dict(per_profile_running)
     if per_profile_cap is not None:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
@@ -3026,6 +3196,10 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
+    for prow in conn.execute("SELECT assignee, COUNT(*) AS n FROM tasks WHERE status = 'running' AND assignee IS NOT NULL GROUP BY assignee"):
+        count = int(prow["n"])
+        pool = _function_pool_for_profile(prow["assignee"], profile_pools)
+        pool_running[pool] = pool_running.get(pool, 0) + count
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
@@ -3040,6 +3214,8 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        function_pools=function_pools, profile_pools=profile_pools, pool_running=pool_running,
+        max_in_progress=max_in_progress,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

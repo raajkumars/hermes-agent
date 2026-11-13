@@ -1904,6 +1904,10 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Named function-pool concurrency policy. Each mapping entry may name
+        # ``profiles`` and positive ``max_slots`` / ``reserved_slots`` values.
+        # Unknown profiles are routed to the ``engineering`` pool by the dispatcher.
+        "function_pools": {},
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a

@@ -69,6 +69,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = kbd._positive_int(
             _kanban_cfg.get("max_in_progress_per_profile"), None
         )
+        function_pools = _kanban_cfg.get("function_pools")
         # Memory-derived default when unset — same fallback the gateway applies.
         max_in_progress = kbd.resolve_max_in_progress(
             kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
@@ -79,7 +80,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
     except Exception:
-        default_assignee = max_in_progress_per_profile = max_in_progress = None
+        default_assignee = max_in_progress_per_profile = max_in_progress = function_pools = None
         max_spawn = getattr(args, "max", None)
     paused = estop.is_engaged()
     if paused and max_spawn != 0:
@@ -96,6 +97,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            function_pools=function_pools,
         )
     if getattr(args, "json", False):
         _print_json({
@@ -113,6 +115,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_function_pool_capped": [
+                {"task_id": tid, "assignee": who, "pool": pool, "current": current}
+                for (tid, who, pool, current) in res.skipped_function_pool_capped
+            ],
+            "function_pool_limit_errors": [
+                {"task_id": tid, "assignee": who, "pool": pool, "error_code": error_code}
+                for (tid, who, pool, error_code) in res.function_pool_limit_errors
+            ],
+            "profile_slot_utilization": res.profile_slot_utilization,
             "auto_assigned_default": res.auto_assigned_default,
             "respawn_guarded": [
                 {"task_id": tid, "reason": reason}

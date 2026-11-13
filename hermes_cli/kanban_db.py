@@ -2365,6 +2365,33 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return [Event.from_row(r) for r in _task_rows(conn, "task_events", task_id, "created_at ASC, id ASC")]
 
 
+def list_function_pool_fallback_events(
+    conn: sqlite3.Connection, *, task_id: Optional[str] = None, since: Optional[int] = None,
+    limit: int = 1000,
+) -> list[Event]:
+    """Fallback audit records for investigations, newest first.
+
+    These are ordinary task events and therefore follow ``gc_events`` retention.
+    """
+    limit = int(limit)
+    if limit <= 0:
+        raise ValueError("limit must be > 0")
+    clauses = ["kind = 'function_pool_fallback'"]
+    params: list[Any] = []
+    if task_id is not None:
+        clauses.append("task_id = ?")
+        params.append(task_id)
+    if since is not None:
+        clauses.append("created_at >= ?")
+        params.append(int(since))
+    rows = conn.execute(
+        "SELECT id, task_id, run_id, kind, payload, created_at FROM task_events WHERE "
+        + " AND ".join(clauses) + " ORDER BY created_at DESC, id DESC LIMIT ?",
+        [*params, limit],
+    ).fetchall()
+    return [Event.from_row(row) for row in rows]
+
+
 def _insert_comment(
     conn: sqlite3.Connection, task_id: str, author: str, body: str, created_at: int,
 ) -> None:
