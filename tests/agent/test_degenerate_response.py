@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -125,6 +127,7 @@ class _FallbackAgent:
     def __init__(self):
         self.hooks = []
         self.statuses = []
+        self.fallback_calls = []
 
     def _invoke_api_request_error_hook(self, **kwargs):
         self.hooks.append(kwargs)
@@ -133,7 +136,11 @@ class _FallbackAgent:
         return False, False
 
     def _try_activate_fallback(self):
+        self.fallback_calls.append((self.provider, self.model))
+        target = self._fallback_chain[self._fallback_index]
         self._fallback_index += 1
+        self.provider = target["provider"]
+        self.model = target["model"]
         return True
 
     def _buffer_diagnostic_status(self, status):
@@ -159,4 +166,49 @@ def test_degenerate_response_uses_retryable_provider_hook_and_existing_fallback(
     assert verdict.active_system_prompt == "same system prompt"
     assert agent.hooks[0]["error_type"] == "DegenerateProviderResponse"
     assert agent.hooks[0]["retryable"] is True
+    assert agent.fallback_calls == [("openrouter", "nvidia/nemotron-3-nano-30b-a3b:free")]
+    assert (agent.provider, agent.model) == ("openai", "gpt-5")
     assert agent.statuses == ["⚠️ Degenerate provider output — switching to fallback..."]
+
+
+def test_degenerate_response_activates_a_real_configured_fallback(monkeypatch):
+    """The real agent must leave the bad route, not merely report a retry."""
+    from run_agent import AIAgent
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent: Any = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            model="nvidia/nemotron-3-nano-30b-a3b:free",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            fallback_model=cast(dict[str, Any], [{"provider": "openai", "model": "gpt-5"}]),
+        )
+
+    fallback_client = MagicMock()
+    fallback_client.api_key = "fallback-key"
+    fallback_client.base_url = "https://api.openai.com/v1"
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *_args, **_kwargs: (fallback_client, "gpt-5"),
+    )
+
+    verdict = retry_invalid_response(
+        agent,
+        response=SimpleNamespace(error=None),
+        error_details=["degenerate_provider_output digest=deadbeef length=400 count=1"],
+        _retry=TurnRetryState(), thinking_spinner=None, messages=[], api_messages=[], api_kwargs=None,
+        active_system_prompt="system", conversation_history=None, retry_count=0, max_retries=3,
+        compression_attempts=0, api_call_count=1, api_request_id="request", api_start_time=0.0,
+        api_duration=0.1, effective_task_id="task", turn_id="turn",
+    )
+
+    assert verdict.action == "break"
+    assert (agent.provider, agent.model) == ("openai", "gpt-5")
+    assert agent._fallback_activated is True
