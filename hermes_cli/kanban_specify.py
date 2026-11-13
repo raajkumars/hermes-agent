@@ -198,6 +198,16 @@ def specify_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
+    # A loop-breaker escalation is deliberately terminal for automation. The
+    # task is in triage so a human can resolve the repeated unblock cycle;
+    # asking the specifier to act would silently bypass that escalation.
+    with kbc.connect_closing() as conn:
+        if any(event.kind == "block_loop_detected" for event in kb.list_events(conn, task_id)):
+            return SpecifyOutcome(
+                task_id,
+                False,
+                "task requires manual triage after repeated unblock cycles",
+            )
 
     raw, reason = _call_aux(
         "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,
