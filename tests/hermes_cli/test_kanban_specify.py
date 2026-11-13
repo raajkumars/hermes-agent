@@ -97,6 +97,27 @@ def test_specify_task_happy_path(kanban_home):
 
 
 
+def test_specify_task_skips_block_loop_escalation(kanban_home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="needs a human", triage=True)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "block_loop_detected")
+
+    p, mock_call = _patch_aux_client('{"title": "should not run"}')
+    with p:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome == spec.SpecifyOutcome(
+        tid,
+        False,
+        "task requires manual triage after repeated unblock cycles",
+    )
+    mock_call.assert_not_called()
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+    assert (task.status, task.title) == ("triage", "needs a human")
+
+
 # ---------------------------------------------------------------------------
 # CLI wiring — argparse + _cmd_specify
 # ---------------------------------------------------------------------------
