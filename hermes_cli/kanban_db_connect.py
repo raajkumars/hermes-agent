@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import random
 import re
 import secrets
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -665,6 +667,39 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     return conn, out
 
 
+def _running_test_harness() -> bool:
+    """Whether this process is a pytest/unittest run, including test children."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return True
+    return (
+        os.environ.get("HERMES_TEST_MODE") == "1"
+        and ("pytest" in sys.modules or "unittest" in sys.modules)
+    )
+
+
+def _refuse_live_board_write_from_test(path: Path) -> None:
+    """Keep a test that inherits a worker board pin off the live Kanban DB.
+
+    Tests receive a temporary root from ``tests/conftest.py``. A path outside
+    that root is a production pin or an explicitly supplied external board, so
+    fail before mkdir/sqlite can create or mutate it. ``ALLOW`` is deliberately
+    noisy and opt-in for the rare integration harness that owns its board.
+    """
+    if not _running_test_harness() or os.environ.get("HERMES_KANBAN_ALLOW_LIVE_IN_TESTS") == "1":
+        return
+    root = os.environ.get("HERMES_KANBAN_TEST_ROOT", "").strip()
+    if root:
+        try:
+            path.resolve().relative_to(Path(root).expanduser().resolve())
+            return
+        except ValueError:
+            pass
+    raise PermissionError(
+        "refusing to open Kanban board outside HERMES_KANBAN_TEST_ROOT from a test; "
+        "set HERMES_KANBAN_ALLOW_LIVE_IN_TESTS=1 only for an explicitly owned integration board"
+    )
+
+
 def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB. WAL is (re)enabled on
     every connection so a re-created file stays robust; the first connection
@@ -673,6 +708,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    _refuse_live_board_write_from_test(path)
     from agent.delegation_context import kanban_path_is_fenced
     if kanban_path_is_fenced(path):
         # Reads must not enter schema/backfill write transactions. Never create a
@@ -758,6 +794,7 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
     migration pass — callers that know the on-disk schema may have drifted
     (tests writing legacy event kinds, external upgrades) use it to force it."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    _refuse_live_board_write_from_test(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Clear the cache entry so connect() re-runs schema + migrations.
     with _INIT_LOCK:
@@ -832,7 +869,8 @@ _LATER_TASK_COLUMNS = (
     ("goal_max_turns", "goal_max_turns INTEGER"),
     ("completion_contract", "completion_contract TEXT"),
     ("session_id", "session_id TEXT"),
-    # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
+    # Typed reason for a currently blocked task (VALID_BLOCK_KINDS); NULL for
+    # every non-blocked task and generic human blockers.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
@@ -893,6 +931,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
 
+    # ``block_kind`` is live-state metadata, not the loop-breaker's history.
+    # Older releases retained it after a task left ``blocked``; remove those
+    # stale classifications on every open so old boards immediately satisfy
+    # the invariant. The update is idempotent and historical recurrence data
+    # remains in block_recurrences plus task_events.
+    conn.execute(
+        "UPDATE tasks SET block_kind = NULL "
+        "WHERE status != 'blocked' AND block_kind IS NOT NULL"
+    )
+
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,
     # so a ``CREATE INDEX`` over a missing column in SCHEMA_SQL would abort
@@ -910,6 +958,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     # Same ordering rule as the ``tasks`` indexes above: index after column.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id, id)")
+    # task_events.acted_by: who/what wrote the event (see kanban_db.resolve_actor); NULL for
+    # events written before attribution existed. Indexed so "what did X unblock" is cheap.
+    if "acted_by" not in _column_names(conn, "task_events"):
+        _add_column_if_missing(conn, "task_events", "acted_by", "acted_by TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_actor ON task_events(acted_by, kind, created_at)")
 
     if _table_exists(conn, "kanban_notify_subs"):
         notify_cols = _column_names(conn, "kanban_notify_subs")
@@ -1014,10 +1067,11 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_events ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL,"
-        " payload TEXT, created_at INTEGER NOT NULL)",
+        " payload TEXT, created_at INTEGER NOT NULL, acted_by TEXT)",
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
+            "CREATE INDEX idx_events_actor ON task_events(acted_by, kind, created_at)",
         ),
     ),
     "task_comments": (

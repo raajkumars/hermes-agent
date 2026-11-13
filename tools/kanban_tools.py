@@ -24,7 +24,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_UNLINK_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -418,7 +418,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     children = kb.child_ids(conn, task.id)
     return {
         **_fields(task, _TASK_SUMMARY_FIELDS), "parents": parents, "children": children,
-        "parent_count": len(parents), "child_count": len(children)}
+        "parent_count": len(parents), "child_count": len(children),
+        **kb.compute_request_view(conn, task)}
 
 
 # --- Goal-mode judge gate ---
@@ -624,11 +625,13 @@ def _handle_show(args: dict, **kw) -> str:
         task = _existing_task(kb, conn, tid)
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
+            "request_view": kb.compute_request_view(conn, task),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
             # gate is not holding it and kanban_complete will refuse.
             "unsatisfied_parents": [
-                {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
+                {"id": pid, "status": status, "reason": reason, "verdict": verdict}
+                for pid, status, reason, verdict in kb.unsatisfied_parents(conn, tid)],
             "children": kb.child_ids(conn, tid),
             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
             # Capped; full log via CLI.
@@ -737,7 +740,10 @@ def _handle_complete(args: dict, **kw) -> str:
             # the worker/operator completes the parents instead of re-running.
             blockers = kb.unsatisfied_parents(conn, tid)
             if blockers:
-                detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
+                detail = ", ".join(
+                    f"{pid} ({status}; {reason}" + (f"; verdict={verdict}" if verdict else "") + ")"
+                    for pid, status, reason, verdict in blockers
+                )
                 raise _Reject(
                     f"could not complete {tid}: unsatisfied parent dependencies: "
                     f"{detail}; complete the parents first (done or archived)")
@@ -826,7 +832,8 @@ def _handle_request_review(args: dict, **kw) -> str:
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid), with_reason=True)
+                expected_run_id=_worker_run_id(tid), with_reason=True,
+                implementer=_redact_opt(args.get("implementer") or None))
         except kb.ArtifactPreservationError as artifact_err:
             # Same contract as kanban_complete (#22923): the transition rolled
             # back, the task is untouched and retryable — say so explicitly or
@@ -851,7 +858,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
         ok, detail = kb.request_changes(
             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
-        return _ok_landed(kb, conn, tid, "ready", implementer=detail)
+        return _ok_landed(kb, conn, tid, "ready", implementer=detail)  # status reports where it actually landed (blocked for an external author)
 
 
 @_kanban_handler("kanban_heartbeat")
@@ -890,6 +897,10 @@ def _handle_comment(args: dict, **kw) -> str:
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        warning = kb.needs_input_comment_warning(conn, tid)
+        if warning:
+            # A comment never unblocks a needs_input card; say so to the caller.
+            return _ok(task_id=tid, comment_id=cid, warning=warning)
         return _ok(task_id=tid, comment_id=cid)
 
 
@@ -1039,6 +1050,16 @@ def _handle_create(args: dict, **kw) -> str:
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
                     if _is_dispatcher_owned_worker() else None)
         self_task = kb.get_task(conn, self_tid) if self_tid else None
+        if (
+            not str(args.get("body") or "").strip()
+            and not parents
+            and not self_tid
+            and not triage
+        ):
+            raise ValueError(
+                f"refusing to create {str(title).strip()!r}: add a body, link a parent, "
+                "or file it to triage"
+            )
         # The worker/API runtime may be transient; the owning task's origin is durable.
         # The ambient id is the request-scoped ContextVar binding, not the process-global
         # os.environ: in a multi-session gateway the env holds the LAST agent built, and an
@@ -1178,6 +1199,22 @@ def _handle_link(args: dict, **kw) -> str:
                    **({"gated_by": parent_id} if gated else {}))
 
 
+@_kanban_handler("kanban_unlink")
+def _handle_unlink(args: dict, **kw) -> str:
+    """Remove a dependency edge; mirrors kanban_link's running-child fence."""
+    _reject_delegated_child_mutation("kanban_unlink")
+    parent_id = args.get("parent_id")
+    child_id = args.get("child_id")
+    _check(parent_id and child_id, "both parent_id and child_id are required")
+    with _board(args.get("board")) as (kb, conn):
+        removed = kb.unlink_tasks(
+            conn, parent_id=parent_id, child_id=child_id,
+            expected_child_run_id=_worker_run_id(str(child_id)))
+        _check(removed, f"could not unlink {parent_id} -> {child_id} (edge not found)")
+        return _ok(parent_id=parent_id, child_id=child_id,
+                   **_fields(kb.get_task(conn, child_id), ("status",)))
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
@@ -1196,7 +1233,8 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_unlink", KANBAN_UNLINK_SCHEMA, _handle_unlink, "🔓"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

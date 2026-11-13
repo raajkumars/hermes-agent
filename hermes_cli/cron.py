@@ -899,12 +899,65 @@ _CRON_SUBCOMMANDS["add"] = _CRON_SUBCOMMANDS["create"]
 _CRON_SUBCOMMANDS["rm"] = _CRON_SUBCOMMANDS["delete"] = _CRON_SUBCOMMANDS["remove"]
 
 
+def _other_cron_store_jobs() -> Dict[str, List[Dict[str, Any]]]:
+    """Jobs in cron stores OTHER than the one this process is homed on, keyed by ``-p`` name.
+
+    Cron is per-profile (``cron.jobs``), and a bare ``hermes`` follows the sticky ``active_profile``, so
+    a sticky named profile hides every job in the default store (and other profiles') from list/edit/
+    pause/status/runs/doctor while the gateway keeps ticking them. Read-only: never schedules or writes.
+    """
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+    try:
+        current = (get_hermes_home().resolve() / "cron" / "jobs.json")
+        root = get_default_hermes_root()
+        stores = [("default", root / "cron" / "jobs.json")]
+        profiles_dir = root / "profiles"
+        if profiles_dir.is_dir():
+            stores += [(e.name, e / "cron" / "jobs.json") for e in sorted(profiles_dir.iterdir())]
+    except OSError:
+        return {}
+    found: Dict[str, List[Dict[str, Any]]] = {}
+    for label, path in stores:
+        try:
+            if not path.is_file() or path.resolve() == current:
+                continue
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        jobs = data.get("jobs") if isinstance(data, dict) else data
+        jobs = [j for j in (jobs or []) if isinstance(j, dict)]
+        if jobs:
+            found[label] = jobs
+    return found
+
+
+def _print_other_store_notice(subcmd: Optional[str], args, rc) -> None:
+    """stderr notice when other cron stores hold jobs this command did not cover."""
+    if subcmd in ("create", "add", "tick", "notepad"):
+        return
+    others = _other_cron_store_jobs()
+    if not others:
+        return
+    ref = getattr(args, "job_id", None)
+    if ref and rc not in (0, None):
+        for label, jobs in others.items():
+            if any(str(j.get("id", "")).startswith(ref) or j.get("name") == ref for j in jobs):
+                print(color(f"Job {ref!r} lives in the {label!r} cron store, not this profile's. "
+                            f"Run: hermes -p {label} cron {subcmd} {ref} ...", Colors.YELLOW),
+                      file=sys.stderr)
+    summary = ", ".join(f"{label} ({len(jobs)})" for label, jobs in others.items())
+    print(color(f"Note: other cron stores hold jobs this command did not cover: {summary}. "
+                "Target one with `hermes -p <name> cron ...`.", Colors.YELLOW), file=sys.stderr)
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
     handler = _CRON_SUBCOMMANDS.get("list" if subcmd is None else subcmd)
     if handler is not None:
-        return handler(args)
+        rc = handler(args)
+        _print_other_store_notice(subcmd, args, rc)
+        return rc
     print(f"Unknown cron command: {subcmd}\n"
           "Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|tick]")
     sys.exit(1)

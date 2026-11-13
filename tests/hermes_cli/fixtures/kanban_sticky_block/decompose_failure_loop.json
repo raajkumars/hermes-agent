@@ -1,0 +1,29 @@
+{
+  "regression": "t_a197a905 decompose-failure triage loop",
+  "cards": [
+    {
+      "key": "fixture",
+      "title": "sticky block",
+      "assignee": "worker",
+      "history": [
+        {"op": "block", "kind": "needs_input", "reason": "human decision"},
+        {"op": "unblock"},
+        {"op": "block", "kind": "needs_input", "reason": "same human decision"}
+      ],
+      "decomposer": {
+        "ok": false,
+        "fanout": false,
+        "reason": "budget_exhausted: needs split (no fanout)"
+      },
+      "expect": {
+        "after_tick_1": {"status": "blocked", "sticky": true, "source_status": "triage"},
+        "ticks": 4,
+        "decomposer_calls": 1,
+        "extra_events_after_tick_1": 0
+      }
+    },
+    {"key": "C1", "title": "triage success", "decomposer": {"ok": true, "fanout": true}},
+    {"key": "C2", "title": "worker double block", "kind": "needs_input"},
+    {"key": "C3", "title": "dependency wait", "kind": "dependency"}
+  ]
+}

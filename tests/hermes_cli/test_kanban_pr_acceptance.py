@@ -21,7 +21,11 @@ def github(tmp_path, monkeypatch):
             sha = state["head"]
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                    # t_e5a5924c: a CLOSED, unmerged pull request is the one
+                    # acceptance outcome no retry can ever change, so the suite
+                    # has to be able to produce it.
+                    "headRefOid": sha, "baseRefName": "main",
+                    "state": state.get("pr_state", "OPEN"),
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
                         {"context": "required", "app": {"databaseId": 1}}]}}}}}}
             elif "/rules/branches/" in self.path:
@@ -107,6 +111,93 @@ def test_pr_completion_requires_current_required_evidence(github):
         local = kb.create_task(conn, title="local", completion_contract="local-only")
         assert kb.complete_task(conn, local, summary="https://github.com/acme/repo/pull/7 is background context")
         assert len(github["requests"]) == before
+
+
+@pytest.mark.linux_only
+def test_published_pr_shape_is_caller_input_not_github_infra(github):
+    """An object-shaped published_pr carries its URL; any other shape is a caller error."""
+    url = "https://github.com/acme/repo/pull/7"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="object", body="publish", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": {"url": url, "number": 7}})
+        assert kb.get_task(conn, tid).completion_contract == url
+        for bad in ({"number": 7}, 7, [url]):
+            tid = kb.create_task(conn, title="bad", body="publish", completion_contract="acme/repo")
+            before = len(github["requests"])
+            assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": bad})
+            receipt = json.loads(conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance' ORDER BY id DESC",
+                (tid,)).fetchone()[0])
+            assert receipt["classification"] == "missing"
+            assert "published_pr must be the PR URL string" in receipt["detail"]
+            assert len(github["requests"]) == before
+
+
+@pytest.mark.linux_only
+def test_a_refused_completion_reports_why_not_unknown_id_or_terminal_state(github, capsys):
+    """t_e5a5924c: `kanban complete` told the truth about why it refused.
+
+    The incident. A card bound to a pull request that was CLOSED without being
+    merged can never be accepted -- acceptance requires OPEN or MERGED -- while
+    `kanban edit --completion-contract` refuses to replace the binding
+    ("publication binds once") and `--force` overrides only the live-claim
+    fence. The card sat in `ready`, and every `kanban complete` answered
+    `cannot complete <id> (unknown id or terminal state)`: the id existed and
+    the status was not terminal, so BOTH halves were false and the real reason
+    (the acceptance receipt, already on the event log) was never surfaced.
+    Archiving by hand was the only way off the board.
+
+    This asserts the reason now reaches the caller, that the bare-bool contract
+    every other caller relies on is unchanged, and that a card which really is
+    in a terminal state still gets the terminal-state wording.
+    """
+    import argparse
+
+    from hermes_cli import kanban as kcli
+
+    url = "https://github.com/acme/repo/pull/7"
+
+    def complete_cli(tid):
+        args = argparse.Namespace(task_ids=[tid], summary="done", metadata=None,
+                                  result="done", force=False)
+        return kcli._cmd_complete(args)
+
+    with connect() as conn:
+        github.update(conclusion="success", head="a" * 40, pr_state="CLOSED")
+        tid = kb.create_task(conn, title="publish", completion_contract="acme/repo")
+        ok, reason = kb.complete_task(conn, tid, result="done", with_reason=True,
+                                      metadata={"published_pr": url})
+        assert ok is False
+        # The reason is the acceptance receipt's own words, read off the card,
+        # and the receipt names the real state instead of blaming gh auth.
+        assert reason and "PR acceptance closed" in reason, reason
+        assert "was not merged" in reason and "never succeed" in reason
+        assert "gh authentication" not in reason
+        assert "unknown id" not in reason
+        # ... for a card that is demonstrably neither unknown nor terminal.
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status in {"running", "ready", "blocked", "review"}
+        assert task.completion_contract == url  # publication bound on the first attempt
+
+        # Every caller that does not ask for a reason still sees a bare bool.
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": url}) is False
+
+    # The CLI surfaces it, and names exits that exist instead of inviting a
+    # retry that cannot succeed.
+    assert complete_cli(tid) == 1
+    err = capsys.readouterr().err
+    assert "unknown id or terminal state" not in err, err
+    assert "PR acceptance" in err
+    assert "binds once" in err and "archive" in err
+
+    # A genuinely terminal card still reads as terminal.
+    with connect() as conn:
+        done = kb.create_task(conn, title="local", completion_contract="local-only")
+        assert kb.complete_task(conn, done, summary="finished")
+        ok, reason = kb.complete_task(conn, done, summary="again", with_reason=True)
+        assert ok is False
+        assert "status is 'done'" in reason, reason
 
 
 @pytest.mark.linux_only

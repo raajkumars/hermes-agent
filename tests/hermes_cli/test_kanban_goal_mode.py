@@ -170,7 +170,12 @@ class TestCLIJudgeGate:
 
         def fake_complete_task(conn, tid, **kw):
             complete_calls.append(tid)
-            return complete_ok
+            # t_e5a5924c: complete_task returns (ok, reason) when the caller asks
+            # for the refusal reason, and the CLI now always asks. The double has
+            # to match the real signature, or it hides the shape it is standing
+            # in for.
+            assert kw.get("with_reason") is True, "the CLI must ask for the refusal reason"
+            return (complete_ok, None if complete_ok else "refused by the double")
 
         monkeypatch.setattr("hermes_cli.kanban.kb.get_task", lambda conn, tid: fake_task)
         monkeypatch.setattr("hermes_cli.kanban.kb.complete_task", fake_complete_task)

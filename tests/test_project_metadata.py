@@ -63,6 +63,24 @@ def test_lazy_installable_extras_excluded_from_all():
         )
 
 
+def test_claude_subscription_sdk_stays_opt_in_and_exact_pinned():
+    """The Claude subscription SDK is image-baked but not part of ``[all]``.
+
+    It bundles a large CLI and is required only by the claude-subscription
+    provider. Keep the package's reviewed version scoped to its own extra so
+    ordinary installs do not take that dependency transitively.
+    """
+    optional_dependencies = _load_optional_dependencies()
+
+    assert optional_dependencies["claude-subscription"] == [
+        "claude-agent-sdk==0.2.159",
+    ]
+    assert all(
+        "claude-subscription" not in spec
+        for spec in optional_dependencies["all"]
+    )
+
+
 def _exact_pins(specs):
     pins = {}
     for spec in specs:

@@ -525,7 +525,7 @@ import {
     downloadMedia: async () => { throw new Error('boom'); },
     cacheDirs: { document: mkdtempSync(path.join(tmpdir(), 'wa-media-')) },
   });
-  assert.equal(event.body, 'see attached\n[document could not be downloaded]');
+  assert.equal(event.body, 'see attached\n[document could not be downloaded: q.pdf]');
   assert.equal(event.mediaUrls.length, 0);
   console.log('  ✓ captioned failed download keeps caption and appends note');
 }

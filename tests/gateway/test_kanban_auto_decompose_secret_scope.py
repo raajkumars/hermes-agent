@@ -29,8 +29,9 @@ def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkey
 
     seen = {}
 
-    def fake_decompose(task_id, author=None):
+    def fake_decompose(task_id, author=None, require_fanout=False):
         seen["value"] = ss.get_secret("ANTHROPIC_API_KEY")
+        seen["require_fanout"] = require_fanout
         return SimpleNamespace(ok=True, fanout=False, child_ids=None, reason=None)
 
     fake = SimpleNamespace(list_triage_ids=lambda: ["t1"], decompose_task=fake_decompose)
@@ -45,5 +46,6 @@ def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkey
         ss.set_multiplex_active(False)
 
     assert decomposed == 1
+    assert seen["require_fanout"] is True
     assert seen["value"] == "launch-profile-key"
     assert ss.current_secret_scope() is None

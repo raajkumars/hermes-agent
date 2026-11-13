@@ -142,6 +142,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
         conn,
         task_id,
         summary="Approved after independent verification.",
+        metadata={"verdict": "approved"},
         expected_run_id=review_2.current_run_id,
     )
 

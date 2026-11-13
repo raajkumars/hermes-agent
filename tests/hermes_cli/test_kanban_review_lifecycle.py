@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -483,6 +484,155 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_active_pr_guard_allows_only_explicit_exact_pr_review_continuations(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ready reviewer continuation must name the same PR and another author.
+
+    This narrowly admits a separately assigned exact-head review continuation;
+    ordinary implementation cards, generic review prose, a mismatched target,
+    and a comment from the continuation assignee remain duplicate-work guarded.
+    """
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    pr_url = "https://github.com/example/repo/pull/29"
+    with kbc.connect() as conn:
+        continuation_id = kb.create_task(
+            conn,
+            title="independent exact-head review",
+            body="Perform an independent non-implementer exact-head review.",
+            completion_contract=pr_url,
+            assignee="vaidya",
+        )
+        kb.add_comment(
+            conn, continuation_id, author="anika",
+            body=f"Opened {pr_url}; ready for independent review.",
+        )
+
+        ordinary_id = kb.create_task(
+            conn, title="ordinary implementation", assignee="builder",
+        )
+        kb.add_comment(conn, ordinary_id, author="anika", body=f"Opened {pr_url}.")
+
+        mismatch_id = kb.create_task(
+            conn,
+            title="independent exact-head review",
+            body=("Perform an independent exact-head review of "
+                  "https://github.com/example/repo/pull/30."),
+            assignee="vaidya",
+        )
+        kb.add_comment(conn, mismatch_id, author="anika", body=f"Opened {pr_url}.")
+
+        same_assignee_id = kb.create_task(
+            conn,
+            title="independent exact-head review",
+            body=f"Perform an independent exact-head review of {pr_url}.",
+            assignee="vaidya",
+        )
+        kb.add_comment(conn, same_assignee_id, author="vaidya", body=f"Opened {pr_url}.")
+
+        generic_id = kb.create_task(
+            conn,
+            title="review the PR",
+            body=f"Please review {pr_url} before merging.",
+            assignee="vaidya",
+        )
+        kb.add_comment(conn, generic_id, author="anika", body=f"Opened {pr_url}.")
+
+        assert kbd.check_respawn_guard(conn, continuation_id) is None
+        for guarded_id in (ordinary_id, mismatch_id, same_assignee_id, generic_id):
+            assert kbd.check_respawn_guard(conn, guarded_id) == "active_pr"
+
+        result = kbd.dispatch_once(conn, dry_run=True)
+        spawned_ids = [task[0] for task in result.spawned]
+        guarded = dict(result.respawn_guarded)
+        assert continuation_id in spawned_ids
+        for guarded_id in (ordinary_id, mismatch_id, same_assignee_id, generic_id):
+            assert guarded.get(guarded_id) == "active_pr"
+
+
+def test_active_pr_guard_refuses_body_edit_after_pr_announcement(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-announcement body edit cannot manufacture a PR continuation.
+
+    The continuation exception is authorization for an independently assigned
+    worker to perform work that was requested before the PR existed. Reading
+    the mutable task body here would let an operator edit generic prose into
+    the magic words after the implementation PR was announced and bypass the
+    duplicate-work guard.
+    """
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    pr_url = "https://github.com/example/repo/pull/31"
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="ordinary implementation",
+            body="Continue the implementation if more work is needed.",
+            completion_contract=pr_url,
+            assignee="vaidya",
+        )
+        kb.add_comment(conn, task_id, author="anika", body=f"Opened {pr_url}.")
+        assert kb.edit_task(
+            conn,
+            task_id,
+            body="Perform an independent non-implementer exact-head review.",
+        )
+
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_active_pr_guard_releases_only_exact_terminal_cache_entries(
+    kanban_home: Path,
+) -> None:
+    """Terminal cache state lifts ordinary cards without a dispatcher GitHub call."""
+    merged = "https://github.com/example/repo/pull/61"
+    closed = "https://github.com/example/repo/pull/62"
+    open_url = "https://github.com/example/repo/pull/63"
+    unknown = "https://github.com/example/repo/pull/64"
+    mixed_case_http = "hTtP://GitHub.com/Example/Repo/pull/65"
+    now = int(time.time())
+    with kbc.connect() as conn:
+        merged_id = kb.create_task(conn, title="merged PR", assignee="dev")
+        closed_id = kb.create_task(conn, title="closed PR", assignee="dev")
+        open_id = kb.create_task(conn, title="open PR", assignee="dev")
+        unknown_id = kb.create_task(conn, title="unknown PR", assignee="dev")
+        mixed_case_id = kb.create_task(conn, title="mixed-case HTTP PR", assignee="dev")
+        for task_id, url in ((merged_id, merged), (closed_id, closed), (open_id, open_url), (unknown_id, unknown), (mixed_case_id, mixed_case_http)):
+            kb.add_comment(conn, task_id, author="dev", body=f"Opened {url}.")
+        with kb.write_txn(conn):
+            conn.executemany(
+                "INSERT INTO pr_state(url, state, checked_at) VALUES (?, ?, ?)",
+                ((merged, "merged", now), (closed, "closed", now), (open_url, "open", now), (mixed_case_http, "merged", now)),
+            )
+
+        assert kbd.check_respawn_guard(conn, merged_id) is None
+        assert kbd.check_respawn_guard(conn, closed_id) is None
+        assert kbd.check_respawn_guard(conn, open_id) == "active_pr"
+        assert kbd.check_respawn_guard(conn, unknown_id) == "active_pr"
+        assert kbd.check_respawn_guard(conn, mixed_case_id) is None
+
+
+def test_active_pr_guard_requires_every_url_in_comment_to_be_terminal(
+    kanban_home: Path,
+) -> None:
+    """A terminal audit URL cannot hide a different unresolved linked PR."""
+    settled = "https://github.com/example/repo/pull/71"
+    unresolved = "https://github.com/example/repo/pull/72"
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="mixed PR evidence", assignee="dev")
+        kb.add_comment(conn, task_id, author="dev", body=f"Reviewed {settled}; work remains at {unresolved}.")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO pr_state(url, state, checked_at) VALUES (?, 'merged', 1)",
+                (settled,),
+            )
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
+
 def _backdate_comments(conn, tid, seconds=60):
     """Second-granularity timestamps: make the PR comment older than the
     handoff that follows it in the same test."""
@@ -913,9 +1063,17 @@ def test_review_handoff_of_card_assigned_to_its_reviewer_records_no_implementer(
 
         claimed = kb.claim_review_task(conn, tid, claimer="reviewer-a")
         assert claimed is not None
+        # A reviewer must always be able to reject. Absent provenance the card is NOT
+        # routed to a guessed identity: it parks blocked for the board owner instead
+        # of refusing (which left approve as the reviewer's only non-blocking exit).
         ok, reason = kb.request_changes(conn, tid, reason="found 3 issues")
-        assert ok is False
-        assert "implementer provenance" in (reason or "")
+        assert ok is True
+        assert reason is None
+        landed = kb.get_task(conn, tid)
+        assert landed.status == "blocked"
+        assert landed.assignee == "reviewer-a"
+        rejected = _events(conn, tid, kind="changes_requested")[0][1]
+        assert rejected["implementer_provenance"] == "unestablished"
 
 
 def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Path) -> None:

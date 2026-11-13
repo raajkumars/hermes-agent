@@ -210,7 +210,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
-    "gc",
+    "answer", "gc",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -425,9 +425,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
         tasks = kb.list_tasks(
             conn, assignee=assignee, status=args.status, tenant=args.tenant, session_id=args.session,
             include_archived=args.archived, order_by=getattr(args, "sort", None),
-            workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
+            workflow_template_id=args.workflow_template_id, current_step_key=getattr(args, "step", None),
         )
-    if _json_out(args, [_task_to_dict(t) for t in tasks]):
+        request_views = {task.id: kb.compute_request_view(conn, task) for task in tasks}
+        parents_by_task = {task.id: kb.parent_ids(conn, task.id) for task in tasks}
+    if _json_out(args, [
+        {**_task_to_dict(task), "parents": parents_by_task[task.id], "request_view": request_views[task.id]}
+        for task in tasks
+    ]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
     try:
@@ -442,7 +447,16 @@ def _cmd_list(args: argparse.Namespace) -> int:
         print("(no matching tasks)")
         return 0
     for t in tasks:
+        view = request_views[t.id]
         print(_fmt_task_line(t))
+        print(f"    outcome: {view['verified_outcome']} | owner: {view['owner'] or '-'}")
+        if view["last_verified_progress"]:
+            print(f"    progress: {view['last_verified_progress'].splitlines()[0][:160]}")
+        if view["blocker_age_seconds"] is not None:
+            print(f"    waiting: {view['blocker_age_seconds'] // 3600}h "
+                  f"{(view['blocker_age_seconds'] % 3600) // 60}m")
+        if view["next_action"]:
+            print(f"    next: {view['next_action']}")
     return 0
 
 
@@ -487,12 +501,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        request_view = kb.compute_request_view(conn, task)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
 
     if want_json:
         _print_json({
-            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
+            "task": _task_to_dict(task), "latest_summary": latest_summary, "request_view": request_view,
+            "parents": parents, "children": children,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
@@ -505,6 +521,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
     field("assignee", task.assignee or "-")
+    field("outcome", request_view["verified_outcome"])
+    if request_view["last_verified_progress"]:
+        field("progress", request_view["last_verified_progress"].splitlines()[0][:160])
+    if request_view["next_action"]:
+        field("next", request_view["next_action"])
+    if request_view["blocker_age_seconds"] is not None:
+        field("waiting", f"{request_view['blocker_age_seconds'] // 3600}h "
+                         f"{(request_view['blocker_age_seconds'] % 3600) // 60}m")
     if task.tenant:
         field("tenant", task.tenant)
     field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))
@@ -757,7 +781,36 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     author = args.author or _profile_author()
     with kbc.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)
+        warning = kb.needs_input_comment_warning(conn, args.task_id)
     print(f"Comment added to {args.task_id}")
+    if warning:
+        print(f"WARNING: {warning}", file=sys.stderr)
+    return 0
+
+
+def _cmd_answer(args: argparse.Namespace) -> int:
+    """Answer a ``needs_input`` block: comment + unblock in one transaction."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban answer is orchestrator-only; workers must hand off their assigned task")
+    positional = " ".join(args.text).strip()
+    flagged = (args.body or "").strip()
+    if positional and flagged:
+        return _err("kanban answer: give the answer as text OR --body, not both", 2)
+    body = positional or flagged
+    if not body:
+        return _err("kanban answer: an answer body is required (text or --body)", 2)
+    invoker = _profile_author()
+    author = args.author or invoker
+    try:
+        with kbc.connect_closing() as conn:
+            result = kb.answer_blocked_task(
+                conn, args.task_id, answerer=author, body=body, acting_as=invoker,
+                confirm_human_action=args.confirm_human_action,
+            )
+    except kb.AnswerRefused as exc:
+        return _err(f"kanban answer: refused ({exc.code}): {exc}")
+    print(f"Answered {result['task_id']}: comment #{result['comment_id']} by {author}; "
+          f"card -> {result['status']}")
     return 0
 
 
@@ -891,6 +944,28 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
     return None
 
 
+def _completion_exit_hint(refusal: str) -> str:
+    """Name the exits a pull-request acceptance refusal actually leaves open.
+
+    t_e5a5924c. A card whose ``completion_contract`` is a pull request that was
+    closed WITHOUT being merged can never be accepted: acceptance requires the
+    pull request to be OPEN or MERGED. ``kanban edit --completion-contract``
+    refuses to replace it ("publication binds once"), and ``--force`` overrides
+    only the live-claim fence, never acceptance. So the receipt's generic "fix
+    required failures, then retry completion" is advice that cannot work, and
+    the card was archived by hand to get it off the board. Say which exits are
+    real instead of inviting a retry that can never succeed. Guidance only: it
+    changes no verdict and grants no new way to close a card.
+    """
+    if "PR acceptance" not in refusal:
+        return ""
+    return (". A pull-request completion contract binds once: `kanban edit "
+            "--completion-contract` will not replace it, and `--force` applies to the live-claim "
+            "fence, not to acceptance. If that pull request is closed without being merged, no "
+            "retry can ever accept it -- open a new card bound to the replacement pull request "
+            "and `kanban archive` this one, or `kanban block` it for an operator decision.")
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids, rc = _require_ids(args)
@@ -916,15 +991,26 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False
+            # t_e5a5924c: this pre-seeded line used to survive EVERY refusal
+            # complete_task expressed as a bare False, so a card sitting in
+            # `ready` whose pull-request acceptance had refused was told it had
+            # an "unknown id or terminal state" -- neither half true, and it
+            # sent the agent looking for the wrong problem. Ask for the reason.
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
+            refusal = None
             try:
-                done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
+                done, refusal = kb.complete_task(conn, tid, result=args.result, summary=summary,
+                                        metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
+                                        force=bool(getattr(args, "force", False)),
+                                        with_reason=True)
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
                                  f"--force to close its run and complete anyway.")
+                return False
+            except (kb.ReviewVerdictError, kb.ReviewVerdictConflictError) as verdict_err:
+                fail_msg[tid] = f"cannot complete {tid}: {verdict_err}"
                 return False
             except kb.EmptyCompletionError as empty_err:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
@@ -935,9 +1021,15 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 # name the open parents instead of claiming the id is unknown.
                 blockers = kb.unsatisfied_parents(conn, tid)
                 if blockers:
-                    detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
+                    detail = ", ".join(
+                        f"{pid} ({status}; {reason}" + (f"; verdict={verdict}" if verdict else "") + ")"
+                        for pid, status, reason, verdict in blockers
+                    )
                     fail_msg[tid] = (f"cannot complete {tid}: unsatisfied parent dependencies: {detail}; "
                                      f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
+                elif refusal:
+                    fail_msg[tid] = (f"cannot complete {tid}: {refusal}"
+                                     f"{_completion_exit_hint(refusal)}")
             return done
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
@@ -950,18 +1042,23 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
+    contract = getattr(args, "completion_contract", None)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    if all(value is None for value in (title, body, priority, result, contract)):
+        return _err("kanban edit: provide --title, --body, --priority, --completion-contract, or --result", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
-    with kbc.connect_closing() as conn:
-        ok = kb.edit_task(
-            conn, args.task_id, title=title, body=body, priority=priority,
-            result=result, summary=summary, metadata=metadata,
-        )
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.edit_task(
+                conn, args.task_id, title=title, body=body, priority=priority,
+                result=result, summary=summary, metadata=metadata,
+                completion_contract=contract,
+            )
+    except ValueError as exc:
+        return _err(f"kanban edit: {exc}", 2)
     return _ok_or_err(
         ok,
         f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)",
@@ -1025,10 +1122,20 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = _stripped_or_none(getattr(args, "reason", None))
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
+    refused: dict[str, str] = {}
+
+    def unblock(tid: str) -> bool:
+        try:
+            return kb.unblock_task(conn, tid)
+        except kb.ApprovalReleaseRefused as exc:
+            refused[tid] = str(exc)
+            return False
+
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        op = _commented(conn, reason, author, "UNBLOCK", unblock)
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: (f"refused to unblock {tid}: {refused[tid]}" if tid in refused
+                                        else f"cannot unblock {tid} (not blocked/scheduled?)"))
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -1046,7 +1153,8 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return _err(gate_err)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True,
+            implementer=getattr(args, "implementer", None))
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)
@@ -1062,7 +1170,11 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid))
         if not ok:
             return _err(f"cannot request changes for {tid}: {detail or 'invalid review state'}")
-        print(f"Requested changes for {tid}" + (f"; routed to {detail}" if detail else ""))
+        landed = kb.get_task(conn, tid)
+        where = f"; routed to {detail}" if detail else ""
+        if landed is not None and landed.status == "blocked":
+            where += " (parked blocked: the implementer is external or unestablished; see the card comment)"
+        print(f"Requested changes for {tid}{where}")
     return 0
 
 
@@ -1323,7 +1435,7 @@ _HANDLERS = {
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
-    "comment": _cmd_comment, "attach": _cmd_attach,
+    "comment": _cmd_comment, "answer": _cmd_answer, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,

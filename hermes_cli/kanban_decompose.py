@@ -305,6 +305,7 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    require_fanout: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
     (not in triage, no aux client, API error, malformed/empty reply) surface
@@ -332,6 +333,8 @@ def decompose_task(
 
     audit_author = author or _profile_author()
     if not parsed.get("fanout"):
+        if require_fanout:
+            return DecomposeOutcome(task_id, False, "budget_exhausted: needs split (no fanout)")
         return _apply_single(task, parsed, routing, audit_author)
     return _apply_fanout(task_id, parsed, routing, audit_author)
 

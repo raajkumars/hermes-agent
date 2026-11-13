@@ -1399,6 +1399,13 @@ def _apply_agent_section(agent, _agent_cfg):
     except (TypeError, ValueError):
         _api_retries = 3
     agent._api_max_retries = _api_retries
+    # Primary attempts before transient transport/overload failures use the fallback chain.
+    # Keep the historical threshold of two when the config is absent or malformed.
+    try:
+        _transient_retries = max(int(_agent_section.get("transient_retries", 2)), 1)
+    except (TypeError, ValueError):
+        _transient_retries = 2
+    agent._transient_retries = _transient_retries
     # Bounded post-exhaustion auto-recovery cycles once retries AND the fallback chain are spent
     # on a transient outage (agent/turn_recovery_autorecover.py). 0 disables the ladder.
     try:

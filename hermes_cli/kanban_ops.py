@@ -81,6 +81,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
+    paused = estop.is_engaged()
+    if paused and max_spawn != 0:
+        # Keep the normal tick's reclaim/promotion work live while preventing a
+        # standalone CLI invocation from bypassing ``hermes pause``. Explicit
+        # ``--max 0`` already requests this reclaim-only behaviour.
+        max_spawn = 0
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
@@ -101,6 +107,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_gateway_only": res.skipped_gateway_only,
+            "skipped_approval_request": res.skipped_approval_request,
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -113,6 +121,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            "estop_engaged": paused,
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -128,6 +137,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         if items:
             print(f"  {', '.join(items)}")
     print(f"Promoted:     {res.promoted}")
+    if paused:
+        print("Paused (ESTOP): ran reclaim-only; no new workers were started")
     print(f"Spawned:      {len(res.spawned)}")
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:
@@ -145,6 +156,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if res.skipped_gateway_only:
+        print(
+            "Skipped (gateway-only approval adjudication): "
+            f"{', '.join(res.skipped_gateway_only)}"
+        )
+    if res.skipped_approval_request:
+        print(
+            "Skipped (immutable approval request): "
+            f"{', '.join(res.skipped_approval_request)}"
         )
     for tid, reason in res.respawn_guarded:
         print(f"Guarded ({reason}): {tid}")
@@ -198,9 +219,13 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
 
-    # Health telemetry: warn when every tick finds ready work but spawns
-    # nothing (broken profile, PATH drift, missing venv, credential loss) —
-    # the per-task breaker auto-blocks quietly, so the operator needs a signal.
+    # Health telemetry: warn when the dispatcher spawns nothing for a whole
+    # window. The REASON is assessed per occurrence (see
+    # kanban_db_dispatch.StarvationReport) rather than asserted: workers at the
+    # concurrency cap are healthy and are not warned about at all, a named
+    # guard hold is reported as that hold, an empty ready lane is reported as
+    # starvation, and profile health is only ever suggested for the one state
+    # where it is actually a candidate.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
 
@@ -219,20 +244,40 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
-        # Warn once per HEALTH_WINDOW bad ticks, at most every 5 minutes.
+        # Report once per HEALTH_WINDOW bad ticks, at most every 5 minutes.
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())
             if now - health_state["last_warn_at"] >= 300:
-                held = kbd.describe_suppression([res])
-                held = f" Last tick held back: {held}." if held else ""
-                print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
-                    f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
-                    file=sys.stderr, flush=True,
-                )
+                rep = None
+                try:
+                    with kbc.connect_closing() as conn:
+                        rep = kbd.assess_starvation(conn, [res])
+                except Exception:
+                    rep = None
+                ticks = health_state["bad_ticks"]
+                if rep is None:
+                    held = kbd.describe_suppression([res])
+                    print(
+                        f"[{_fmt_ts(now)}] WARN dispatcher spawned nothing for {ticks} "
+                        f"consecutive ticks"
+                        + (f"; held back: {held}" if held else "")
+                        + "; the board could not be read, so no lane counts or running "
+                          "count are available for this line.",
+                        file=sys.stderr, flush=True,
+                    )
+                elif not rep.is_warning:
+                    # Workers are running. Not stuck, so not a warning.
+                    print(
+                        f"[{_fmt_ts(now)}] dispatcher spawned nothing for {ticks} ticks "
+                        f"[{rep.cause()}]: {rep} -- {rep.advice()}",
+                        file=sys.stderr, flush=True,
+                    )
+                else:
+                    print(
+                        f"[{_fmt_ts(now)}] WARN dispatcher spawned nothing for {ticks} "
+                        f"consecutive ticks [{rep.cause()}]: {rep} -- {rep.advice()}",
+                        file=sys.stderr, flush=True,
+                    )
                 health_state["last_warn_at"] = now
         if not verbose:
             return
@@ -407,3 +452,4 @@ def _cmd_repair(args: argparse.Namespace) -> int:
         "further) or move the file aside to start a new board."
     )
     return 1
+from agent import estop

@@ -28,7 +28,7 @@ from gateway.response_filters import display_kind_for_event, is_machinery_displa
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
-    build_session_context,
+    build_session_context, is_group_notice_source,
 )
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
@@ -536,6 +536,31 @@ class GatewayTurnMixin:
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
             })
+            # Pacing-governor session-boundary routing (t_e71698f5, follow-up to t_31b1338d's
+            # kanban worker-spawn wiring): only ever consulted here, on a genuinely NEW session
+            # (never mid-session -- _is_new_session is the same signal session:start already
+            # gates on). Sets a session /model-style override so every later turn for this
+            # session sticks to the routed provider through the ordinary override precedence,
+            # never re-evaluated once set. No-op (fail-open) when the profile has no documented
+            # fallback pair, the governor says stay on the default, or ANY error occurs.
+            _profile_name = getattr(source, "profile", None)
+            if _profile_name and self._session_model_override(session_key) is None:
+                try:
+                    from gateway.gateway_pacing import resolve_new_session_model_override
+                    from gateway.run import _load_gateway_config
+                    _override = resolve_new_session_model_override(_profile_name, _load_gateway_config())
+                    if _override:
+                        self._session_model_overrides[session_key] = _override
+                        await self.async_session_store.set_model_override(session_key, _override)
+                        logger.info(
+                            "Pacing governor routed new session=%s (profile=%s) -> provider=%s model=%s",
+                            session_key, _profile_name, _override.get("provider"), _override.get("model"),
+                        )
+                except Exception:
+                    logger.debug(
+                        "Pacing governor: new-session routing skipped for session=%s (profile=%s)",
+                        session_key, _profile_name, exc_info=True,
+                    )
         return _was_auto_reset, _is_new_session
 
     async def _hmwa_deliver_auto_reset_notice(self, session_entry, source, turn_sidecar_notes):
@@ -1410,9 +1435,19 @@ class GatewayTurnMixin:
     async def _hmwa_first_contact_notes(self, source, history, turn_sidecar_notes):
         """First-ever-message onboarding note + one-time 'no home channel' prompt (both only when
         the session has no history). Delivered on the user message (sidecar), NOT the ephemeral
-        system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed prompt diff + rebuild."""
+        system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed prompt diff + rebuild.
+
+        Neither is appropriate for a shared group/channel: onboarding a whole group and asking it
+        to set a home channel is gateway noise for everyone but the person Hermes should be
+        addressing. Both are suppressed there (log only); see ``is_group_notice_source``."""
         from gateway.run import _hermes_home, _home_target_env_var, _load_gateway_config
         if history:
+            return
+        if is_group_notice_source(source):
+            logger.debug(
+                "First-contact onboarding/no-home-channel notices suppressed for group/channel "
+                "source (%s)", getattr(source.platform, "value", source.platform),
+            )
             return
         if not await self.async_session_store.has_any_sessions():
             _intro_note = (

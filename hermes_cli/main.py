@@ -118,6 +118,11 @@ _ONESHOT_CLEANUPS = (
     ("tools.browser_tool_lifecycle", "_emergency_cleanup_all_sessions", {}, Exception),
     ("tools.mcp_tool_lifecycle", "shutdown_mcp_servers", {}, BaseException),
     ("agent.auxiliary_client", "shutdown_cached_clients", {}, Exception),
+    # A provider's own pooled session (claude-subscription's persistent `claude`
+    # subprocess) has no future turn left to be reused for once THIS process is about to
+    # os._exit -- without this, nothing ever tells the pool the process is disappearing
+    # and the subprocess is reparented to init forever (t_2d4e174b).
+    ("providers", "shutdown_all_session_pools", {}, Exception),
 )
 
 

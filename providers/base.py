@@ -74,6 +74,19 @@ class ProviderProfile:
     auth_handler: Callable[[str, Any], Any] | None = None
     refresh_credential: Callable[[Any], Any] | None = None
     classify_api_error: Callable[..., Any] | None = None
+    # Optional: force-close every pooled session/subprocess this provider is holding onto,
+    # regardless of idle-TTL state. A provider that pools a persistent SDK session across
+    # turns (e.g. claude-subscription, which keeps a real `claude` subprocess alive for
+    # cache-read reuse) has nothing left to reuse a session FOR once the process holding the
+    # pool is about to exit -- a one-shot CLI run (kanban worker, `-z`/`-Q`) has exactly one
+    # turn. `providers.shutdown_all_session_pools()` calls this for every registered profile
+    # at CLI process exit (both the `-z/--oneshot` hard-exit path and the interactive/`-q`
+    # single-query path); NEVER called from a persistent process (gateway/webui), where
+    # pooling across turns is the point (t_2d4e174b -- the leak this closes: a kanban
+    # worker's own `client.close()` intentionally no-ops for a pooled session so the NEXT
+    # turn of the SAME conversation reuses it, so nothing ever told the pool the process
+    # itself was about to disappear, and its `claude` child was reparented to init forever).
+    shutdown_all_sessions: Callable[[], None] | None = None
 
     # ── Vision support ────────────────────────────────────────
     # True when the provider's API accepts image content inside

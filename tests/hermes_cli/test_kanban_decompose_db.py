@@ -90,5 +90,33 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+def test_budget_exhaustion_triages_without_failure_increment(kanban_home):
+    with kbc.connect() as conn:
+        workspace = kanban_home / "kanban" / "workspaces" / "bounded-worker"
+        workspace.mkdir(parents=True)
+        tid = kb.create_task(
+            conn, title="bounded worker", assignee="worker", workspace_kind="worktree",
+            workspace_path=str(workspace), branch_name="wip/bounded-worker",
+        )
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.triage_budget_exhausted_task(
+            conn, tid, budget_used=60, budget_max=60, handoff="DONE: partial\nBRANCH: wip/t",
+        )
+        task = kb.get_task(conn, tid)
+        runs = kb.list_runs(conn, tid)
+        events = kb.list_events(conn, tid)
+        comments = kb.list_comments(conn, tid)
+        assert kb.claim_task(conn, tid) is None
+    assert task is not None
+    assert task.status == "triage"
+    assert task.consecutive_failures == 0
+    assert runs[-1].outcome == "budget_exhausted"
+    assert runs[-1].metadata["workspace"] == {
+        "kind": "worktree", "path": str(workspace), "branch": "wip/bounded-worker", "retained": True,
+    }
+    assert any(event.kind == "budget_exhausted" for event in events)
+    assert any("Workspace: " + str(workspace) in c.body for c in comments)
+    assert any("Branch: wip/bounded-worker" in c.body for c in comments)
+    assert any("do not respawn this exhausted run unchanged" in c.body for c in comments)
 
 

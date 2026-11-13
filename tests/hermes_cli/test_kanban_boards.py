@@ -312,9 +312,13 @@ class TestCLI:
         assert _cli(["boards", "create", "projB"], env_extra=env).returncode == 0
 
         # Create one task on each via --board.
-        r = _cli(["--board", "projA", "create", "Task A", "--assignee", "dev"], env_extra=env)
+        r = _cli([
+            "--board", "projA", "create", "Task A", "--body", "fixture", "--assignee", "dev",
+        ], env_extra=env)
         assert r.returncode == 0, r.stderr
-        r = _cli(["--board", "projB", "create", "Task B", "--assignee", "dev"], env_extra=env)
+        r = _cli([
+            "--board", "projB", "create", "Task B", "--body", "fixture", "--assignee", "dev",
+        ], env_extra=env)
         assert r.returncode == 0, r.stderr
 
         # list on each board only shows its own.

@@ -165,13 +165,13 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
-def test_pending_response_records_kanban_timeout(monkeypatch):
+def test_pending_response_records_kanban_budget_triage(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
-    record = MagicMock(name="record_task_failure")
+    record = MagicMock(name="triage_budget_exhausted_task")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db.triage_budget_exhausted_task", record)
     agent = _LimitAgent()
 
     result = _finalize(
@@ -183,13 +183,7 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
 
     assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
     record.assert_called_once_with(
-        conn,
-        "task-123",
-        error=ANY,
-        outcome="timed_out",
-        release_claim=True,
-        end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        conn, "task-123", budget_used=60, budget_max=60, handoff="composed report",
     )
 
 
@@ -239,10 +233,10 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-456")
-    record = MagicMock(name="record_task_failure")
+    record = MagicMock(name="triage_budget_exhausted_task")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db.triage_budget_exhausted_task", record)
     agent = _LimitAgent()
 
     # Budget exhausted (60/60), interrupted, no fallback-eligible exit_reason
@@ -267,11 +261,8 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     record.assert_called_once()
     args, kwargs = record.call_args
     assert args[1] == "task-456"
-    assert kwargs["outcome"] == "timed_out"
-    assert kwargs["release_claim"] is True
-    assert kwargs["end_run"] is True
-    assert kwargs["event_payload_extra"]["budget_used"] == 60
-    assert kwargs["event_payload_extra"]["budget_max"] == 60
+    assert kwargs["budget_used"] == 60
+    assert kwargs["budget_max"] == 60
 
 
 def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
@@ -280,10 +271,10 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-789")
-    record = MagicMock(name="record_task_failure")
+    record = MagicMock(name="triage_budget_exhausted_task")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db.triage_budget_exhausted_task", record)
     agent = _LimitAgent()
 
     result = finalize_turn(
@@ -305,7 +296,8 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     record.assert_called_once()
     args, kwargs = record.call_args
     assert args[1] == "task-789"
-    assert kwargs["outcome"] == "timed_out"
+    assert kwargs["budget_used"] == 60
+    assert kwargs["budget_max"] == 60
 
 
 def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
@@ -313,10 +305,10 @@ def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
     active, the bounded fallback must NOT fire (#87096).
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    record = MagicMock(name="record_task_failure")
+    record = MagicMock(name="triage_budget_exhausted_task")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db.triage_budget_exhausted_task", record)
     agent = _LimitAgent()
 
     result = finalize_turn(
@@ -344,10 +336,10 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-999")
-    record = MagicMock(name="record_task_failure")
+    record = MagicMock(name="triage_budget_exhausted_task")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db.triage_budget_exhausted_task", record)
     agent = _LimitAgent(budget_remaining=60)
 
     # api_call_count=10, max_iterations=60 — budget NOT exhausted
@@ -379,10 +371,10 @@ def test_budget_exhausted_child_does_not_record_parent_kanban_timeout(monkeypatc
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
-    record = MagicMock(name="record_task_failure")
+    record = MagicMock(name="triage_budget_exhausted_task")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db.triage_budget_exhausted_task", record)
     agent = _LimitAgent()
 
     ctx = delegated_child_context if scope == "child" else non_dispatcher_owned_context

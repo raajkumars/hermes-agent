@@ -1598,6 +1598,8 @@ DEFAULT_CONFIG = {
 
     "whatsapp": {
         # reply_prefix: None = built-in "☤ *Hermes Agent*" header; "" disables; \n allowed.
+        "require_mention": True,  # require @mention/reply-to-bot/slash-command to respond in groups
+        "free_response_chats": "",  # comma-separated group JIDs answered without mention
     },
 
     "telegram": {
@@ -1867,6 +1869,10 @@ DEFAULT_CONFIG = {
         "review_dispatch": True,
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # When a worker's primary provider hits a rate limit, end the run and requeue it (the
+        # dispatcher holds that provider's tasks until the reset) instead of failing over to the
+        # fallback provider. False = workers fail over like interactive sessions do.
+        "pause_on_rate_limit": True,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,

@@ -357,9 +357,33 @@ function formatPollUpdateText(update) {
  * something was sent rather than silently losing the attachment. Returns
  * `content` unchanged when nothing failed. (Port of nanoclaw#2895.)
  */
+export function formatMediaBytes(n) {
+  const v = Number(n) || 0;
+  if (!v) return '';
+  if (v >= 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB`;
+  if (v >= 1024) return `${Math.round(v / 1024)} KB`;
+  return `${v} B`;
+}
+
+// Baileys decodes uint64 fileLength as number | string | Long.
+export function declaredMediaBytes(mediaMessage) {
+  const raw = mediaMessage?.fileLength;
+  if (raw == null) return 0;
+  const n = typeof raw === 'object' && typeof raw.toString === 'function' ? Number(raw.toString()) : Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 export function appendMediaFailureNote(content, failures) {
   if (!failures || failures.length === 0) return content;
-  const note = failures.map((t) => `[${t} could not be downloaded]`).join(' ');
+  // choco patch: failures may be {type, name, size, reason}; plain strings keep the upstream format.
+  const note = failures.map((f) => {
+    if (typeof f === 'string') return `[${f} could not be downloaded]`;
+    const detail = [f.name, formatMediaBytes(f.size)].filter(Boolean).join(', ');
+    const what = f.reason === 'too_large'
+      ? `${f.type || 'media'} too large to download (limit ${formatMediaBytes(f.limit)})`
+      : `${f.type || 'media'} could not be downloaded`;
+    return `[${what}${detail ? `: ${detail}` : ''}]`;
+  }).join(' ');
   return content ? `${content}\n${note}` : note;
 }
 
@@ -374,6 +398,7 @@ export async function extractBridgeEvent({
   writeMediaFile,
   cacheDirs = {},
   lookupQuotedMedia,
+  maxMediaBytes,
 }) {
   const messageContent = getMessageContent(msg);
   const contextInfo = getContextInfo(messageContent);
@@ -428,6 +453,17 @@ export async function extractBridgeEvent({
 
   const saveMedia = async ({ mediaMessage, dir, prefix, fallbackExt, fileName: name, type }) => {
     if (!downloadMedia) return;
+    // choco patch: size cap from the declared fileLength (WHATSAPP_MAX_MEDIA_BYTES,
+    // default 100 MB, 0 = off). Over-cap media is never downloaded but the
+    // message still reaches the agent with an explicit note (name, size).
+    const declared = declaredMediaBytes(mediaMessage);
+    const envCap = typeof process !== 'undefined' ? process.env?.WHATSAPP_MAX_MEDIA_BYTES : undefined;
+    const cap = maxMediaBytes ?? (envCap !== undefined && envCap !== '' && Number.isFinite(Number(envCap)) ? Number(envCap) : 100 * 1024 * 1024);
+    if (cap > 0 && declared > cap) {
+      mediaFailures.push({ type: type || 'media', name, size: declared, limit: cap, reason: 'too_large' });
+      try { console.warn(`[bridge] inbound ${type || 'media'} too large (${declared} > ${cap} bytes), not downloaded`); } catch {}
+      return;
+    }
     try {
       const buf = await downloadMedia(msg);
       const ext = mediaExtForMime(mediaMessage?.mimetype, fallbackExt);
@@ -441,7 +477,7 @@ export async function extractBridgeEvent({
       // failure so the agent is told media was sent instead of losing it
       // silently. (Port of nanoclaw#2895's never-silently-drop guarantee; the
       // reuploadRequest recovery half is already wired in bridge.js.)
-      mediaFailures.push(type || 'media');
+      mediaFailures.push({ type: type || 'media', name, size: declared, reason: 'download_failed' });
       try {
         console.warn(`[bridge] failed to download inbound ${type || 'media'}:`, err?.message || err);
       } catch {}

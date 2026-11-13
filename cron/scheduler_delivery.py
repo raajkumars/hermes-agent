@@ -35,7 +35,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
 # Gateway platforms whose adapter declares ``supports_async_delivery = False`` (request/response
 # only, ``send()`` is a stub) — a cron report can never reach them, so they are never a
 # deliver=origin destination.
-_NON_PUSH_ORIGIN_PLATFORMS = frozenset({"api_server"})
+_NON_PUSH_ORIGIN_PLATFORMS = frozenset({"api_server", "webui"})
 
 # Platforms supporting a cron/notification home target -> env var used by gateway config.
 _HOME_TARGET_ENV_VARS = {

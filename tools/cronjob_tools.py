@@ -61,7 +61,8 @@ from tools.cronjob_job_args import (
     _validate_bot_chat_deliver,
     _validate_context_from_refs,
     _validate_cron_base_url,
-    _validate_cron_script_path)
+    _validate_cron_script_path,
+    _validate_delivery_platforms)
 from tools.registry import registry, tool_error
 
 
@@ -584,9 +585,12 @@ def _action_create(a: Dict[str, Any]) -> str:
         # A model-supplied base_url must not route a named provider's stored credential
         # to an attacker endpoint.
         or _validate_cron_base_url(a["provider"], a["base_url"])
+        # Delivery targets must be a real push-capable gateway platform, an intent, or bot-chat.
+        or _validate_delivery_platforms(deliver)
         # bot-chat targets are machine-local: fail the CREATE, not the run.
         or _validate_bot_chat_deliver(deliver)
         # failure_deliver shares deliver's grammar and validators.
+        or _validate_delivery_platforms(_normalize_deliver_param(a["failure_deliver"]))
         or _validate_bot_chat_deliver(_normalize_deliver_param(a["failure_deliver"]))
         or (a["context_from"] and _validate_context_from_refs(
             [a["context_from"]] if isinstance(a["context_from"], str) else a["context_from"])))
@@ -738,7 +742,11 @@ def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[st
         # type-default empties must not wipe untouched fields.
         updates["name"] = a["name"]
     if deliver is not None:
-        bot_chat_error = _validate_bot_chat_deliver(_normalize_deliver_param(deliver))
+        normalized_deliver = _normalize_deliver_param(deliver)
+        platform_error = _validate_delivery_platforms(normalized_deliver)
+        if platform_error:
+            return platform_error
+        bot_chat_error = _validate_bot_chat_deliver(normalized_deliver)
         if bot_chat_error:
             return bot_chat_error
         updates["deliver"] = _resolve_cron_context_deliver(_normalize_deliver_param(deliver))
@@ -748,6 +756,9 @@ def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[st
         # inside a cron run must never store literal 'origin').
         _norm_fd = _normalize_deliver_param(a["failure_deliver"])
         if _norm_fd:
+            platform_error = _validate_delivery_platforms(_norm_fd)
+            if platform_error:
+                return platform_error
             bot_chat_error = _validate_bot_chat_deliver(_norm_fd)
             if bot_chat_error:
                 return bot_chat_error

@@ -44,6 +44,26 @@ def test_stamped_api_server_origin_falls_back_to_home_channel(monkeypatch):
     assert sd._resolve_delivery_targets(job)[0]["platform"] == "discord"
 
 
+def test_webui_origin_is_dropped_and_stamped_jobs_fall_back(monkeypatch):
+    """The dashboard webui is not a gateway Platform and cannot receive cron pushes."""
+    from cron import scheduler_delivery as sd
+    from tools.cronjob_job_args import _origin_from_env
+
+    tokens = set_session_vars(platform="webui", chat_id="browser-chat", session_key="web", async_delivery=True)
+    try:
+        assert _origin_from_env() is None
+    finally:
+        clear_session_vars(tokens)
+
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "12345")
+    targets = sd._resolve_delivery_targets({
+        "id": "old-webui", "deliver": "origin",
+        "origin": {"platform": "webui", "chat_id": "browser-chat"},
+    })
+    assert [(t["platform"], t["chat_id"], t["_resolved_from"]) for t in targets] == [
+        ("telegram", "12345", "origin_fallback")]
+
+
 def test_non_push_session_creation_notice_names_home_channel_fallback(monkeypatch):
     """With a home channel configured the rerouted job must still tell the creating client where
     the report goes (the api_server client never sees it); a push-capable session stays silent."""
