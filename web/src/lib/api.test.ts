@@ -300,3 +300,60 @@ describe("api OAuth helpers", () => {
     ]);
   });
 });
+
+describe("session kind query parameter", () => {
+  const url = (fetchMock: ReturnType<typeof jsonFetchMock>) =>
+    new URL(String(fetchMock.mock.calls[0][0]), "http://dashboard.test");
+
+  it.each(["interactive", "background", "all"] as const)(
+    "sends kind=%s on both the list and the search request",
+    async (kind) => {
+      vi.stubGlobal("window", {});
+      const listFetch = jsonFetchMock({ sessions: [], total: 0, limit: 20, offset: 0 });
+      vi.stubGlobal("fetch", listFetch);
+      await api.getSessions(20, 0, { kind });
+      expect(url(listFetch).searchParams.getAll("kind")).toEqual([kind]);
+
+      const searchFetch = jsonFetchMock({ results: [] });
+      vi.stubGlobal("fetch", searchFetch);
+      await api.searchSessions("needle", { kind });
+      expect(url(searchFetch).searchParams.getAll("kind")).toEqual([kind]);
+    },
+  );
+
+  it("omits kind when the caller names none, leaving the endpoint default in charge", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ sessions: [], total: 0, limit: 20, offset: 0 });
+    vi.stubGlobal("fetch", fetchMock);
+    await api.getSessions(20, 0, {});
+    expect(url(fetchMock).searchParams.has("kind")).toBe(false);
+  });
+
+  it("sends kind alongside an explicit source pick so the backend sees both", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ sessions: [], total: 0, limit: 20, offset: 0 });
+    vi.stubGlobal("fetch", fetchMock);
+    await api.getSessions(20, 0, { kind: "background", source: "cron" });
+    const params = url(fetchMock).searchParams;
+    expect(params.get("kind")).toBe("background");
+    expect(params.get("source")).toBe("cron");
+  });
+
+  it("rejects when the backend refuses an invalid kind", async () => {
+    vi.stubGlobal("window", {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(
+        async () =>
+          new Response(JSON.stringify({ detail: "kind must be one of: interactive, background, all" }), {
+            headers: { "Content-Type": "application/json" },
+            status: 400,
+          }),
+      ),
+    );
+    await expect(
+      api.getSessions(20, 0, { kind: "bogus" as unknown as "all" }),
+    ).rejects.toThrow();
+  });
+});

@@ -41,7 +41,9 @@ import {
 } from "@/lib/session-import";
 import type {
   SessionInfo,
+  SessionKind,
   SessionMessage,
+  SessionQueryOptions,
   SessionSearchResult,
   SessionStoreStats,
   StatusResponse,
@@ -99,33 +101,26 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
     webhook: { icon: Globe, color: "text-warning" },
   };
 
-const AUTOMATION_SESSION_SOURCES = [
-  "cron",
-  "tool",
-  "oneshot",
-  "api_server",
-  "acp",
-  "hermes_flow",
-  "vulcan_delegate",
-  "webhook",
-];
-const AUTOMATION_SESSION_SOURCE_SET = new Set(AUTOMATION_SESSION_SOURCES);
 const NO_MATCHING_SESSION_SOURCE = "__hermes_dashboard_no_matching_source__";
 
 type SessionFilterCategory = "chats" | "automation" | "all";
 type SourceSelectionsByCategory = Record<SessionFilterCategory, string[] | null>;
 
-function isAutomationSource(source: string): boolean {
-  return AUTOMATION_SESSION_SOURCE_SET.has(source);
-}
+const SESSION_KIND_BY_CATEGORY: Record<SessionFilterCategory, SessionKind> = {
+  chats: "interactive",
+  automation: "background",
+  all: "all",
+};
 
+// Row filtering is server-side (``kind``); the backend also owns which
+// sources are background, delivered on /api/sessions/stats.
 function sourceBelongsToCategory(
   source: string,
   category: SessionFilterCategory,
+  backgroundSources: ReadonlySet<string>,
 ): boolean {
   if (category === "all") return true;
-  if (category === "automation") return isAutomationSource(source);
-  return !isAutomationSource(source);
+  return backgroundSources.has(source) === (category === "automation");
 }
 
 function sourceLabel(source: string): string {
@@ -907,49 +902,39 @@ export default function SessionsPage() {
     [allSourceOptions],
   );
 
-  const sessionQueryOptions = useMemo(() => {
-    if (selectedSources !== null) {
-      if (selectedSources.length === 0) {
-        return allSourceNames.length > 0
-          ? { excludeSources: allSourceNames }
-          : { source: NO_MATCHING_SESSION_SOURCE };
-      }
-      if (selectedSources.length === 1) {
-        return { source: selectedSources[0] };
-      }
-      const selected = new Set(selectedSources);
-      const excludedSources = allSourceNames.filter(
-        (source) => !selected.has(source),
-      );
-      return excludedSources.length > 0 ? { excludeSources: excludedSources } : {};
+  // The backend classifies rows by ``kind``; an explicit source pick is an
+  // exact selector that the backend honours over ``kind``.
+  const sessionQueryOptions = useMemo((): SessionQueryOptions => {
+    const kind = SESSION_KIND_BY_CATEGORY[sessionCategory];
+    if (selectedSources === null) return { kind };
+    if (selectedSources.length === 0) {
+      return { kind, source: NO_MATCHING_SESSION_SOURCE };
     }
-    if (sessionCategory === "chats") {
-      return { excludeSources: AUTOMATION_SESSION_SOURCES };
+    if (selectedSources.length === 1) {
+      return { kind, source: selectedSources[0] };
     }
-    if (sessionCategory === "automation") {
-      const excludedSources = allSourceNames.filter(
-        (source) => !isAutomationSource(source),
-      );
-      return excludedSources.length > 0
-        ? { excludeSources: excludedSources }
-        : { sources: AUTOMATION_SESSION_SOURCES };
-    }
-    return {};
-  }, [selectedSources, sessionCategory, allSourceNames]);
+    return { kind, sources: selectedSources };
+  }, [selectedSources, sessionCategory]);
+
+  const backgroundSources = useMemo(
+    () => new Set(stats?.background_sources ?? []),
+    [stats],
+  );
 
   const categoryDefaultSources = useMemo(() => {
     return allSourceNames.filter((source) =>
-      sourceBelongsToCategory(source, sessionCategory),
+      sourceBelongsToCategory(source, sessionCategory, backgroundSources),
     );
-  }, [sessionCategory, allSourceNames]);
+  }, [sessionCategory, allSourceNames, backgroundSources]);
 
   const sourceOptions = useMemo(() => {
     const selected = new Set(selectedSources ?? []);
     return allSourceOptions.filter(
       ([source]) =>
-        sourceBelongsToCategory(source, sessionCategory) || selected.has(source),
+        sourceBelongsToCategory(source, sessionCategory, backgroundSources) ||
+        selected.has(source),
     );
-  }, [allSourceOptions, selectedSources, sessionCategory]);
+  }, [allSourceOptions, selectedSources, sessionCategory, backgroundSources]);
 
   const effectiveSelectedSources = selectedSources ?? categoryDefaultSources;
 

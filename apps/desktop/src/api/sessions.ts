@@ -295,7 +295,11 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
     recents_profile: req.recentsProfile,
     recents_limit: String(Math.max(1, req.recentsLimit)),
     cron_limit: String(Math.max(1, req.cronLimit)),
-    messaging_limit: String(Math.max(1, req.messagingLimit))
+    messaging_limit: String(Math.max(1, req.messagingLimit)),
+    // Keep the three batched slices aligned with the interactive sidebar.
+    // The cron slice has an explicit source selector, so the backend preserves
+    // it despite this default (the same rule as the legacy per-slice requests).
+    kind: 'interactive'
   })
 
   if (req.recentsExclude.length) {
