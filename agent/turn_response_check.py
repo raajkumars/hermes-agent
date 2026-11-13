@@ -254,10 +254,11 @@ def retry_invalid_response(
             compression_attempts=compression_attempts, result=result,
         )
 
+    _degenerate = any(str(detail).startswith("degenerate_provider_output") for detail in error_details)
     agent._invoke_api_request_error_hook(
         task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
         api_call_count=api_call_count, api_start_time=api_start_time, api_kwargs=api_kwargs,
-        error_type="InvalidAPIResponse",
+        error_type="DegenerateProviderResponse" if _degenerate else "InvalidAPIResponse",
         error_message=", ".join(error_details) or "Invalid API response",
         status_code=getattr(getattr(response, "error", None), "code", None),
         retry_count=retry_count, max_retries=max_retries, retryable=True, reason="invalid_response",
@@ -280,9 +281,12 @@ def retry_invalid_response(
             return _verdict("continue")
     retry_count += 1
 
-    # Eager fallback: empty/malformed responses often mean rate limiting.
+    # Eager fallback: malformed and degenerate responses are retryable provider failures.
     if agent._fallback_index < len(agent._fallback_chain):
-        agent._buffer_diagnostic_status("⚠️ Empty/malformed response — switching to fallback...")
+        agent._buffer_diagnostic_status(
+            "⚠️ Degenerate provider output — switching to fallback..."
+            if _degenerate else "⚠️ Empty/malformed response — switching to fallback..."
+        )
     if agent._try_activate_fallback():
         active_system_prompt = _arm_fallback_restart(
             agent, api_messages, active_system_prompt, _retry)
