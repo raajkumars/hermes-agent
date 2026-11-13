@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from run_agent import AIAgent
+
 from agent.degenerate_response import detect_degenerate_response
 from agent.turn_recovery import validate_response_shape
 from agent.turn_response_check import retry_invalid_response
@@ -173,8 +175,6 @@ def test_degenerate_response_uses_retryable_provider_hook_and_existing_fallback(
 
 def test_degenerate_response_activates_a_real_configured_fallback(monkeypatch):
     """The real agent must leave the bad route, not merely report a retry."""
-    from run_agent import AIAgent
-
     with (
         patch("model_tools.get_tool_definitions", return_value=[]),
         patch("model_tools.check_toolset_requirements", return_value={}),
@@ -212,3 +212,77 @@ def test_degenerate_response_activates_a_real_configured_fallback(monkeypatch):
     assert verdict.action == "break"
     assert (agent.provider, agent.model) == ("openai", "gpt-5")
     assert agent._fallback_activated is True
+
+
+def test_profile_scoped_garbled_replay_uses_configured_fallback(tmp_path, monkeypatch, caplog):
+    """Exercise the real loop with a profile config, never a network provider."""
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "model:\n  provider: openrouter\n  default: nvidia/nemotron-3-nano-30b-a3b:free\n"
+        "fallback_model:\n  - provider: claude-subscription\n    model: claude-sonnet-5\n"
+        "  - provider: nous\n    model: stepfun/step-3.7-flash:free\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: config)
+    from hermes_cli.config import load_config
+
+    configured = load_config()
+    assert configured["fallback_model"][0] == {
+        "provider": "claude-subscription", "model": "claude-sonnet-5"
+    }
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+    ):
+        agent: Any = AIAgent(
+            api_key="test-key", base_url="https://openrouter.ai/api/v1",
+            provider="openrouter", model="nvidia/nemotron-3-nano-30b-a3b:free",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            fallback_model=configured["fallback_model"],
+        )
+    fallback_client = MagicMock()
+    fallback_client.api_key = "fallback-key"
+    fallback_client.base_url = "https://api.anthropic.com"
+    fallback_client._custom_headers = None
+    fallback_client.default_headers = None
+    calls = []
+
+    def response(content, *, anthropic=False):
+        if anthropic:
+            return SimpleNamespace(content=[SimpleNamespace(type="text", text=content)], stop_reason="end_turn", usage=None)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None), finish_reason="stop")],
+            model="test", usage=None,
+        )
+
+    def fake_api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        return (
+            response(_REAL_GARBLED_SAMPLES[0])
+            if len(calls) == 1
+            else response("Fallback answer completed.", anthropic=True)
+        )
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=fake_api_call),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.auxiliary_client.resolve_provider_client", return_value=(fallback_client, "claude-sonnet-5")),
+        patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda model, _provider: model),
+        patch("agent.model_metadata.get_model_context_length", return_value=200000),
+    ):
+        result = agent.run_conversation("reply normally")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Fallback answer completed."
+    assert calls == [
+        ("openrouter", "nvidia/nemotron-3-nano-30b-a3b:free"),
+        ("claude-subscription", "claude-sonnet-5"),
+    ]
+    assert "Degenerate provider response detected" in caplog.text
+    assert "digest=" in caplog.text
+    assert "count=1" in caplog.text
+    assert _REAL_GARBLED_SAMPLES[0] not in caplog.text
