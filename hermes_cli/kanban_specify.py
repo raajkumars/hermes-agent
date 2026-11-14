@@ -202,7 +202,9 @@ def specify_task(
     # task is in triage so a human can resolve the repeated unblock cycle;
     # asking the specifier to act would silently bypass that escalation.
     with kbc.connect_closing() as conn:
-        if any(event.kind == "block_loop_detected" for event in kb.list_events(conn, task_id)):
+        if task.status == "triage" and any(
+            event.kind == "block_loop_detected" for event in kb.list_events(conn, task_id)
+        ):
             return SpecifyOutcome(
                 task_id,
                 False,
