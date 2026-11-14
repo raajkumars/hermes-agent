@@ -197,6 +197,46 @@ def test_decompose_explicit_default_assignee_wins_over_root_assignee(kanban_home
     assert c1.assignee == "docs"
 
 
+def test_decompose_routes_unrunnable_profile_name_to_default_assignee(kanban_home):
+    """A profile name supplied by the model is not an assignee unless it can
+    execute work.  In particular, the dispatcher/decomposer profile must not
+    leak as a child owner merely because it exists on disk."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="route safely", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "one child is enough",
+        "tasks": [
+            {"title": "implement", "body": "do the work", "assignee": "kanban", "parents": []},
+        ],
+    })
+    patches = _patch_list_profiles(["kanban", "prime"])
+    for p in patches:
+        p.start()
+    try:
+        with patch(
+            "hermes_cli.kanban_decompose._profile_is_runnable",
+            side_effect=lambda name: name == "prime",
+        ), _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"kanban": {
+                "orchestrator_profile": "prime",
+                "default_assignee": "prime",
+            }},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child is not None
+    assert child.assignee == "prime"
+
+
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="route me safely", triage=True)
