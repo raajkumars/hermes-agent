@@ -56,7 +56,7 @@ def test_capacity_block_records_typed_reason_and_live_measurements(monkeypatch):
 
 def test_repetition_uses_the_last_real_provider_measurement(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t-repeat")
-    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "18")
     calls = _install_kanban_stubs(monkeypatch)
     agent = SimpleNamespace(model="loop-model", context_compressor=SimpleNamespace(
         context_length=16384, last_real_prompt_tokens=15000,
@@ -70,19 +70,37 @@ def test_repetition_uses_the_last_real_provider_measurement(monkeypatch):
     )
 
 
-def test_non_capacity_failure_or_missing_measurements_does_not_block(monkeypatch):
+def test_capacity_failure_without_measurements_still_blocks_for_the_saved_search(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t-noop")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "19")
     calls = _install_kanban_stubs(monkeypatch)
-    agent = SimpleNamespace(model="model", context_compressor=SimpleNamespace(
-        context_length=8192, last_real_prompt_tokens=0,
-    ))
+    agent = SimpleNamespace(model="", context_compressor=SimpleNamespace())
 
     assert cli._block_kanban_capacity_exhaustion(SimpleNamespace(agent=agent), {
         "failure_reason": "timeout", "last_prompt_tokens": 8000,
     }) is False
     assert cli._block_kanban_capacity_exhaustion(SimpleNamespace(agent=agent), {
         "failure_reason": "context_overflow", "last_prompt_tokens": 0,
-    }) is False
+    }) is True
+    assert calls == [("connection", "t-noop", {
+        "reason": "context_window_full",
+        "kind": "capability",
+        "expected_run_id": 19,
+    })]
+
+
+@pytest.mark.parametrize("run_id", [None, "not-an-int"])
+def test_capacity_failure_refuses_to_mutate_a_card_without_a_valid_worker_run(monkeypatch, run_id):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t-unbound")
+    if run_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id)
+    calls = _install_kanban_stubs(monkeypatch)
+
+    assert cli._block_kanban_capacity_exhaustion(SimpleNamespace(agent=SimpleNamespace(
+        model="model", context_compressor=SimpleNamespace(context_length=8192),
+    )), {"failure_reason": "context_window_full", "last_prompt_tokens": 8000}) is False
     assert calls == []
 
 

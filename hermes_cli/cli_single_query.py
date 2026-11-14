@@ -180,23 +180,26 @@ def _block_kanban_capacity_exhaustion(cli, result: Any) -> bool:
     context_tokens = _positive_int(result.get("last_prompt_tokens"))
     if context_tokens is None:
         context_tokens = _positive_int(getattr(compressor, "last_real_prompt_tokens", None))
-    if not (model and context_limit and context_tokens):
-        logger.warning(
-            "kanban capacity exhaustion missing measurements task=%s kind=%s model=%r context_limit=%r context_tokens=%r",
-            task_id, exhaustion, model, context_limit, context_tokens,
-        )
-        return False
-
     try:
         from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc
 
         raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
         run_id = _int_or(raw_run_id, None) if raw_run_id else None
-        reason = (
-            f"{exhaustion}; model={model}; context_limit={context_limit}; "
-            f"context_tokens={context_tokens}"
-        )
+        if run_id is None:
+            logger.warning(
+                "kanban capacity exhaustion has no valid run id task=%s kind=%s",
+                task_id, exhaustion,
+            )
+            return False
+        reason_parts = [exhaustion]
+        if model:
+            reason_parts.append(f"model={model}")
+        if context_limit is not None:
+            reason_parts.append(f"context_limit={context_limit}")
+        if context_tokens is not None:
+            reason_parts.append(f"context_tokens={context_tokens}")
+        reason = "; ".join(reason_parts)
         with _kbc.connect_closing() as conn:
             return bool(_kb.block_task(
                 conn, task_id, reason=reason, kind="capability", expected_run_id=run_id,
