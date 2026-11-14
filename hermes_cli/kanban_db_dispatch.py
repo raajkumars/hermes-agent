@@ -163,6 +163,9 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    respawn_cap_blocked: list[str] = field(default_factory=list)
+    """Task ids the embedded dispatcher sticky-blocked after the configured
+    number of confirmed starts without a completion."""
     config_fatal_recovered: list[str] = field(default_factory=list)
     """Task ids auto-requeued this tick by :func:`_recheck_config_fatal_credentials` after
     their profile's provider credential passed a live health check following a prior
