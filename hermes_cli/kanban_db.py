@@ -755,6 +755,10 @@ class Task:
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
     creator_task_id: Optional[str] = None    # task id that spawned this via kanban_create; NULL if not
+    deliverable_key: Optional[str] = None
+    effective_deliverable_key: Optional[str] = None
+    deliverable_rank: int = 0
+    age_bonus: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -785,6 +789,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract", "creator_task_id",
+    "deliverable_key",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -986,6 +991,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- completion gate (``unsatisfied_decomposed_children``) — see there
     -- for why a dependency edge back to the creator is excluded.
     creator_task_id       TEXT,
+    -- Optional deliverable grouping. A task without a key inherits one from
+    -- an open dependent while ranked for dispatch/list visibility.
+    deliverable_key       TEXT,
     -- Typed reason for a task that is currently ``blocked`` (one of
     -- VALID_BLOCK_KINDS, or NULL for legacy/un-typed blocks). ``dependency``
     -- never sits in ``blocked`` (it goes to ``todo`` for parent-gating); the
@@ -1005,6 +1013,16 @@ CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
     PRIMARY KEY (parent_id, child_id)
+);
+
+-- Operator-curated deliverable bands. Rank is independent of free-form
+-- task.priority so noisy priority values cannot starve a deliverable.
+CREATE TABLE IF NOT EXISTS kanban_deliverables (
+    key          TEXT PRIMARY KEY,
+    rank         INTEGER NOT NULL DEFAULT 0,
+    owner        TEXT,
+    dod          TEXT,
+    epic_task_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -1536,7 +1554,8 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
-# Each value is a raw SQL fragment appended after ``ORDER BY``.
+# ``priority`` is resolved in Python by ``rank_tasks`` because dependency
+# inheritance and aging cannot be represented by a stable SQL expression.
 VALID_SORT_ORDERS: dict[str, str] = {
     "created": "created_at ASC, id ASC",
     "created-desc": "created_at DESC, id DESC",
@@ -1548,6 +1567,120 @@ VALID_SORT_ORDERS: dict[str, str] = {
     "updated": "started_at DESC NULLS LAST, created_at DESC",
     "completed-desc": "completed_at DESC NULLS LAST, id DESC",
 }
+
+
+def _open_child_rows(conn: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
+    """Open dependent rows keyed by parent task id, fetched once per ranking."""
+    rows = conn.execute(
+        "SELECT l.parent_id, t.id, t.status, t.priority, t.deliverable_key "
+        "FROM task_links l JOIN tasks t ON t.id = l.child_id "
+        "WHERE t.status NOT IN ('done', 'archived')"
+    ).fetchall()
+    children: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        children.setdefault(row["parent_id"], []).append(row)
+    return children
+
+
+def effective_priorities(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, int]:
+    """Priority inherited from open dependents, with cycle-safe memoization."""
+    requested = tuple(dict.fromkeys(task_ids))
+    if not requested:
+        return {}
+    rows = conn.execute("SELECT id, priority FROM tasks").fetchall()
+    own = {row["id"]: int(row["priority"] or 0) for row in rows}
+    children = _open_child_rows(conn)
+    memo: dict[str, int] = {}
+    visiting: set[str] = set()
+
+    def resolve(task_id: str) -> int:
+        if task_id in memo:
+            return memo[task_id]
+        if task_id in visiting:
+            return own.get(task_id, 0)
+        visiting.add(task_id)
+        value = max([own.get(task_id, 0), *(resolve(r["id"]) for r in children.get(task_id, ()))])
+        visiting.remove(task_id)
+        memo[task_id] = value
+        return value
+
+    return {task_id: resolve(task_id) for task_id in requested}
+
+
+def effective_deliverable_keys(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, Optional[str]]:
+    """Own key, otherwise first deterministic open dependent key (cycle-safe)."""
+    requested = tuple(dict.fromkeys(task_ids))
+    if not requested:
+        return {}
+    rows = conn.execute("SELECT id, deliverable_key FROM tasks").fetchall()
+    own = {row["id"]: row["deliverable_key"] for row in rows}
+    children = _open_child_rows(conn)
+    memo: dict[str, Optional[str]] = {}
+    visiting: set[str] = set()
+
+    def resolve(task_id: str) -> Optional[str]:
+        if task_id in memo:
+            return memo[task_id]
+        if task_id in visiting:
+            return own.get(task_id)
+        visiting.add(task_id)
+        value = own.get(task_id)
+        if not value:
+            for child in sorted(children.get(task_id, ()), key=lambda row: row["id"]):
+                value = resolve(child["id"])
+                if value:
+                    break
+        visiting.remove(task_id)
+        memo[task_id] = value
+        return value
+
+    return {task_id: resolve(task_id) for task_id in requested}
+
+
+def deliverable_ranks(conn: sqlite3.Connection, keys: Iterable[Optional[str]]) -> dict[str, int]:
+    wanted = sorted({key for key in keys if key})
+    if not wanted:
+        return {}
+    placeholders = ", ".join("?" for _ in wanted)
+    rows = conn.execute(
+        f"SELECT key, rank FROM kanban_deliverables WHERE key IN ({placeholders})", wanted,
+    ).fetchall()
+    return {row["key"]: int(row["rank"] or 0) for row in rows}
+
+
+def rank_key(task: Task, *, effective_priority: Optional[int] = None,
+             deliverable_rank: Optional[int] = None, now: Optional[int] = None) -> tuple[int, int, int, int, str]:
+    """Stable dispatcher order: deliverable rank, inherited priority, aging, FIFO.
+
+    Aging applies only in todo/ready and is capped at eight weekly 100-point
+    steps. Deliverable rank remains the first key, so aging never crosses into
+    the next deliverable band.
+    """
+    now = int(time.time()) if now is None else int(now)
+    age_bonus = 0
+    if task.status in {"todo", "ready"}:
+        age_days = max(0, (now - int(task.created_at)) // 86400)
+        age_bonus = min(age_days // 7, 8) * 100
+    task.deliverable_rank = int(deliverable_rank or 0)
+    task.age_bonus = age_bonus
+    return (-task.deliverable_rank, -int(effective_priority if effective_priority is not None else task.priority),
+            -age_bonus, int(task.created_at), task.id)
+
+
+def rank_tasks(conn: sqlite3.Connection, tasks: Iterable[Task], *, now: Optional[int] = None) -> list[Task]:
+    """Annotate and order tasks using the same key used by dispatcher lanes."""
+    ranked = list(tasks)
+    keys = effective_deliverable_keys(conn, (task.id for task in ranked))
+    priorities = effective_priorities(conn, (task.id for task in ranked))
+    ranks = deliverable_ranks(conn, keys.values())
+    for task in ranked:
+        task.effective_deliverable_key = keys.get(task.id)
+        task.deliverable_rank = ranks.get(task.effective_deliverable_key or "", 0)
+    return sorted(
+        ranked,
+        key=lambda task: rank_key(task, effective_priority=priorities.get(task.id),
+                                  deliverable_rank=task.deliverable_rank, now=now),
+    )
 
 
 def list_tasks(
@@ -1570,17 +1703,23 @@ def list_tasks(
             params.append(val)
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
+    priority_order = order_by is None or (order_by and order_by.strip().lower() == "priority")
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
             raise ValueError(f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}")
-        query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
-    else:
+        if not priority_order:
+            query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
+    elif not priority_order:
         query += " ORDER BY priority DESC, created_at ASC"
-    if limit:
+    if limit and not priority_order:
         query += f" LIMIT {int(limit)}"
-    rows = conn.execute(query, params).fetchall()
-    return [Task.from_row(r) for r in rows]
+    tasks = [Task.from_row(r) for r in conn.execute(query, params).fetchall()]
+    if priority_order:
+        tasks = rank_tasks(conn, tasks)
+        if limit:
+            tasks = tasks[:int(limit)]
+    return tasks
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
@@ -3330,12 +3469,14 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
 def edit_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, priority: Optional[int] = None,
+    deliverable_key: Optional[str] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
     changed_fields = [
-        field for field, value in (("title", title), ("body", body), ("priority", priority))
+        field for field, value in (("title", title), ("body", body), ("priority", priority),
+                                   ("deliverable_key", deliverable_key))
         if value is not None
     ]
     with write_txn(conn):
@@ -3344,10 +3485,11 @@ def edit_task(
             return False
         assignments = []
         params = []
-        for field, value in (("title", title), ("body", body), ("priority", priority)):
+        for field, value in (("title", title), ("body", body), ("priority", priority),
+                             ("deliverable_key", deliverable_key)):
             if value is not None:
                 assignments.append(f"{field} = ?")
-                params.append(value)
+                params.append(value.strip() or None if field == "deliverable_key" else value)
         if result is not None:
             assignments.append("result = ?")
             params.append(result)
@@ -3360,6 +3502,8 @@ def edit_task(
         )
         if priority is not None:
             _append_event(conn, task_id, "reprioritized", {"priority": priority})
+        if deliverable_key is not None:
+            _append_event(conn, task_id, "deliverable_set", {"deliverable_key": deliverable_key.strip() or None})
         if result is None:
             non_priority_fields = [field for field in changed_fields if field != "priority"]
             if non_priority_fields:
@@ -4574,6 +4718,14 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         by_status[row["status"]] = int(row["n"])
 
     by_assignee = _counts_by_assignee(conn)
+    ranked_open = rank_tasks(conn, (Task.from_row(row) for row in conn.execute(
+        "SELECT * FROM tasks WHERE status IN ('todo', 'ready')"
+    ).fetchall()))
+    rank_columns = [
+        {"id": task.id, "deliverable_key": task.effective_deliverable_key,
+         "deliverable_rank": task.deliverable_rank, "age_bonus": task.age_bonus}
+        for task in ranked_open
+    ]
 
     oldest_row = conn.execute(
         "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
@@ -4588,6 +4740,7 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
+        "rank_columns": rank_columns,
         "now": now,
     }
 

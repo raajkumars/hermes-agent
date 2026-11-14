@@ -3157,12 +3157,13 @@ def _tick_spawn_budget(
 
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
-    return conn.execute(
-        "SELECT id, assignee FROM tasks "
-        f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+    """Unclaimed rows in the shared deliverable/priority/aging dispatch order."""
+    rows = conn.execute(
+        "SELECT * FROM tasks "
+        f"WHERE status = '{status}' AND claim_lock IS NULL"
     ).fetchall()
+    by_id = {row["id"]: row for row in rows}
+    return [by_id[task.id] for task in _kb.rank_tasks(conn, (_kb.Task.from_row(row) for row in rows))]
 
 
 def _any_spawnable_review(

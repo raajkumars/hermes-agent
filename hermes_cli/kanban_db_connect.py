@@ -843,6 +843,8 @@ _LATER_TASK_COLUMNS = (
     # Drives the open-decomposed-children completion gate (kanban_db.py::
     # unsatisfied_decomposed_children / complete_task).
     ("creator_task_id", "creator_task_id TEXT"),
+    # Optional key into kanban_deliverables; NULL preserves legacy behavior.
+    ("deliverable_key", "deliverable_key TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

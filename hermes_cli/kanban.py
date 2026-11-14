@@ -1056,16 +1056,17 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
+    deliverable_key = getattr(args, "deliverable", None)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    if all(value is None for value in (title, body, priority, deliverable_key, result)):
+        return _err("kanban edit: provide --title, --body, --priority, --deliverable, or --result", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
     with kbc.connect_closing() as conn:
         ok = kb.edit_task(
-            conn, args.task_id, title=title, body=body, priority=priority,
+            conn, args.task_id, title=title, body=body, priority=priority, deliverable_key=deliverable_key,
             result=result, summary=summary, metadata=metadata,
         )
     return _ok_or_err(
@@ -1289,6 +1290,11 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    if stats["rank_columns"]:
+        print("\nDispatch rank columns (todo/ready):")
+        for row in stats["rank_columns"]:
+            print(f"  {row['id']:10s}  deliverable={row['deliverable_key'] or '-':16s} "
+                  f"rank={row['deliverable_rank']:>4d}  age_bonus={row['age_bonus']:>3d}")
     return 0
 
 
