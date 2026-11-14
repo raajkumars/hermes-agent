@@ -3354,25 +3354,32 @@ def _dispatch_once_locked(
         if ready_budget is not None and spawned >= ready_budget:
             break
         row_assignee = row["assignee"]
+        # Use the configured fallback to make the WIP decision, but only
+        # persist it once this card is actually eligible to start. Otherwise a
+        # deferred new initiative would look assigned despite never running.
+        effective_assignee = row_assignee or default_assignee
+        if not effective_assignee:
+            result.skipped_unassigned.append(row["id"])
+            continue
         is_session_card = row["session_id"] is not None
         # A live interactive session is follow-up work, not a speculative new
         # initiative.  It bypasses both the per-profile ranked-work hold and
         # the fleet-wide exploration budget.
         if is_session_card:
             pass
-        elif row_assignee and row_assignee in ranked_profiles_with_work:
+        elif effective_assignee in ranked_profiles_with_work:
             result.skipped_wip_new_initiative.append(row["id"])
             continue
         elif ranked_rows and unranked_initiatives >= initiative_wip:
             result.skipped_wip_new_initiative.append(row["id"])
             continue
-        if not row_assignee:
-            if not default_assignee or not _apply_default_assignee(
+        if row_assignee is None:
+            if not _apply_default_assignee(
                 conn, row["id"], default_assignee, dry_run=dry_run,
             ):
                 result.skipped_unassigned.append(row["id"])
                 continue
-            row_assignee = default_assignee
+            row_assignee = effective_assignee
             result.auto_assigned_default.append(row["id"])
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1

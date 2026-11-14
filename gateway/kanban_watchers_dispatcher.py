@@ -15,7 +15,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
+from gateway.kanban_watchers_common import (
+    _board_slugs,
+    _nonnegative_int_setting,
+    _positive_int_setting,
+    logger,
+)
 
 
 def _kbc():
@@ -161,7 +166,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         stale_waiting_escalation_manager_map=stale_waiting_escalation_manager_map,
         stale_waiting_escalation_manager=stale_waiting_escalation_manager,
         pr_review_wakeup_enabled=pr_review_wakeup_enabled,
-        new_initiative_wip=_positive_int_setting(kanban_cfg, "new_initiative_wip") or 1,
+        new_initiative_wip=_nonnegative_int_setting(kanban_cfg, "new_initiative_wip", 1),
     )
 
 

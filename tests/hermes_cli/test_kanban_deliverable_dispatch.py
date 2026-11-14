@@ -26,7 +26,7 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _ready_task(conn, *, title: str, assignee: str = "ira", rank: int = 0,
+def _ready_task(conn, *, title: str, assignee: str | None = "ira", rank: int = 0,
                 deliverable_key: str | None = None, session_id: str | None = None) -> str:
     task_id = kb.create_task(conn, title=title, assignee=assignee)
     conn.execute(
@@ -98,3 +98,46 @@ def test_default_wip_allows_one_unranked_start_fleet_wide(
     assert set(spawned_ids[1:]) | set(result.skipped_wip_new_initiative) == {first, second}
     assert len(spawned_ids) == 2
     assert len(result.skipped_wip_new_initiative) == 1
+
+
+def test_default_assignee_is_resolved_before_wip_without_mutating_deferred_task(
+    kanban_home, all_assignees_spawnable,
+):
+    with kbc.connect() as conn:
+        ranked = _ready_task(
+            conn, title="finish release", deliverable_key="faabzi-1.0.9", rank=100,
+        )
+        deferred = _ready_task(conn, title="deferred new idea", assignee=None)
+        result = kbd.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=False,
+            max_spawn=10,
+            default_assignee="ira",
+        )
+        deferred_row = conn.execute("SELECT assignee FROM tasks WHERE id=?", (deferred,)).fetchone()
+
+    assert [task_id for task_id, *_ in result.spawned] == [ranked]
+    assert result.skipped_wip_new_initiative == [deferred]
+    assert result.auto_assigned_default == []
+    assert deferred_row["assignee"] is None
+
+
+def test_zero_new_initiative_wip_defers_every_unranked_card_while_ranked_work_exists(
+    kanban_home, all_assignees_spawnable,
+):
+    with kbc.connect() as conn:
+        ranked = _ready_task(
+            conn, title="finish release", deliverable_key="faabzi-1.0.9", rank=100,
+        )
+        unranked = _ready_task(conn, title="new idea", assignee="prime")
+        result = kbd.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_spawn=10,
+            new_initiative_wip=0,
+        )
+
+    assert [task_id for task_id, *_ in result.spawned] == [ranked]
+    assert result.skipped_wip_new_initiative == [unranked]

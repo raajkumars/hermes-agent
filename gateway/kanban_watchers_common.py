@@ -63,6 +63,21 @@ def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:
     return value
 
 
+def _nonnegative_int_setting(kanban_cfg: dict, key: str, default: int) -> int:
+    """Parse ``kanban.<key>`` where zero deliberately disables the budget."""
+    raw = kanban_cfg.get(key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("kanban dispatcher: invalid kanban.%s=%r; using default %d", key, raw, default)
+        return default
+    if value < 0:
+        logger.warning("kanban dispatcher: kanban.%s=%r is below 0; using default %d", key, raw, default)
+        return default
+    logger.info("kanban dispatcher: %s=%d", key, value)
+    return value
+
+
 def _resolve_auto_decompose_settings(load_config: Callable[[], Any]) -> "tuple[bool, int]":
     """Live (enabled, per_tick) auto-decompose settings, re-read every dispatcher tick.
 
