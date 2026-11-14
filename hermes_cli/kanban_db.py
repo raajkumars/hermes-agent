@@ -3459,6 +3459,71 @@ class EmptyCompletionError(ValueError):
         )
 
 
+class DeliverableCompletionError(ValueError):
+    """An epic's completion did not satisfy its deliverable's DoD fence."""
+
+
+def _epic_deliverable_for_task(conn: sqlite3.Connection, task_id: str):
+    """Return the task's owned deliverable only when it declares this task epic."""
+    from hermes_cli.kanban_db_deliverables import get_deliverable
+
+    row = conn.execute("SELECT deliverable_key FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    key = row["deliverable_key"] if row else None
+    deliverable = get_deliverable(conn, key) if key else None
+    return deliverable if deliverable and deliverable.epic_task_id == task_id else None
+
+
+def _gate_epic_completion(conn: sqlite3.Connection, task_id: str, metadata: Optional[dict]) -> None:
+    """Only the deliverable owner may close its epic, with auditable DoD evidence."""
+    deliverable = _epic_deliverable_for_task(conn, task_id)
+    if deliverable is None:
+        return
+    actor = _actor_profile()
+    if actor != deliverable.owner:
+        raise DeliverableCompletionError(
+            f"completion blocked: epic {task_id} for deliverable {deliverable.key!r} "
+            f"may only be completed by owner {deliverable.owner!r}, not active profile {actor!r}"
+        )
+    evidence = metadata.get("dod_evidence") if isinstance(metadata, dict) else None
+    if not isinstance(evidence, list) or not evidence:
+        raise DeliverableCompletionError(
+            f"completion blocked: epic {task_id} for deliverable {deliverable.key!r} "
+            "requires a non-empty metadata.dod_evidence list"
+        )
+
+
+def _dod_regression_reopens_epic(conn: sqlite3.Connection, task_id: str, metadata: Optional[dict]) -> bool:
+    """Invalidate an epic's dependency branch after a member records regression."""
+    if not isinstance(metadata, dict) or not metadata.get("dod_regressed"):
+        return False
+    from hermes_cli.kanban_db_deliverables import effective_deliverable_keys, get_deliverable
+
+    key = effective_deliverable_keys(conn, [task_id]).get(task_id)
+    if not key:
+        return False
+    deliverable = get_deliverable(conn, key)
+    epic_task_id = deliverable.epic_task_id if deliverable else None
+    if not epic_task_id or epic_task_id == task_id:
+        return False
+    linked = conn.execute(
+        """
+        WITH RECURSIVE descendants(id) AS (
+            SELECT child_id FROM task_links WHERE parent_id = ?
+            UNION
+            SELECT l.child_id FROM task_links l JOIN descendants d ON d.id = l.parent_id
+        )
+        SELECT 1 FROM descendants WHERE id = ?
+        """,
+        (task_id, epic_task_id),
+    ).fetchone()
+    if linked is None:
+        return False
+    invalidate_descendants_for_parent_reopen(
+        conn, task_id, author=f"dod-gate:{_actor_profile()}",
+    )
+    return True
+
+
 class ReviewVerdictError(ValueError):
     """A reviewer attempted to complete without an approving verdict."""
 
@@ -3580,6 +3645,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    _gate_epic_completion(conn, task_id, metadata)
     _gate_review_completion_verdict(conn, task_id, expected_run_id, metadata)
     approval_author, approval_shas = _plan_review_approval_comments(
         conn, task_id, expected_run_id, metadata, summary, result,
@@ -3659,6 +3725,7 @@ def complete_task(
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
+    _dod_regression_reopens_epic(conn, task_id, metadata)
     recompute_ready(conn)  # separate txn so children see ``done``
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
