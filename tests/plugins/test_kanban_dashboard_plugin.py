@@ -1289,6 +1289,45 @@ def test_capability_blocker_saved_search_resolves_measurements_with_sources(clie
         assert cards[bare][key] is None, key
 
 
+def test_capability_blocker_saved_search_tracks_board_changes_without_restart(client):
+    """One running app: a newly blocked card appears with its measurements and an
+    unblocked card disappears, each on the very next request."""
+
+    def cards():
+        response = client.get(_CAPABILITY_SEARCH)
+        assert response.status_code == 200, response.text
+        return {card["task_id"]: card for card in response.json()["cards"]}
+
+    def write(fn):
+        conn = kbc.connect()
+        try:
+            return fn(conn)
+        finally:
+            conn.close()
+
+    first = write(lambda conn: kb.create_task(conn, title="first"))
+    second = write(lambda conn: kb.create_task(conn, title="second"))
+    assert not {first, second} & cards().keys()
+
+    assert write(lambda conn: kb.block_task(conn, first, kind="capability", reason=(
+        f"context window full; model=m-a; context_limit=1000; {_CONTEXT_TOKENS}=900")))
+    live = cards()
+    assert second not in live
+    assert (live[first]["model"], live[first]["context_limit"], live[first]["measured_token_usage"]) == (
+        "m-a", 1000, 900)
+
+    assert write(lambda conn: kb.block_task(conn, second, kind="capability", reason=(
+        f"repetition loop; model=m-b; context_limit=2000; {_CONTEXT_TOKENS}=1500")))
+    live = cards()
+    assert (live[second]["model"], live[second]["context_limit"], live[second]["measured_token_usage"]) == (
+        "m-b", 2000, 1500)
+    assert first in live
+
+    assert write(lambda conn: kb.unblock_task(conn, first))
+    live = cards()
+    assert first not in live and second in live
+
+
 def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     conn = kbc.connect()
     try:
