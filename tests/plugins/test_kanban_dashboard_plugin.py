@@ -1197,6 +1197,98 @@ def test_reassign_endpoint_switches_profile(client):
 # ---------------------------------------------------------------------------
 
 
+_CAPABILITY_SEARCH = "/api/plugins/kanban/saved-searches/capability-blockers"
+_CONTEXT_TOKENS = "_".join(("context", "tokens"))
+
+
+def test_capability_blocker_saved_search_selects_current_context_or_repetition_blocks(client):
+    """Only the NEWEST block reason counts, plain 'context' mentions do not match,
+    bad payloads are skipped, and ?keyword= narrows the set (unknown -> 422)."""
+    conn = kbc.connect()
+    try:
+        ctx = kb.create_task(conn, title="ctx", priority=9)
+        rep = kb.create_task(conn, title="rep", priority=4)
+        stale = kb.create_task(conn, title="stale", priority=8)
+        prose = kb.create_task(conn, title="prose", priority=7)
+        broken = kb.create_task(conn, title="broken", priority=6)
+        assert kb.block_task(conn, ctx, kind="capability", reason="Worker capability exhausted (context_window_full)")
+        assert kb.block_task(conn, rep, kind="capability", reason="Model stuck in a repetition loop")
+        # An older matching reason must not resurface once a newer block supersedes it.
+        assert kb.block_task(conn, stale, kind="capability", reason="context window full")
+        assert kb.unblock_task(conn, stale)
+        assert kb.block_task(conn, stale, kind="capability", reason="GPU unavailable")
+        assert kb.block_task(conn, prose, kind="capability", reason="needs the Docker context of the worker")
+        assert kb.block_task(conn, broken, kind="capability", reason="context limit hit")
+        with kbc.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, ?)",
+                (broken, "{not json", int(time.time()) + 5),
+            )
+    finally:
+        conn.close()
+
+    def ids(**params):
+        response = client.get(_CAPABILITY_SEARCH, params=params)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["count"] == len(body["cards"])
+        return [card["task_id"] for card in body["cards"]], body
+
+    all_ids, body = ids()
+    assert all_ids == [ctx, rep]  # priority DESC
+    assert body["keyword"] == "all"
+    assert {c["task_id"]: c["matched_keywords"] for c in body["cards"]} == {ctx: ["context"], rep: ["repetition"]}
+    assert ids(keyword="repetition")[0] == [rep]
+    assert ids(keyword="context")[0] == [ctx]
+    assert client.get(_CAPABILITY_SEARCH, params={"keyword": "bogus"}).status_code == 422
+
+
+def test_capability_blocker_saved_search_resolves_measurements_with_sources(client):
+    from agent.context_pin import advertised_context_length
+
+    conn = kbc.connect()
+    try:
+        recorded = kb.create_task(conn, title="recorded", model_override="ignored-override")
+        override = kb.create_task(conn, title="override", model_override="claude-opus-5-5")
+        bare = kb.create_task(conn, title="bare")
+        assert kb.block_task(conn, recorded, kind="capability", reason="; ".join((
+            "Worker capability exhausted (context_window_full)",
+            "model=thinkingmachines/inkling:free", f"{_CONTEXT_TOKENS}=65159", "context_limit=65536",
+        )))
+        assert kb.block_task(conn, override, kind="capability",
+                             reason=f"context window full; context_limit=0; {_CONTEXT_TOKENS}=abc")
+        assert kb.block_task(conn, bare, kind="capability", reason="repetitive output; model= ")
+    finally:
+        conn.close()
+
+    response = client.get(_CAPABILITY_SEARCH)
+    assert response.status_code == 200, response.text
+    cards = {card["task_id"]: card for card in response.json()["cards"]}
+
+    for key, value in {
+        "model": "thinkingmachines/inkling:free", "model_source": "block_reason",
+        "context_limit": 65536, "context_limit_source": "block_reason",
+        "measured_token_usage": 65159, "measured_token_usage_source": "block_reason",
+    }.items():
+        assert cards[recorded][key] == value, key
+    assert cards[recorded]["usage_ratio"] == round(65159 / 65536, 4)
+
+    # Non-positive / non-numeric reason values are null; limit falls back to local model metadata.
+    assert cards[override]["model"] == "claude-opus-5-5"
+    assert cards[override]["model_source"] == "model_override"
+    expected_limit = advertised_context_length("claude-opus-5-5")
+    assert expected_limit and expected_limit > 0
+    assert cards[override]["context_limit"] == expected_limit
+    assert cards[override]["context_limit_source"] == "model_metadata"
+    assert cards[override]["measured_token_usage"] is None
+    assert cards[override]["usage_ratio"] is None
+
+    # Nothing recorded: card still listed, every value and source null.
+    for key in ("model", "model_source", "context_limit", "context_limit_source",
+                "measured_token_usage", "measured_token_usage_source", "usage_ratio"):
+        assert cards[bare][key] is None, key
+
+
 def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     conn = kbc.connect()
     try:

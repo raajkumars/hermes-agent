@@ -649,6 +649,9 @@
     const [search, setSearch] = useState("");
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
+    const [capabilityBlockers, setCapabilityBlockers] = useState([]);
+    const [capabilityBlockersOpen, setCapabilityBlockersOpen] = useState(false);
+    const [capabilityBlockersError, setCapabilityBlockersError] = useState(null);
 
     const [selectedTaskId, setSelectedTaskId] = useState(null);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
@@ -702,6 +705,23 @@
         .finally(function () { setLoading(false); });
     }, [tenantFilter, includeArchived, board]);
 
+    // Only the newest request may write state, so a slow response for the
+    // previous board cannot overwrite the current board's results.
+    const capabilityBlockersSeqRef = useRef(0);
+    const loadCapabilityBlockers = useCallback(function () {
+      const seq = ++capabilityBlockersSeqRef.current;
+      return SDK.fetchJSON(withBoard(`${API}/saved-searches/capability-blockers`, board))
+        .then(function (data) {
+          if (seq !== capabilityBlockersSeqRef.current) return;
+          setCapabilityBlockers((data && data.cards) || []);
+          setCapabilityBlockersError(null);
+        })
+        .catch(function (err) {
+          if (seq !== capabilityBlockersSeqRef.current) return;
+          setCapabilityBlockersError(String(err && err.message ? err.message : err));
+        });
+    }, [board]);
+
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
       return SDK.fetchJSON(withBoard(`${API}/boards`, board))
@@ -731,8 +751,10 @@
       reloadTimerRef.current = setTimeout(function () {
         reloadTimerRef.current = null;
         loadBoard();
+        // Same debounce: a burst of block/create events refetches once.
+        loadCapabilityBlockers();
       }, 250);
-    }, [loadBoard]);
+    }, [loadBoard, loadCapabilityBlockers]);
 
     useEffect(function () {
       loadBoard();
@@ -743,6 +765,8 @@
         }
       };
     }, [loadBoard]);
+
+    useEffect(function () { loadCapabilityBlockers(); }, [loadCapabilityBlockers]);
 
     // --- WebSocket ---------------------------------------------------------
     useEffect(function () {
@@ -1324,6 +1348,14 @@
               .catch(function (e) { setError(String(e.message || e)); });
           },
           onRefresh: loadBoard,
+        }),
+        h(CapabilityBlockerSavedSearch, {
+          cards: capabilityBlockers,
+          error: capabilityBlockersError,
+          open: capabilityBlockersOpen,
+          onToggle: function () { setCapabilityBlockersOpen(function (open) { return !open; }); },
+          onRefresh: loadCapabilityBlockers,
+          onOpen: setSelectedTaskId,
         }),
        selectedIds.size > 0 ? h(BulkActionBar, {
          count: selectedIds.size,
@@ -2618,6 +2650,110 @@
         size: "sm",
         title: "Clear all active filters (search, tenant, assignee, archived).",
       }, tx(t, "clearFilters", "Clear filters")),
+    );
+  }
+
+  // Which saved-search keyword a capability blocker matched. Prefers a
+  // server-supplied ``keyword``; otherwise reads the free-text reason with its
+  // ``key=value`` measurement segments removed, because ``context_limit=`` is
+  // present on repetition blocks too and must not count as "context".
+  const CAPABILITY_KEYWORDS = ["context", "repetition"];
+  function capabilityBlockerKeyword(card) {
+    if (card && CAPABILITY_KEYWORDS.indexOf(card.keyword) >= 0) return card.keyword;
+    const prose = String((card && card.reason) || "")
+      .split(";")
+      .filter(function (seg) { return !/^\s*[\w.-]+=/.test(seg); })
+      .join(";")
+      .toLowerCase();
+    if (prose.indexOf("repetition") >= 0) return "repetition";
+    if (prose.indexOf("context") >= 0) return "context";
+    return null;
+  }
+
+  function formatTokenCount(value) {
+    return value == null ? "—" : Number(value).toLocaleString("en-US");
+  }
+
+  function CapabilityBlockerSavedSearch(props) {
+    const { t } = useI18n();
+    // Keyword toggle: both on = the whole saved search. Turning one off
+    // narrows to the other; at least one always stays on.
+    const [keywords, setKeywords] = useState(function () {
+      return { context: true, repetition: true };
+    });
+    const cards = props.cards || [];
+    const visible = cards.filter(function (card) {
+      const kw = capabilityBlockerKeyword(card);
+      return kw == null ? keywords.context && keywords.repetition : !!keywords[kw];
+    });
+    function toggleKeyword(kw) {
+      setKeywords(function (prev) {
+        const next = Object.assign({}, prev, { [kw]: !prev[kw] });
+        return (next.context || next.repetition) ? next : prev;
+      });
+    }
+    const countLabel = visible.length === cards.length
+      ? String(cards.length) : `${visible.length}/${cards.length}`;
+    return h("section", { className: "hermes-kanban-capability-search" },
+      h("div", { className: "hermes-kanban-capability-search-bar" },
+        h("div", null,
+          h("strong", null, tx(t, "capabilityBlockers", "Capability blockers")),
+          h("span", { className: "hermes-kanban-capability-search-hint" },
+            tx(t, "capabilityBlockersHint", " context exhaustion or repetition"))),
+        h("div", { className: "hermes-kanban-capability-search-keywords", role: "group",
+          "aria-label": tx(t, "capabilityKeywordFilter", "Blocker keyword filter") },
+          CAPABILITY_KEYWORDS.map(function (kw) {
+            return h("button", {
+              key: kw, type: "button",
+              className: cn("hermes-kanban-capability-search-keyword",
+                keywords[kw] && "hermes-kanban-capability-search-keyword--on"),
+              "aria-pressed": keywords[kw] ? "true" : "false",
+              "data-keyword": kw,
+              onClick: function () { toggleKeyword(kw); },
+            }, kw);
+          })),
+        h("span", { className: "hermes-kanban-capability-search-count",
+          "data-testid": "capability-blocker-count" }, countLabel),
+        h(Button, { size: "sm", onClick: props.onRefresh,
+          title: "Refresh context/repetition capability blockers." }, tx(t, "refresh", "Refresh")),
+        h(Button, { size: "sm", onClick: props.onToggle },
+          props.open ? tx(t, "hide", "Hide") : tx(t, "show", "Show")),
+      ),
+      props.error ? h("div", { className: "text-xs text-destructive" }, props.error) : null,
+      props.open ? h("div", { className: "hermes-kanban-capability-search-list" },
+        visible.length === 0
+          ? h("div", { className: "text-xs text-muted-foreground" },
+              tx(t, "noCapabilityBlockers", "No matching capability blockers."))
+          : h("table", { className: "hermes-kanban-capability-search-table" },
+              h("thead", null, h("tr", null,
+                h("th", null, tx(t, "card", "Card")),
+                h("th", null, tx(t, "keyword", "Keyword")),
+                h("th", null, tx(t, "model", "Model")),
+                h("th", { className: "num" }, tx(t, "contextLimit", "Context limit")),
+                h("th", { className: "num" }, tx(t, "measuredTokens", "Measured tokens")))),
+              h("tbody", null, visible.map(function (card) {
+                const kw = capabilityBlockerKeyword(card);
+                const pct = (card.context_limit && card.measured_token_usage != null)
+                  ? Math.round(100 * card.measured_token_usage / card.context_limit) : null;
+                return [
+                  h("tr", { key: card.task_id, "data-task-id": card.task_id },
+                    h("td", null, h("button", {
+                      className: "hermes-kanban-capability-search-task",
+                      onClick: function () { props.onOpen(card.task_id); }, type: "button",
+                    }, `${card.task_id} · ${card.title || tx(t, "untitled", "(untitled)")}`)),
+                    h("td", null, kw || "—"),
+                    h("td", { className: "mono" }, card.model || "—"),
+                    h("td", { className: "num" }, formatTokenCount(card.context_limit)),
+                    h("td", { className: "num" }, formatTokenCount(card.measured_token_usage),
+                      pct == null ? null
+                        : h("span", { className: "hermes-kanban-capability-search-pct" }, ` (${pct}%)`))),
+                  h("tr", { key: card.task_id + ":reason",
+                    className: "hermes-kanban-capability-search-reason-row" },
+                    h("td", { colSpan: 5, className: "hermes-kanban-capability-search-reason" },
+                      card.reason)),
+                ];
+              }))),
+      ) : null,
     );
   }
 

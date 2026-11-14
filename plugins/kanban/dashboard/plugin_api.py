@@ -21,7 +21,7 @@ from contextlib import closing, contextmanager
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Literal, Optional
 
 from fastapi import (
     APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
@@ -34,6 +34,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
+from hermes_cli import kanban_db_capability_blockers as kbcb
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
 
@@ -836,6 +837,25 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 entry.update(ok=False, error=str(e))
             results.append(entry)
         return {"results": results}
+
+
+# --- Saved searches ----------------------------------------------------------
+
+@router.get("/saved-searches/capability-blockers")
+def capability_blocker_saved_search(
+    board: Optional[str] = _BOARD_Q,
+    keyword: Literal["context", "repetition", "all"] = Query("all"),
+):
+    """Cards blocked on a context-window or repetition limit, with model/limit/usage."""
+    with _board_conn(board) as (board, conn):
+        cards = kbcb.capability_blockers(conn, keyword)
+    return {
+        "saved_search": kbcb.SAVED_SEARCH_NAME,
+        "board": board,
+        "keyword": keyword,
+        "count": len(cards),
+        "cards": cards,
+    }
 
 
 # --- Diagnostics — fleet-wide distress signals (see kanban_diagnostics) ------
