@@ -179,6 +179,77 @@ def test_completion_then_reopen_is_not_capped(kanban_home, all_assignees_spawnab
     assert status != "blocked"
 
 
+def _reset_by_unblock(conn, tid):
+    assert kb.unblock_task(conn, tid)
+    return "unblocked"
+
+
+def _reset_by_completion(conn, tid):
+    assert kb.complete_task(conn, tid, summary="done")
+    # Reopen: back to ready so the next window can start.
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+    return "completed"
+
+
+def _window_after_reset(conn, reset) -> tuple:
+    """Drive a card into the cap, apply ``reset``, then record the cap's
+    verdict for every start of the next window plus the one past it.
+
+    Starts are real claims (``claim_task``) and the verdict is read straight
+    from :func:`kbd._apply_respawn_cap`, so the prior-success guard that
+    holds a reopened completed card cannot mask the cap's own behaviour.
+    """
+    cap = 2
+    spawns: list = []
+    tid = kb.create_task(conn, title="t", assignee="alice")
+    for _ in range(cap):
+        _tick(conn, spawns, cap=cap)
+        _end_run_back_to_ready(conn, tid, age=300)
+    _tick(conn, spawns, cap=cap)
+    assert kb.get_task(conn, tid).status == "blocked"
+
+    kind = reset(conn, tid)
+    # Same-second claims after a reset are deliberately uncounted; place the
+    # reset strictly between the old window and the new one.
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_events SET created_at = created_at - 100 WHERE task_id = ? AND kind = ?",
+            (tid, kind),
+        )
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ended_at - 100 WHERE task_id = ? AND outcome = 'completed'",
+            (tid,),
+        )
+
+    trace = []
+    for _ in range(cap + 1):
+        result = kbd.DispatchResult()
+        count = kbd.count_spawns_without_completion(conn, tid)
+        capped = kbd._apply_respawn_cap(conn, tid, result, cap=cap, dry_run=False)
+        trace.append((count, capped, list(result.respawn_cap_blocked) == [tid]))
+        if capped:
+            break
+        assert kb.claim_task(conn, tid) is not None
+        _end_run_back_to_ready(conn, tid)
+    # Final status is deliberately not compared: a re-block after an operator
+    # unblock is escalated by the separate unblock-loop detector.
+    reasons = [e.payload.get("reason") for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+    return trace, reasons[-1]
+
+
+def test_completion_resets_the_cap_exactly_like_unblock(kanban_home, all_assignees_spawnable):
+    """Completion is a reset point with the same effect as an operator unblock:
+    count back to 0, a full window of ``cap`` starts allowed, then the cap fires again."""
+    with kbc.connect() as conn:
+        via_unblock = _window_after_reset(conn, _reset_by_unblock)
+        via_completion = _window_after_reset(conn, _reset_by_completion)
+
+    expected_trace = [(0, False, False), (1, False, False), (2, True, True)]
+    assert via_unblock == (expected_trace, "respawn cap: 2 starts without completion")
+    assert via_completion == via_unblock
+
+
 @pytest.mark.parametrize(
     ("raw", "expected", "warns"),
     [
