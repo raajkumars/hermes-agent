@@ -2753,6 +2753,21 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def configured_new_initiative_wip() -> int:
+    """Read the zero-preserving ``kanban.new_initiative_wip`` setting.
+
+    The standalone daemon re-reads this on each tick just like the global
+    concurrency cap, so live config edits take effect without a restart.
+    Invalid or missing values retain the documented default of one.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("new_initiative_wip")
+    except Exception:
+        return 1
+    return _positive_int(raw, 1, minimum=0)
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -3960,11 +3975,13 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            new_initiative_wip = configured_new_initiative_wip()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
+                    new_initiative_wip=new_initiative_wip,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:

@@ -108,6 +108,26 @@ def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
     assert captured.get("max_in_progress") == 7
 
 
+def test_run_daemon_passes_zero_new_initiative_wip(kanban_home, monkeypatch):
+    """The standalone daemon must preserve a deliberate zero WIP budget."""
+    captured: dict = {}
+    stop = threading.Event()
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kbd, "configured_new_initiative_wip", lambda: 0)
+
+    def on_tick(res):
+        stop.set()
+
+    kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
+
+    assert captured.get("new_initiative_wip") == 0
+
+
 def test_configured_max_in_progress_parsing(monkeypatch):
     import hermes_cli.config as cfgmod
 
@@ -125,6 +145,24 @@ def test_configured_max_in_progress_parsing(monkeypatch):
             cfgmod, "load_config_readonly", lambda c=config: c
         )
         assert kbd.configured_max_in_progress() == expected, config
+
+
+def test_configured_new_initiative_wip_parsing(monkeypatch):
+    import hermes_cli.config as cfgmod
+
+    cases = [
+        ({"kanban": {"new_initiative_wip": 3}}, 3),
+        ({"kanban": {"new_initiative_wip": "0"}}, 0),
+        ({"kanban": {"new_initiative_wip": -1}}, 1),
+        ({"kanban": {"new_initiative_wip": "lots"}}, 1),
+        ({"kanban": {}}, 1),
+        ({}, 1),
+    ]
+    for config, expected in cases:
+        monkeypatch.setattr(
+            cfgmod, "load_config_readonly", lambda c=config: c
+        )
+        assert kbd.configured_new_initiative_wip() == expected, config
 
 
 # ---------------------------------------------------------------------------
