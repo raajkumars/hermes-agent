@@ -1889,6 +1889,10 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Fleet-wide per-tick limit for unranked, non-session cards (new
+        # initiatives). Ranked deliverable work and session follow-ups remain
+        # responsive even when the new-initiative budget is exhausted.
+        "new_initiative_wip": 1,
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a

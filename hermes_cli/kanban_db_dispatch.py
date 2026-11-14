@@ -2830,6 +2830,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    new_initiative_wip: int = 1,
     reconcile_orphans: bool = True,
     stale_waiting_timeout_seconds: int = 0,
     stale_waiting_escalation_limit: int = 0,
@@ -2858,6 +2859,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            new_initiative_wip=new_initiative_wip,
             reconcile_orphans=reconcile_orphans,
             stale_waiting_timeout_seconds=stale_waiting_timeout_seconds,
             stale_waiting_escalation_limit=stale_waiting_escalation_limit,
@@ -3158,8 +3160,16 @@ def _tick_spawn_budget(
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+    }
+    # ``deliverable_key``/``rank`` are rollout columns. Keep dispatch safe on
+    # boards that have not received their migration yet: such rows are simply
+    # treated as unranked until the schema arrives.
+    deliverable_key = "deliverable_key" if "deliverable_key" in columns else "NULL"
+    rank = '"rank"' if "rank" in columns else "0"
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        f"SELECT id, assignee, session_id, {deliverable_key} AS deliverable_key, {rank} AS rank FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -3228,6 +3238,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    new_initiative_wip: int = 1,
     reconcile_orphans: bool = True,
     stale_waiting_timeout_seconds: int = 0,
     stale_waiting_escalation_limit: int = 0,
@@ -3257,6 +3268,14 @@ def _dispatch_once_locked(
         return result
 
     ready_rows = _lane_rows(conn, "ready")
+    ranked_rows = [
+        row for row in ready_rows
+        if row["deliverable_key"] and int(row["rank"] or 0) > 0
+    ]
+    unranked_rows = [
+        row for row in ready_rows
+        if not (row["deliverable_key"] and int(row["rank"] or 0) > 0)
+    ]
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
@@ -3297,7 +3316,8 @@ def _dispatch_once_locked(
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
-    for row in ready_rows:
+    ranked_profiles_with_work: set[str] = set()
+    for row in ranked_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
         row_assignee = row["assignee"]
@@ -3313,6 +3333,35 @@ def _dispatch_once_locked(
             result.auto_assigned_default.append(row["id"])
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
+            ranked_profiles_with_work.add(row_assignee)
+
+    # Unranked cards start new initiatives. Limit those fleet-wide per tick,
+    # but keep session-originated follow-up cards responsive. A profile that
+    # already received ranked work this tick cannot consume a new-initiative
+    # slot until its ranked queue drains.
+    initiative_wip = _positive_int(new_initiative_wip, 1, minimum=0)
+    unranked_initiatives = 0
+    for row in unranked_rows:
+        if ready_budget is not None and spawned >= ready_budget:
+            break
+        row_assignee = row["assignee"]
+        if row_assignee and row_assignee in ranked_profiles_with_work:
+            continue
+        is_session_card = row["session_id"] is not None
+        if not is_session_card and unranked_initiatives >= initiative_wip:
+            continue
+        if not row_assignee:
+            if not default_assignee or not _apply_default_assignee(
+                conn, row["id"], default_assignee, dry_run=dry_run,
+            ):
+                result.skipped_unassigned.append(row["id"])
+                continue
+            row_assignee = default_assignee
+            result.auto_assigned_default.append(row["id"])
+        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
+            spawned += 1
+            if not is_session_card:
+                unranked_initiatives += 1
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
     # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop

@@ -56,6 +56,7 @@ class _DispatcherSettings:
     stale_waiting_escalation_manager_map: Optional[dict] = None
     stale_waiting_escalation_manager: Optional[str] = None
     pr_review_wakeup_enabled: bool = False
+    new_initiative_wip: int = 1
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -160,6 +161,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         stale_waiting_escalation_manager_map=stale_waiting_escalation_manager_map,
         stale_waiting_escalation_manager=stale_waiting_escalation_manager,
         pr_review_wakeup_enabled=pr_review_wakeup_enabled,
+        new_initiative_wip=_positive_int_setting(kanban_cfg, "new_initiative_wip") or 1,
     )
 
 
