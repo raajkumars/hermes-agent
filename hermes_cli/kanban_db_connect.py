@@ -843,6 +843,9 @@ _LATER_TASK_COLUMNS = (
     # Drives the open-decomposed-children completion gate (kanban_db.py::
     # unsatisfied_decomposed_children / complete_task).
     ("creator_task_id", "creator_task_id TEXT"),
+    # Stable family key for duplicate-card detection. Existing cards are backfilled
+    # below because SQLite ALTER TABLE cannot derive it from title.
+    ("title_family", "title_family TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -899,6 +902,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
 
+    # Backfill once per schema pass so boards upgraded from older releases take
+    # part in duplicate protection immediately. Keep this here, rather than in a
+    # SQL expression, so title normalization remains one Python implementation.
+    rows = conn.execute(
+        "SELECT id, title FROM tasks WHERE title_family IS NULL OR title_family = ''"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE tasks SET title_family = ? WHERE id = ?",
+            (_kb.title_family(row["title"]), row["id"]),
+        )
+
     # ``block_kind`` is live-state metadata, not the loop-breaker's history.
     # Older releases retained it after a task left ``blocked``; remove those
     # stale classifications on every open so old boards immediately satisfy
@@ -919,6 +934,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_creator_task_id ON tasks(creator_task_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_title_family ON tasks(title_family)")
 
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).

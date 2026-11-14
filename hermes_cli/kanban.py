@@ -193,6 +193,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: unknown action {action!r}", 2)
         try:
             return int(handler(args) or 0)
+        except kb.DuplicateFamilyError as exc:
+            return _err(f"kanban: {exc}", 2)
         except (ValueError, RuntimeError, PermissionError) as exc:
             return _err(f"kanban: {exc}")
 
@@ -450,6 +452,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
+            supersedes=getattr(args, "supersedes", None),
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),

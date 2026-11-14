@@ -112,6 +112,36 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+_TITLE_FAMILY_TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b", re.IGNORECASE)
+_TITLE_FAMILY_PR_RE = re.compile(r"#\d+\b")
+_TITLE_FAMILY_SHA_RE = re.compile(r"\b[0-9a-f]{7,64}\b", re.IGNORECASE)
+_TITLE_FAMILY_NUMBER_RE = re.compile(r"\b\d+\b")
+_TITLE_FAMILY_WORD_RE = re.compile(r"[a-z0-9_<>]+")
+_TITLE_FAMILY_WORD_LIMIT = 7
+
+
+class DuplicateFamilyError(ValueError):
+    """A new card would duplicate a non-archived task's normalized title family."""
+
+    def __init__(self, family: str, task_ids: Iterable[str]):
+        self.family = family
+        self.task_ids = tuple(task_ids)
+        listed = ", ".join(self.task_ids)
+        super().__init__(
+            f"duplicate title family {family!r}; existing non-archived task(s): {listed}. "
+            "Link the new card with parents or pass --supersedes <task-id>."
+        )
+
+
+def title_family(title: str) -> str:
+    """Normalize volatile identifiers out of a card title for duplicate detection."""
+    value = str(title or "").lower()
+    value = _TITLE_FAMILY_TASK_ID_RE.sub(" task ", value)
+    value = _TITLE_FAMILY_PR_RE.sub(" pr ", value)
+    value = _TITLE_FAMILY_SHA_RE.sub(" sha ", value)
+    value = _TITLE_FAMILY_NUMBER_RE.sub(" number ", value)
+    return " ".join(_TITLE_FAMILY_WORD_RE.findall(value)[:_TITLE_FAMILY_WORD_LIMIT])
+
 # Recovery is deliberately narrower than the dispatcher's respawn guard.  A
 # respawn guard may hold a card on broad auth/quota-like text; this operator
 # lifecycle may release only explicit provider capacity/session evidence, and
@@ -755,6 +785,7 @@ class Task:
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
     creator_task_id: Optional[str] = None    # task id that spawned this via kanban_create; NULL if not
+    title_family: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -785,6 +816,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract", "creator_task_id",
+    "title_family",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -998,7 +1030,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    title_family         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1278,6 +1311,20 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def find_title_family_matches(
+    conn: sqlite3.Connection, family: str, *, exclude_ids: Iterable[str] = (),
+) -> list[str]:
+    """Return non-archived cards in a normalized title family, newest first."""
+    excluded = tuple(dict.fromkeys(str(task_id) for task_id in exclude_ids if task_id))
+    sql = "SELECT id FROM tasks WHERE title_family = ? AND status != 'archived'"
+    params: list[Any] = [family]
+    if excluded:
+        sql += " AND id NOT IN (" + ",".join("?" * len(excluded)) + ")"
+        params.extend(excluded)
+    sql += " ORDER BY created_at DESC, id DESC"
+    return [row["id"] for row in conn.execute(sql, params)]
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1292,6 +1339,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    supersedes: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1345,6 +1393,8 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    family = title_family(title)
+    supersedes = str(supersedes or "").strip() or None
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1374,6 +1424,20 @@ def create_task(
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                if supersedes:
+                    old = conn.execute(
+                        "SELECT id, status FROM tasks WHERE id = ?", (supersedes,),
+                    ).fetchone()
+                    if old is None:
+                        raise ValueError(f"cannot supersede unknown task {supersedes!r}")
+                    if old["status"] == "archived":
+                        raise ValueError(f"cannot supersede archived task {supersedes!r}")
+                    if old["status"] == "running":
+                        raise ValueError(f"cannot supersede running task {supersedes!r}; reclaim it first")
+                elif not parents:
+                    matches = find_title_family_matches(conn, family)
+                    if matches:
+                        raise DuplicateFamilyError(family, matches)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -1392,8 +1456,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract,
-                        creator_task_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        creator_task_id, title_family
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1403,7 +1467,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
-                        creator_task_id,
+                        creator_task_id, family,
                     ),
                 )
                 for pid in parents:
@@ -1454,6 +1518,23 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if supersedes:
+                    _insert_comment(conn, supersedes, created_by or "user", f"Superseded by {task_id}.", now)
+                    _append_event(conn, supersedes, "superseded", {"by": task_id})
+                    conn.execute(
+                        "UPDATE tasks SET status = 'archived', block_kind = NULL, "
+                        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+                        "WHERE id = ?",
+                        (supersedes,),
+                    )
+                    _append_event(conn, supersedes, "archived", {"reason": "superseded", "by": task_id})
+                    _insert_comment(conn, task_id, created_by or "user", f"Supersedes {supersedes}.", now)
+                    _append_event(conn, task_id, "supersedes", {"task_id": supersedes})
+            if supersedes:
+                # Archiving a parent can release queued descendants; mirror
+                # archive_task's post-commit state and workspace hygiene.
+                recompute_ready(conn)
+                _cleanup_workspace(conn, supersedes)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3348,6 +3429,9 @@ def edit_task(
             if value is not None:
                 assignments.append(f"{field} = ?")
                 params.append(value)
+        if title is not None:
+            assignments.append("title_family = ?")
+            params.append(title_family(title))
         if result is not None:
             assignments.append("result = ?")
             params.append(result)

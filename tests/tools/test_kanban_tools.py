@@ -599,14 +599,14 @@ def test_create_explicit_scratch_ignores_ambient_board_project(
     kb.write_board_metadata("default", project_id=project_id)
     kb.create_board("target", name="Target", project_id=project_id if target_scoped else "")
 
-    def create(**extra):
+    def create(title, **extra):
         result = json.loads(kt._handle_create(
-            {"board": "target", "title": "card", "assignee": "peer", **extra}))
+            {"board": "target", "title": title, "assignee": "peer", **extra}))
         assert result["ok"] is True
         return result["workspace_kind"], result["project_id"]
 
-    assert create(**explicit) == ("scratch", None)
-    assert create() == (("worktree", project_id) if target_scoped else ("scratch", None))
+    assert create("explicit scratch card", **explicit) == ("scratch", None)
+    assert create("inherited board card") == (("worktree", project_id) if target_scoped else ("scratch", None))
 
 
 def test_link_happy_path(worker_env):

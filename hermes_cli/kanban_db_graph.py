@@ -101,7 +101,7 @@ def decompose_triage_task(
     """
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
-        write_txn, recompute_ready,
+        find_title_family_matches, title_family, write_txn, recompute_ready,
     )
 
     if not children:
@@ -128,18 +128,24 @@ def decompose_triage_task(
         ).fetchone():
             return None
         child_ids = [
-            _insert_decomposed_child(conn, task_id, root_row, child, author, now)
+            _insert_decomposed_child(
+                conn, task_id, root_row, child, author, now,
+                existing_ids=find_title_family_matches(
+                    conn, title_family(child["title"]), exclude_ids=(task_id,),
+                ),
+            )
             for child in children
         ]
         # Sibling edges within the decomposed graph.
         for idx, child in enumerate(children):
             for p_idx in child.get("parents") or []:
                 parent_id, child_id = child_ids[p_idx], child_ids[idx]
-                _link(conn, parent_id, child_id)
-                _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
+                if parent_id != child_id:
+                    _link(conn, parent_id, child_id)
+                    _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
         # Root waits for the whole graph: link it under EVERY child (simpler
         # than computing leaves; cycle-free since the root is only ever a child).
-        for cid in child_ids:
+        for cid in dict.fromkeys(child_ids):
             _link(conn, cid, task_id)
         # Flip the root triage -> todo, assignee -> orchestrator.
         sets = ["status = 'todo'"]
@@ -168,7 +174,7 @@ def decompose_triage_task(
 
 def _insert_decomposed_child(
     conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
-    author: Optional[str], now: int,
+    author: Optional[str], now: int, *, existing_ids: list[str],
 ) -> str:
     """Insert one decomposed child as ``todo`` (linked under the root later so
     the dispatcher only ever sees a coherent graph); returns its id.
@@ -181,8 +187,13 @@ def _insert_decomposed_child(
     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
     """
     from hermes_cli.kanban_db import (
-        _new_task_id, _canonical_assignee, _append_event,
+        _new_task_id, _canonical_assignee, _append_event, title_family,
     )
+
+    # Decomposers can re-propose work already represented on this board. Reuse
+    # that card in the dependency graph rather than minting a parallel card.
+    if existing_ids:
+        return existing_ids[0]
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
     child_ws_kind = child.get("workspace_kind") or root_ws_kind
@@ -199,12 +210,12 @@ def _insert_decomposed_child(
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, title_family) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            root_row["tenant"], now, (author or "decomposer"), title_family(child["title"]),
         ),
     )
     _append_event(
