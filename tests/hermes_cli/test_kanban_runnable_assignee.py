@@ -39,6 +39,29 @@ def test_select_runnable_assignee_rejects_when_no_candidate_is_healthy(monkeypat
         kbd.select_runnable_assignee("kanban", fallback="default")
 
 
+def test_bedrock_sdk_chain_profile_remains_assignable(monkeypatch):
+    """The create-time guard accepts Bedrock profiles authenticated through the AWS SDK chain."""
+    from hermes_cli import doctor_connectivity as dc
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda: {
+            "provider": "bedrock",
+            "api_key": "aws-sdk",
+            "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "api_mode": "bedrock_converse",
+        },
+    )
+    monkeypatch.setattr("agent.bedrock_adapter.has_aws_credentials", lambda: True)
+    monkeypatch.setattr(
+        kbd,
+        "_run_credential_probe",
+        lambda _profile, timeout=15.0: dc.probe_active_provider_credential(timeout=timeout),
+    )
+
+    assert kbd.select_runnable_assignee("bedrock-worker", fallback="default") == "bedrock-worker"
+
+
 def test_decomposer_excludes_credentialless_profiles(monkeypatch):
     from types import SimpleNamespace
 

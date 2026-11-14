@@ -78,3 +78,25 @@ def test_native_anthropic_active_provider_uses_native_models_auth(monkeypatch):
         None,
         3.0,
     )]
+
+
+def test_bedrock_sdk_chain_is_a_healthy_active_provider_without_bearer_probe(monkeypatch):
+    """Bedrock's AWS SDK credentials must not be sent to its non-OpenAI runtime endpoint."""
+    runtime = _runtime(
+        "aws-sdk", provider="bedrock", base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+        api_mode="bedrock_converse",
+    )
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda: runtime)
+    monkeypatch.setattr("agent.bedrock_adapter.has_aws_credentials", lambda: True)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Bedrock must not use /models")),
+    )
+
+    assert dc.probe_active_provider_credential() == {
+        "ok": True,
+        "provider": "bedrock",
+        "reason": "",
+        "detail": "AWS SDK credential chain available",
+    }

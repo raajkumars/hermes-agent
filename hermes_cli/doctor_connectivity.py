@@ -420,6 +420,18 @@ def probe_active_provider_credential(timeout: float = 10.0) -> dict:
         return {"ok": False, "provider": None, "reason": "resolve_failed",
                 "detail": format_runtime_provider_error(exc)}
     provider = runtime.get("provider") or ""
+    if provider == "bedrock":
+        # Bedrock's normal runtime uses the AWS SDK credential chain (IAM role,
+        # SSO, named profile, etc.), not an OpenAI-compatible bearer ``/models``
+        # endpoint.  Treat the same scoped chain check that runtime resolution
+        # relies on as the provider-aware credential verdict; sending a bearer
+        # request to bedrock-runtime would reject healthy SDK credentials.
+        from agent.bedrock_adapter import has_aws_credentials
+        if has_aws_credentials():
+            return {"ok": True, "provider": provider, "reason": "",
+                    "detail": "AWS SDK credential chain available"}
+        return {"ok": False, "provider": provider, "reason": "no_credential",
+                "detail": "No usable AWS SDK credential chain resolved for Bedrock."}
     from agent.command_token_source import materialize_probe_api_key
     # A callable credential (for example a key_cmd or Entra source) has not proved it can mint
     # until it is invoked. Materialize it before the request so recovery unblocks only after the
