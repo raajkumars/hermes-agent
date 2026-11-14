@@ -250,6 +250,31 @@ def test_completion_resets_the_cap_exactly_like_unblock(kanban_home, all_assigne
     assert via_completion == via_unblock
 
 
+def test_count_above_cap_blocks_with_the_real_count(kanban_home, all_assignees_spawnable):
+    """A count already PAST the cap (operator lowered the cap mid-window) blocks
+    before claim, exactly like count == cap, and the reason states the real count."""
+    spawns: list = []
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="alice")
+        for _ in range(4):
+            _tick(conn, spawns, cap=10)
+            _end_run_back_to_ready(conn, tid)
+        assert kbd.count_spawns_without_completion(conn, tid) == 4
+        claims_before = [e for e in kb.list_events(conn, tid) if e.kind == "claimed"]
+
+        res = _tick(conn, spawns, cap=2)
+        task = kb.get_task(conn, tid)
+        claims_after = [e for e in kb.list_events(conn, tid) if e.kind == "claimed"]
+        reasons = [e.payload.get("reason") for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+
+    assert len(spawns) == 4
+    assert _spawned(res) == []
+    assert res.respawn_cap_blocked == [tid]
+    assert len(claims_after) == len(claims_before)
+    assert task.status == "blocked"
+    assert reasons == ["respawn cap: 4 starts without completion"]
+
+
 @pytest.mark.parametrize(
     ("raw", "expected", "warns"),
     [
