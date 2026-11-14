@@ -71,6 +71,10 @@ def worker_env(monkeypatch, tmp_path):
     # A real dispatcher always pins the worker's run id; simulate that so the
     # run-lifecycle tools can prove ownership (see test_unbound_worker_cannot_mutate_card).
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    from hermes_cli import kanban_db_dispatch as kbd
+    monkeypatch.setattr(
+        kbd, "select_runnable_assignee", lambda requested, *, fallback=None: requested,
+    )
     return tid
 
 
@@ -578,6 +582,41 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def test_create_redirects_to_configured_runnable_fallback(monkeypatch, worker_env):
+    """New child cards never preserve a credential-less assignee."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "load_config", lambda: {"kanban": {"default_assignee": "prime"}})
+    monkeypatch.setattr(kbd, "select_runnable_assignee", lambda *_args, **_kwargs: "prime")
+
+    result = json.loads(kt._handle_create({"title": "routed child", "assignee": "kanban"}))
+
+    assert result["ok"] is True
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, result["task_id"]).assignee == "prime"
+
+
+def test_create_fails_closed_when_no_assignee_is_runnable(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    from tools import kanban_tools as kt
+
+    def reject(*_args, **_kwargs):
+        raise ValueError("assignee 'kanban' is not runnable")
+
+    monkeypatch.setattr(kbd, "select_runnable_assignee", reject)
+
+    result = json.loads(kt._handle_create({"title": "blocked child", "assignee": "kanban"}))
+
+    assert "not runnable" in result["error"]
+    with kbc.connect() as conn:
+        assert [task.id for task in kb.list_tasks(conn)] == [worker_env]
 
 
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])

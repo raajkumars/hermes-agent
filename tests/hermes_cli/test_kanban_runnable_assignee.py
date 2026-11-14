@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 
 import pytest
 
@@ -110,3 +111,30 @@ def test_cli_create_fails_closed_when_assignee_and_fallback_are_unrunnable(tmp_p
     assert "not runnable" in capsys.readouterr().err
     with kbc.connect_closing() as conn:
         assert kb.list_tasks(conn) == []
+
+
+def test_cli_swarm_redirects_every_execution_role_to_runnable_fallback(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setattr(kc, "_kanban_config", lambda: {"default_assignee": "prime"})
+    selected: list[tuple[str, str | None]] = []
+
+    def select(requested, *, fallback=None):
+        selected.append((requested, fallback))
+        return "prime"
+
+    monkeypatch.setattr(kc.kbd, "select_runnable_assignee", select)
+    created = SimpleNamespace(root_id="root", worker_ids=["worker"], verifier_id="verify", synthesizer_id="write")
+    monkeypatch.setattr(kc.ks, "create_swarm", lambda *_args, **_kwargs: created)
+    kb.init_db()
+    root = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(root.add_subparsers())
+    args = root.parse_args([
+        "kanban", "swarm", "ship it", "--worker", "kanban:implement", "--verifier", "kanban",
+        "--synthesizer", "kanban",
+    ])
+
+    assert kc._cmd_swarm(args) == 0
+    assert selected == [("kanban", "prime"), ("kanban", "prime"), ("kanban", "prime")]
