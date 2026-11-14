@@ -309,6 +309,7 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         return st.end_turn(
             f"{partial_response}\n\n{notice}" if partial_response else notice,
             f"Prompt used {filled[0]} of {filled[1]} context tokens; no room to answer",
+            failure=("context_window_full", False),
         )
     return st.end_turn(
         partial_response or _CEILING_NO_TEXT,
@@ -423,7 +424,11 @@ def recover_from_truncation(
     if abort is not None:
         line, user_response, error = abort
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
-        return st.end_turn(user_response, error)
+        return st.end_turn(
+            user_response, error,
+            failure=("repetition_loop", False) if user_response == _REPETITION_DOMINATED[1]
+            else ("truncated", True),
+        )
 
     if agent.api_mode in _CONTINUABLE_MODES:
         cf = _content_filter_fallback(st, _retry)

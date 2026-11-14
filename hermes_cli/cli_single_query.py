@@ -142,6 +142,70 @@ _TERMINAL_PROVIDER_REASONS = frozenset({
 })
 
 
+_KANBAN_CAPACITY_FAILURE_KINDS = {
+    "context_overflow": "context_window_full",
+    "context_window_full": "context_window_full",
+    "repetition_loop": "repetition_loop",
+}
+
+
+def _positive_int(value: Any) -> int | None:
+    """Return a positive integer, or ``None`` for missing / non-measured values."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _block_kanban_capacity_exhaustion(cli, result: Any) -> bool:
+    """Persist a typed capability block when a worker exhausted model capacity.
+
+    The worker's normal exit path only knows that a turn failed.  Keep the live
+    agent measurements here, before process exit, so saved searches can report
+    the actual model, context limit, and provider-measured prompt usage instead
+    of guessing from the assignee's current configuration.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id or not isinstance(result, dict):
+        return False
+    exhaustion = _KANBAN_CAPACITY_FAILURE_KINDS.get(str(result.get("failure_reason") or ""))
+    if not exhaustion:
+        return False
+
+    agent = getattr(cli, "agent", None)
+    model = str(result.get("model") or getattr(agent, "model", "") or "").strip()
+    compressor = getattr(agent, "context_compressor", None)
+    context_limit = _positive_int(getattr(compressor, "context_length", None))
+    context_tokens = _positive_int(result.get("last_prompt_tokens"))
+    if context_tokens is None:
+        context_tokens = _positive_int(getattr(compressor, "last_real_prompt_tokens", None))
+    if not (model and context_limit and context_tokens):
+        logger.warning(
+            "kanban capacity exhaustion missing measurements task=%s kind=%s model=%r context_limit=%r context_tokens=%r",
+            task_id, exhaustion, model, context_limit, context_tokens,
+        )
+        return False
+
+    try:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_db_connect as _kbc
+
+        raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        run_id = _int_or(raw_run_id, None) if raw_run_id else None
+        reason = (
+            f"{exhaustion}; model={model}; context_limit={context_limit}; "
+            f"context_tokens={context_tokens}"
+        )
+        with _kbc.connect_closing() as conn:
+            return bool(_kb.block_task(
+                conn, task_id, reason=reason, kind="capability", expected_run_id=run_id,
+            ))
+    except Exception as exc:
+        logger.warning("failed to record kanban capacity exhaustion task=%s: %s", task_id, exc)
+        return False
+
+
 def _single_query_exit_code(result, *, credentials_rate_limited: bool = False) -> int:
     """Map a one-shot turn result onto a process exit code, for both `-q` and `-Q`.
 
@@ -259,6 +323,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 result = continued
                 # A teammate's reply displaced the answer this run prints; tell the spawner.
                 _report_turn(result)
+        _block_kanban_capacity_exhaustion(cli, result)
         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
     # Surface backend errors that produced no visible output (e.g. invalid model slug
     # -> provider 4xx) on stderr so piped stdout stays clean.
@@ -492,6 +557,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             cli.console.print(f"[bold blue]Query:[/] {_query_label}")
         cli._show_security_advisories()
         response = cli.chat(query, images=single_query_images or None)
+        _block_kanban_capacity_exhaustion(cli, cli._last_turn_result)
         # Kanban goal_mode on the `-q` path: same judge loop as `-Q`, but each follow-up turn
         # runs through cli.chat so the worker log keeps its live tool feed (the dispatcher
         # used to force -Q here, which left goal_mode cards with a blank Worker log).
