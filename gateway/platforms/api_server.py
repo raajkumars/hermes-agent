@@ -3869,6 +3869,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _invalid_request(f"assignee {assignee!r} is not a known profile")
         assignee = normalized_assignee
 
+        try:
+            from hermes_cli.config import cfg_get, load_config
+            from hermes_cli.kanban_db_dispatch import CredentialMissingError, select_runnable_assignee
+
+            fallback = cfg_get(load_config(), "kanban", "default_assignee", default=None)
+            assignee = select_runnable_assignee(assignee, fallback=fallback)
+        except CredentialMissingError as exc:
+            return web.json_response({"error": exc.code, "detail": str(exc)}, status=400)
+        except ValueError as exc:
+            return _invalid_request(str(exc))
+        except Exception as exc:
+            logger.error("kanban create: runnable-assignee validation failed: %s", type(exc).__name__)
+            return web.json_response({"error": "Unable to validate assignee"}, status=502)
+
         idempotency_key = body.get("idempotency_key")
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             return _invalid_request("idempotency_key is required and must be a non-empty string")

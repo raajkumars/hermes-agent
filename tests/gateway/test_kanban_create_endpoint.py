@@ -53,7 +53,13 @@ def _isolated_kanban_db(tmp_path, monkeypatch):
     hermes_root = tmp_path / "hermes-home"
     (hermes_root / "profiles" / "tanvi").mkdir(parents=True)
     (hermes_root / "profiles" / "tanvi" / "config.yaml").write_text("{}\n")
+    (hermes_root / "profiles" / "prime").mkdir(parents=True)
+    (hermes_root / "profiles" / "prime" / "config.yaml").write_text("{}\n")
     monkeypatch.setenv("HERMES_HOME", str(hermes_root / "profiles" / "tanvi"))
+    from hermes_cli import kanban_db_dispatch as kbd
+    monkeypatch.setattr(
+        kbd, "select_runnable_assignee", lambda requested, *, fallback=None: requested,
+    )
 
 
 def _payload(**overrides):
@@ -199,6 +205,65 @@ class TestValidation:
                 headers={"Authorization": "Bearer sk-secret"},
                 json=_payload(assignee="TANVI"))
             assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_credentialless_assignee_redirects_to_configured_fallback(self, adapter, monkeypatch):
+        """A valid profile that cannot authenticate must not create a ready-forever card."""
+        from hermes_cli import kanban_db_dispatch as kbd
+        from hermes_constants import get_hermes_home
+
+        captured = []
+
+        def select(requested, *, fallback=None):
+            captured.append((requested, fallback))
+            return "prime"
+
+        monkeypatch.setattr(kbd, "select_runnable_assignee", select)
+        (get_hermes_home() / "config.yaml").write_text(
+            "kanban:\n  default_assignee: prime\n",
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/kanban/create",
+                headers={"Authorization": "Bearer sk-secret"},
+                json=_payload(),
+            )
+            task_id = (await resp.json())["task_id"]
+
+        assert resp.status == 200
+        assert captured == [("tanvi", "prime")]
+        from hermes_cli import kanban_db, kanban_db_connect
+        with kanban_db_connect.connect_closing() as conn:
+            assert kanban_db.get_task(conn, task_id).assignee == "prime"
+
+    @pytest.mark.asyncio
+    async def test_credentialless_assignee_rejected_when_no_fallback_is_runnable(self, adapter, monkeypatch):
+        from hermes_cli import kanban_db, kanban_db_connect
+        from hermes_cli import kanban_db_dispatch as kbd
+
+        monkeypatch.setattr(
+            kbd,
+            "select_runnable_assignee",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                kbd.CredentialMissingError("assignee 'tanvi' is not runnable"),
+            ),
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/kanban/create",
+                headers={"Authorization": "Bearer sk-secret"},
+                json=_payload(),
+            )
+            response_body = await resp.json()
+
+        assert resp.status == 400
+        assert response_body == {
+            "error": "credential_missing", "detail": "assignee 'tanvi' is not runnable",
+        }
+        with kanban_db_connect.connect_closing() as conn:
+            assert kanban_db.list_tasks(conn) == []
 
     @pytest.mark.asyncio
     async def test_missing_idempotency_key_400(self, adapter):

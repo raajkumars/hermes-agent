@@ -1039,6 +1039,14 @@ def _handle_create(args: dict, **kw) -> str:
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
+        # A profile name on disk is not enough: assigning a fresh card to a
+        # credential-less dispatcher/profile creates a ready-forever card (or a
+        # crash loop).  Use the dispatcher's scoped active-provider probe before
+        # the DB write; when an operator configured a healthy fallback, redirect
+        # there rather than silently preserving the dead assignment.
+        from hermes_cli.kanban_db_dispatch import select_runnable_assignee
+        fallback = cfg_get(load_config(), "kanban", "default_assignee", default=None)
+        assignee = select_runnable_assignee(str(assignee), fallback=fallback)
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
@@ -1056,7 +1064,7 @@ def _handle_create(args: dict, **kw) -> str:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
         new_tid = kb.create_task(
-            conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+            conn, title=str(title).strip(), body=args.get("body"), assignee=assignee,
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,

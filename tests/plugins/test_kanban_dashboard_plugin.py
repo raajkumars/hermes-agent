@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,9 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        kbd, "select_runnable_assignee", lambda requested, *, fallback=None: requested,
+    )
     kb.init_db()
     return home
 
@@ -117,6 +121,32 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_create_task_redirects_to_runnable_fallback(client, kanban_home, monkeypatch):
+    (kanban_home / "config.yaml").write_text("kanban:\n  default_assignee: prime\n")
+    monkeypatch.setattr(kbd, "select_runnable_assignee", lambda *_args, **_kwargs: "prime")
+
+    response = client.post("/api/plugins/kanban/tasks", json={"title": "route", "assignee": "kanban"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["assignee"] == "prime"
+
+
+def test_create_task_fails_closed_when_no_assignee_is_runnable(client, monkeypatch):
+    def reject(*_args, **_kwargs):
+        raise kbd.CredentialMissingError("assignee 'kanban' is not runnable")
+
+    monkeypatch.setattr(kbd, "select_runnable_assignee", reject)
+
+    response = client.post("/api/plugins/kanban/tasks", json={"title": "reject", "assignee": "kanban"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == {
+        "code": "credential_missing", "message": "assignee 'kanban' is not runnable",
+    }
+    with kbc.connect_closing() as conn:
+        assert kb.list_tasks(conn) == []
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):

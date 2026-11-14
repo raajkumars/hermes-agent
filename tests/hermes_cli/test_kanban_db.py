@@ -419,12 +419,15 @@ def test_terminal_provider_exit_blocks_after_one_attempt_in_either_lane(kanban_h
 
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
+        assert task.block_kind == "capability"
         assert task.consecutive_failures == 1  # one spawn, not failure_limit / max_retries of them
         assert "terminal provider error" in (task.last_failure_error or "")
         gave_up = conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,),
         ).fetchone()
-        assert json.loads(gave_up["payload"])["terminal_provider"] is True
+        payload = json.loads(gave_up["payload"])
+        assert payload["terminal_provider"] is True
+        assert payload["block_kind"] == "capability"
 
         # Sticky: the breaker did not reach its counter limit, yet the card must stay parked
         # until an operator fixes the provider and unblocks it.
