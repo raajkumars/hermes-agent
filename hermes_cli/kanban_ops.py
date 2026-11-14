@@ -79,8 +79,20 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
     except Exception:
+        _kanban_cfg = {}
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
+    # Per-card respawn cap (0 disables); an invalid value keeps the default,
+    # never disables the cap.
+    respawn_cap = kbd.DEFAULT_MAX_SPAWNS_WITHOUT_COMPLETION
+    try:
+        raw_cap = int(_kanban_cfg.get("max_spawns_without_completion", respawn_cap))
+        if raw_cap < 0:
+            raise ValueError(raw_cap)
+        respawn_cap = raw_cap
+    except (TypeError, ValueError, AttributeError):
+        print("warning: invalid kanban.max_spawns_without_completion; using default "
+              f"{respawn_cap}", file=sys.stderr)
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
@@ -90,6 +102,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_spawns_without_completion=respawn_cap,
         )
     if getattr(args, "json", False):
         _print_json({
