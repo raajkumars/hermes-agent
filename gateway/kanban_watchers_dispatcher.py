@@ -56,6 +56,7 @@ class _DispatcherSettings:
     stale_waiting_escalation_manager_map: Optional[dict] = None
     stale_waiting_escalation_manager: Optional[str] = None
     pr_review_wakeup_enabled: bool = False
+    max_spawns_without_completion: int = 20
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -96,6 +97,22 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.warning("kanban dispatcher: kanban.failure_limit=%r is below 1; using default %d",
                        raw_failure_limit, kb.DEFAULT_FAILURE_LIMIT)
         failure_limit = kb.DEFAULT_FAILURE_LIMIT
+
+    # Per-card respawn cap (0 disables). An invalid value is reported and the
+    # default applies — never silently disabled.
+    default_cap = _kbd().DEFAULT_MAX_SPAWNS_WITHOUT_COMPLETION
+    raw_respawn_cap = kanban_cfg.get("max_spawns_without_completion", default_cap)
+    try:
+        max_spawns_without_completion = int(raw_respawn_cap)
+        if max_spawns_without_completion < 0:
+            raise ValueError(raw_respawn_cap)
+    except (TypeError, ValueError):
+        logger.warning("kanban dispatcher: invalid kanban.max_spawns_without_completion=%r; "
+                       "using default %d", raw_respawn_cap, default_cap)
+        max_spawns_without_completion = default_cap
+    if max_spawns_without_completion == 0:
+        logger.warning("kanban dispatcher: kanban.max_spawns_without_completion=0; "
+                       "per-card respawn cap DISABLED")
 
     # 0 disables stale detection.
     raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
@@ -160,6 +177,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         stale_waiting_escalation_manager_map=stale_waiting_escalation_manager_map,
         stale_waiting_escalation_manager=stale_waiting_escalation_manager,
         pr_review_wakeup_enabled=pr_review_wakeup_enabled,
+        max_spawns_without_completion=max_spawns_without_completion,
     )
 
 

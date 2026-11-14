@@ -36,6 +36,14 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# Per-card respawn cap: a card that has started this many workers since its
+# last completion or operator unblock is sticky-blocked BEFORE the next claim.
+# ``0`` disables the cap. Run outcomes that never ran the card's work
+# (``spawn_failed``, ``rate_limited``) are not starts — those have their own
+# breaker/cooldown and must not park a card for a host or quota condition.
+DEFAULT_MAX_SPAWNS_WITHOUT_COMPLETION = 20
+_RESPAWN_CAP_UNCOUNTED_OUTCOMES = ("spawn_failed", "rate_limited")
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -163,6 +171,10 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    respawn_cap_blocked: list[str] = field(default_factory=list)
+    """Task ids sticky-blocked this tick, before any claim, because they had
+    started ``kanban.max_spawns_without_completion`` workers since their last
+    completion or operator unblock (:func:`count_spawns_without_completion`)."""
     config_fatal_recovered: list[str] = field(default_factory=list)
     """Task ids auto-requeued this tick by :func:`_recheck_config_fatal_credentials` after
     their profile's provider credential passed a live health check following a prior
@@ -2241,6 +2253,65 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def count_spawns_without_completion(conn: sqlite3.Connection, task_id: str) -> int:
+    """Worker starts of ``task_id`` since its last completion or operator unblock.
+
+    Derived from the run/event trail on every call, so it survives restarts,
+    needs no extra table and cannot drift from the board. Reset points are
+    ONLY a ``completed`` event, a ``completed`` run, or an ``unblocked`` event
+    (an operator decision); reassignment, re-promotion, reclaim and review
+    hand-offs do not reset the window. A run claimed in the same second as
+    the reset is not counted, which errs toward one more start, never a
+    false block.
+    """
+    reset_at = conn.execute(
+        "SELECT MAX(ts) FROM ("
+        " SELECT MAX(created_at) AS ts FROM task_events"
+        "  WHERE task_id = ? AND kind IN ('completed', 'unblocked')"
+        " UNION ALL"
+        " SELECT MAX(ended_at) AS ts FROM task_runs"
+        "  WHERE task_id = ? AND outcome = 'completed'"
+        ")",
+        (task_id, task_id),
+    ).fetchone()[0]
+    # A start is a CLAIMED run. Zero-duration runs synthesized by a terminal
+    # transition on an unclaimed card (e.g. this cap's own block) carry no
+    # ``claimed`` event and must not count, or every block would feed the cap.
+    placeholders = ", ".join("?" for _ in _RESPAWN_CAP_UNCOUNTED_OUTCOMES)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM task_runs r WHERE r.task_id = ? AND r.started_at > ? "
+        f"AND (r.outcome IS NULL OR r.outcome NOT IN ({placeholders})) "
+        "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
+        "AND e.run_id = r.id AND e.kind = 'claimed')",
+        (task_id, int(reset_at) if reset_at is not None else -1, *_RESPAWN_CAP_UNCOUNTED_OUTCOMES),
+    ).fetchone()
+    return int(row[0])
+
+
+def _apply_respawn_cap(
+    conn: sqlite3.Connection, task_id: str, result: "DispatchResult", *,
+    cap: Optional[int], dry_run: bool,
+) -> bool:
+    """Pre-claim cap check for one ready row. True means: do not spawn.
+
+    Runs before :func:`claim_task`, so the card is ``ready`` with no live run
+    or worker: blocking here can never end a live run or orphan a worker.
+    """
+    if not cap or cap < 1:
+        return False
+    starts = count_spawns_without_completion(conn, task_id)
+    if starts < cap:
+        return False
+    if dry_run:
+        result.respawn_cap_blocked.append(task_id)
+        return True
+    reason = f"respawn cap: {starts} starts without completion"
+    if _kb.block_task(conn, task_id, reason=reason, kind="needs_input"):
+        result.respawn_cap_blocked.append(task_id)
+    # Even if the block lost a race (status moved), never spawn past the cap.
+    return True
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -2836,6 +2907,7 @@ def dispatch_once(
     stale_waiting_escalation_manager_map: Optional[dict] = None,
     stale_waiting_escalation_manager: Optional[str] = None,
     pr_review_wakeup_enabled: bool = False,
+    max_spawns_without_completion: Optional[int] = DEFAULT_MAX_SPAWNS_WITHOUT_COMPLETION,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -2864,6 +2936,7 @@ def dispatch_once(
             stale_waiting_escalation_manager_map=stale_waiting_escalation_manager_map,
             stale_waiting_escalation_manager=stale_waiting_escalation_manager,
             pr_review_wakeup_enabled=pr_review_wakeup_enabled,
+            max_spawns_without_completion=max_spawns_without_completion,
         )
 
     try:
@@ -2913,6 +2986,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    max_spawns_without_completion: Optional[int] = DEFAULT_MAX_SPAWNS_WITHOUT_COMPLETION,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2956,6 +3030,13 @@ def _dispatch_lane_task(
         if not dry_run:
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+        return False
+    # Per-card respawn cap, enforced BEFORE the claim (ready lane only:
+    # ``block_task`` accepts ready/running, and a review-lane start still counts
+    # toward the window, which is enforced when the card next returns to ready).
+    if lane == "ready" and _apply_respawn_cap(
+        conn, task_id, result, cap=max_spawns_without_completion, dry_run=dry_run,
+    ):
         return False
 
     def _count_spawn(name: str) -> None:
@@ -3234,6 +3315,7 @@ def _dispatch_once_locked(
     stale_waiting_escalation_manager_map: Optional[dict] = None,
     stale_waiting_escalation_manager: Optional[str] = None,
     pr_review_wakeup_enabled: bool = False,
+    max_spawns_without_completion: Optional[int] = DEFAULT_MAX_SPAWNS_WITHOUT_COMPLETION,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -3294,6 +3376,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        max_spawns_without_completion=max_spawns_without_completion,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
