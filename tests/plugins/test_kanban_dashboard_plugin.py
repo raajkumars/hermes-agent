@@ -135,13 +135,16 @@ def test_create_task_redirects_to_runnable_fallback(client, kanban_home, monkeyp
 
 def test_create_task_fails_closed_when_no_assignee_is_runnable(client, monkeypatch):
     def reject(*_args, **_kwargs):
-        raise ValueError("assignee 'kanban' is not runnable")
+        raise kbd.CredentialMissingError("assignee 'kanban' is not runnable")
 
     monkeypatch.setattr(kbd, "select_runnable_assignee", reject)
 
     response = client.post("/api/plugins/kanban/tasks", json={"title": "reject", "assignee": "kanban"})
 
     assert response.status_code == 400
+    assert response.json()["detail"] == {
+        "code": "credential_missing", "message": "assignee 'kanban' is not runnable",
+    }
     with kbc.connect_closing() as conn:
         assert kb.list_tasks(conn) == []
 

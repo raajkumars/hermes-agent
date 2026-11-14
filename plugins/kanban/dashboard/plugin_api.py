@@ -404,10 +404,14 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         task_kwargs = payload.model_dump()
         if payload.assignee:
             from hermes_cli.config import load_config
+            from hermes_cli.kanban_db_dispatch import CredentialMissingError
 
             kanban_config = (load_config() or {}).get("kanban") or {}
             fallback = (kanban_config.get("default_assignee") or "").strip() or None
-            task_kwargs["assignee"] = kbd.select_runnable_assignee(payload.assignee, fallback=fallback)
+            try:
+                task_kwargs["assignee"] = kbd.select_runnable_assignee(payload.assignee, fallback=fallback)
+            except CredentialMissingError as exc:
+                raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)})
         task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **task_kwargs)
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}

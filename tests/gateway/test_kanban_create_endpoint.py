@@ -246,7 +246,7 @@ class TestValidation:
             kbd,
             "select_runnable_assignee",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                ValueError("assignee 'tanvi' is not runnable"),
+                kbd.CredentialMissingError("assignee 'tanvi' is not runnable"),
             ),
         )
         app = _create_app(adapter)
@@ -256,8 +256,12 @@ class TestValidation:
                 headers={"Authorization": "Bearer sk-secret"},
                 json=_payload(),
             )
+            response_body = await resp.json()
 
         assert resp.status == 400
+        assert response_body == {
+            "error": "credential_missing", "detail": "assignee 'tanvi' is not runnable",
+        }
         with kanban_db_connect.connect_closing() as conn:
             assert kanban_db.list_tasks(conn) == []
 

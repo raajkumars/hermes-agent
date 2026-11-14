@@ -1868,6 +1868,17 @@ def _run_credential_probe(profile: str, *, timeout: float = 20.0) -> Optional[di
         return None
 
 
+class CredentialMissingError(ValueError):
+    """The requested assignee and any configured fallback cannot authenticate.
+
+    ``code`` is intentionally stable so API clients can distinguish a profile
+    credential refusal from ordinary malformed-assignee validation without
+    receiving provider or secret details.
+    """
+
+    code = "credential_missing"
+
+
 def select_runnable_assignee(requested: str, *, fallback: Optional[str] = None) -> str:
     """Return a profile whose active provider is usable before new work is assigned.
 
@@ -1893,10 +1904,12 @@ def select_runnable_assignee(requested: str, *, fallback: Optional[str] = None) 
         if probe and probe.get("ok"):
             return candidate
     if fallback and fallback.strip() and fallback.strip() != requested.strip():
-        raise ValueError(
+        raise CredentialMissingError(
             f"assignee {requested!r} is not runnable and configured fallback {fallback!r} is not runnable"
         )
-    raise ValueError(f"assignee {requested!r} is not runnable (no usable active-provider credential)")
+    raise CredentialMissingError(
+        f"assignee {requested!r} is not runnable (no usable active-provider credential)"
+    )
 
 
 def _recover_profile_config_fatal(

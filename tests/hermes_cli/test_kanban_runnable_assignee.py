@@ -35,8 +35,10 @@ def test_select_runnable_assignee_redirects_to_healthy_fallback(monkeypatch):
 def test_select_runnable_assignee_rejects_when_no_candidate_is_healthy(monkeypatch):
     monkeypatch.setattr(kbd, "_run_credential_probe", lambda profile, timeout=15.0: {"ok": False})
 
-    with pytest.raises(ValueError, match="not runnable"):
+    with pytest.raises(kbd.CredentialMissingError, match="not runnable") as exc_info:
         kbd.select_runnable_assignee("kanban", fallback="default")
+
+    assert exc_info.value.code == "credential_missing"
 
 
 def test_bedrock_sdk_chain_profile_remains_assignable(monkeypatch):

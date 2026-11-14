@@ -3871,10 +3871,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
         try:
             from hermes_cli.config import cfg_get, load_config
-            from hermes_cli.kanban_db_dispatch import select_runnable_assignee
+            from hermes_cli.kanban_db_dispatch import CredentialMissingError, select_runnable_assignee
 
             fallback = cfg_get(load_config(), "kanban", "default_assignee", default=None)
             assignee = select_runnable_assignee(assignee, fallback=fallback)
+        except CredentialMissingError as exc:
+            return web.json_response({"error": exc.code, "detail": str(exc)}, status=400)
         except ValueError as exc:
             return _invalid_request(str(exc))
         except Exception as exc:
