@@ -2047,6 +2047,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 force_trip=True,
                 release_claim=False,
                 end_run=False,
+                block_kind="capability",
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
@@ -2130,6 +2131,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    block_kind: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -2143,7 +2145,8 @@ def _record_task_failure(
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
     unconditionally (caller applied its own bounded-retry policy).
 
-    ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
+    ``block_kind`` classifies an operator-held block using the board's supported
+    vocabulary. ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
     #114720) — nothing about the card ran, so the run and event are recorded
     with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
     the breaker never trips; the card stays retryable and
@@ -2206,9 +2209,9 @@ def _record_task_failure(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                if release_claim else "")
-            + "consecutive_failures = ?, last_failure_error = ? "
+            + "block_kind = ?, consecutive_failures = ?, last_failure_error = ? "
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-            (failures, error, task_id),
+            (block_kind, failures, error, task_id),
         )
         payload = {
             "failures": failures,
@@ -2218,6 +2221,8 @@ def _record_task_failure(
             "trigger_outcome": outcome,
             "retry_status": retry_status,
         }
+        if block_kind:
+            payload["block_kind"] = block_kind
         run_id = None
         if end_run:
             # Only the spawn path has an open run to close.

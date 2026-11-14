@@ -436,9 +436,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    assignee = args.assignee
+    if assignee:
+        fallback = (_kanban_config().get("default_assignee") or "").strip() or None
+        try:
+            assignee = kbd.select_runnable_assignee(assignee, fallback=fallback)
+        except ValueError as exc:
+            return _err(f"kanban create: {exc}", 2)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
-            conn, title=args.title, body=body, assignee=args.assignee,
+            conn, title=args.title, body=body, assignee=assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
