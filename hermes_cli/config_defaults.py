@@ -1856,6 +1856,9 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # A card that repeatedly starts but never completes is parked after this many confirmed
+        # starts. The cap is task-scoped: sibling cards retain their own dispatch windows.
+        "max_spawns_without_completion": 20,
         # Floor (seconds) between live credential re-probes for the SAME config_fatal-parked
         # profile (#t_f9a0fdf7): without it every dispatcher tick would fire one authenticated
         # HTTP call per parked profile. Clamped to a 30s minimum; a probe that still fails is

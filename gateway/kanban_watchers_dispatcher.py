@@ -27,6 +27,11 @@ def _kbd():
     from hermes_cli import kanban_db_dispatch
     return kanban_db_dispatch
 
+
+def _kb():
+    from hermes_cli import kanban_db
+    return kanban_db
+
 _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
 
 
@@ -51,6 +56,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    max_spawns_without_completion: int = 20
     stale_waiting_timeout_seconds: int = 0
     stale_waiting_escalation_limit: int = 0
     stale_waiting_escalation_manager_map: Optional[dict] = None
@@ -96,6 +102,22 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.warning("kanban dispatcher: kanban.failure_limit=%r is below 1; using default %d",
                        raw_failure_limit, kb.DEFAULT_FAILURE_LIMIT)
         failure_limit = kb.DEFAULT_FAILURE_LIMIT
+
+    raw_respawn_cap = kanban_cfg.get("max_spawns_without_completion", 20)
+    try:
+        max_spawns_without_completion = int(raw_respawn_cap)
+    except (TypeError, ValueError):
+        logger.warning(
+            "kanban dispatcher: invalid kanban.max_spawns_without_completion=%r; using default 20",
+            raw_respawn_cap,
+        )
+        max_spawns_without_completion = 20
+    if max_spawns_without_completion < 1:
+        logger.warning(
+            "kanban dispatcher: kanban.max_spawns_without_completion=%r is below 1; using default 20",
+            raw_respawn_cap,
+        )
+        max_spawns_without_completion = 20
 
     # 0 disables stale detection.
     raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
@@ -155,6 +177,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        max_spawns_without_completion=max_spawns_without_completion,
         stale_waiting_timeout_seconds=stale_waiting_timeout_seconds,
         stale_waiting_escalation_limit=stale_waiting_escalation_limit,
         stale_waiting_escalation_manager_map=stale_waiting_escalation_manager_map,
@@ -247,6 +270,15 @@ class _KanbanDispatcher:
             count, completion_id, cap_blocked = int(row[0]), row[1], bool(row[2])
             if latest_id != completion_id:
                 count, completion_id, cap_blocked = 0, latest_id, False
+            elif cap_blocked:
+                # The production board always has ``tasks``; tolerate the
+                # reduced in-memory state schema used by focused unit tests.
+                with contextlib.suppress(sqlite3.OperationalError):
+                    status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                    # A cap-blocked card leaves ``blocked`` only through an
+                    # operator unblock (or a terminal completion, handled above).
+                    if status is not None and status[0] != "blocked":
+                        count, cap_blocked = 0, False
         self._store_respawn_state(
             slug, task_id, conn, count=count, last_completed_run_id=completion_id,
             cap_blocked=cap_blocked,
@@ -255,6 +287,27 @@ class _KanbanDispatcher:
         self._spawns_since_completion[key] = count
         self._last_completed_run_id[key] = completion_id
         return count, completion_id, cap_blocked
+
+    def _apply_respawn_cap(self, slug: str, conn: sqlite3.Connection, result: Any) -> None:
+        """Record confirmed starts and sticky-block only the card that hits its cap."""
+        cap = self.settings.max_spawns_without_completion
+        for task_id, _assignee, _workspace in result.spawned:
+            count, completion_id, cap_blocked = self._load_respawn_state(slug, task_id, conn)
+            if cap_blocked:
+                continue
+            count += 1
+            if count < cap:
+                self._store_respawn_state(
+                    slug, task_id, conn, count=count, last_completed_run_id=completion_id,
+                    cap_blocked=False,
+                )
+                continue
+            reason = f"respawn cap: {cap} starts without a completion"
+            blocked = _kb().block_task(conn, task_id, reason=reason, kind="needs_input")
+            self._store_respawn_state(
+                slug, task_id, conn, count=count, last_completed_run_id=completion_id,
+                cap_blocked=blocked,
+            )
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -308,7 +361,9 @@ class _KanbanDispatcher:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
             conn = _kbc().connect(board=slug)
-            return _kbd().dispatch_once(conn, board=slug, **kwargs)
+            result = _kbd().dispatch_once(conn, board=slug, **kwargs)
+            self._apply_respawn_cap(slug, conn, result)
+            return result
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
