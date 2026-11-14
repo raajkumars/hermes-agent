@@ -138,6 +138,10 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_wip_new_initiative: list[str] = field(default_factory=list)
+    """Unranked non-session task ids deferred because their profile received
+    ranked deliverable work or the fleet-wide new-initiative WIP budget was
+    exhausted. They remain ready for the next dispatch tick."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -195,6 +199,11 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.skipped_wip_new_initiative:
+            counts["skipped_wip_new_initiative"] = (
+                counts.get("skipped_wip_new_initiative", 0)
+                + len(res.skipped_wip_new_initiative)
+            )
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -3345,10 +3354,17 @@ def _dispatch_once_locked(
         if ready_budget is not None and spawned >= ready_budget:
             break
         row_assignee = row["assignee"]
-        if row_assignee and row_assignee in ranked_profiles_with_work:
-            continue
         is_session_card = row["session_id"] is not None
-        if not is_session_card and unranked_initiatives >= initiative_wip:
+        # A live interactive session is follow-up work, not a speculative new
+        # initiative.  It bypasses both the per-profile ranked-work hold and
+        # the fleet-wide exploration budget.
+        if is_session_card:
+            pass
+        elif row_assignee and row_assignee in ranked_profiles_with_work:
+            result.skipped_wip_new_initiative.append(row["id"])
+            continue
+        elif ranked_rows and unranked_initiatives >= initiative_wip:
+            result.skipped_wip_new_initiative.append(row["id"])
             continue
         if not row_assignee:
             if not default_assignee or not _apply_default_assignee(

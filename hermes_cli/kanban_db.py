@@ -977,6 +977,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- profile's state.db (kanban_create verifies before stamping). Indexed
     -- so per-session list queries stay cheap on larger boards.
     session_id           TEXT,
+    -- Dispatcher WIP routing metadata.  A positive rank means this card is
+    -- part of an in-progress deliverable; NULL/0 rows are new initiatives.
+    -- These deliberately remain task-local so D2 can roll out independently
+    -- of the broader deliverables registry.
+    deliverable_key      TEXT,
+    rank                 INTEGER NOT NULL DEFAULT 0,
     -- Task id of the worker that spawned this task via kanban_create,
     -- independent of ``task_links`` dependency edges (a worker's fan-out
     -- children usually carry NO ``parents=[self]`` edge, since gating a

@@ -832,6 +832,10 @@ _LATER_TASK_COLUMNS = (
     ("goal_max_turns", "goal_max_turns INTEGER"),
     ("completion_contract", "completion_contract TEXT"),
     ("session_id", "session_id TEXT"),
+    # Dispatcher WIP routing metadata.  Existing work remains unranked until
+    # explicitly enrolled, preserving legacy dispatch behaviour on upgrade.
+    ("deliverable_key", "deliverable_key TEXT"),
+    ("rank", "rank INTEGER NOT NULL DEFAULT 0"),
     # Typed reason for a currently blocked task (VALID_BLOCK_KINDS); NULL for
     # every non-blocked task and generic human blockers.
     ("block_kind", "block_kind TEXT"),
@@ -918,6 +922,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_ready_deliverable_rank "
+        "ON tasks(status, claim_lock, deliverable_key, rank)"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_creator_task_id ON tasks(creator_task_id)")
 
     # task_events.run_id back-fills as NULL for historical events (they predate
