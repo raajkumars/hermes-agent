@@ -173,6 +173,8 @@ def test_structured_provider_config_cause_blocks_the_affected_profile(kanban_hom
         assert kbd.detect_crashed_workers._last_auto_blocked == [failed, queued]
         assert kb.get_task(conn, failed).status == "blocked"
         assert kb.get_task(conn, queued).status == "blocked"
+        assert kb.get_task(conn, failed).block_kind == "capability"
+        assert kb.get_task(conn, queued).block_kind == "capability"
         assert "config_fatal" in [event.kind for event in kb.list_events(conn, queued)]
         comment = conn.execute(
             "SELECT body FROM task_comments WHERE task_id=? ORDER BY id DESC LIMIT 1", (queued,),
@@ -220,6 +222,7 @@ def test_recheck_requeues_once_after_credential_recovers(kanban_home, monkeypatc
         for tid in (failed, queued):
             task = kb.get_task(conn, tid)
             assert task.status == "ready"
+            assert task.block_kind is None
             assert task.consecutive_failures == 0
             assert [e.kind for e in kb.list_events(conn, tid)][-1] == "config_fatal_recovered"
         comment = conn.execute(

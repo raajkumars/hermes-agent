@@ -143,14 +143,32 @@ def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = 
     for candidate in (explicit, (fallback or "").strip()):
         if candidate:
             try:
-                if profiles_mod.profile_exists(candidate):
+                if profiles_mod.profile_exists(candidate) and _profile_is_runnable(candidate):
                     return candidate
             except Exception:
                 pass
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        active = profiles_mod.get_active_profile_name() or "default"
+        if _profile_is_runnable(active):
+            return active
     except Exception:
-        return "default"
+        pass
+    raise ValueError("no installed profile has a usable active-provider credential")
+
+
+def _profile_is_runnable(profile: str) -> bool:
+    """True only when *profile* can execute an agent turn right now.
+
+    The decomposer must not advertise credential-less profiles to the routing
+    model: a name that merely exists on disk is otherwise selected as a real
+    assignee and immediately strands its child cards.
+    """
+    from hermes_cli.kanban_db_dispatch import select_runnable_assignee
+
+    try:
+        return select_runnable_assignee(profile) == profile
+    except ValueError:
+        return False
 
 
 def _build_roster() -> tuple[list[dict], set[str]]:
@@ -163,13 +181,16 @@ def _build_roster() -> tuple[list[dict], set[str]]:
         return [], set()
     roster = []
     for p in all_profiles:
+        if not _profile_is_runnable(p.name):
+            logger.info("decompose: excluding unrunnable profile %r from routing roster", p.name)
+            continue
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,
             "description": desc or f"(no description; profile named {p.name!r})",
             "has_description": bool(desc),
         })
-    return roster, {p.name for p in all_profiles}
+    return roster, {entry["name"] for entry in roster}
 
 
 def _format_roster(roster: list[dict]) -> str:
@@ -313,7 +334,10 @@ def decompose_task(
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
-    routing = _load_routing(root_assignee=task.assignee)
+    try:
+        routing = _load_routing(root_assignee=task.assignee)
+    except ValueError as exc:
+        return DecomposeOutcome(task_id, False, str(exc))
     raw, reason = _call_aux(
         "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
         user=_USER_TEMPLATE.format(

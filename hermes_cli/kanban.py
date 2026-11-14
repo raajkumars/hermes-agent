@@ -436,9 +436,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    assignee = args.assignee
+    if assignee:
+        fallback = (_kanban_config().get("default_assignee") or "").strip() or None
+        try:
+            assignee = kbd.select_runnable_assignee(assignee, fallback=fallback)
+        except ValueError as exc:
+            return _err(f"kanban create: {exc}", 2)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
-            conn, title=args.title, body=body, assignee=args.assignee,
+            conn, title=args.title, body=body, assignee=assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
@@ -475,10 +482,27 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
         return _err(f"kanban swarm: {exc}", 2)
     if not workers:
         return _err("kanban swarm: at least one --worker is required", 2)
+    fallback = (_kanban_config().get("default_assignee") or "").strip() or None
+    try:
+        workers = [
+            ks.SwarmWorkerSpec(
+                profile=kbd.select_runnable_assignee(worker.profile, fallback=fallback),
+                title=worker.title,
+                body=worker.body,
+                skills=worker.skills,
+                priority=worker.priority,
+                max_runtime_seconds=worker.max_runtime_seconds,
+            )
+            for worker in workers
+        ]
+        verifier = kbd.select_runnable_assignee(args.verifier, fallback=fallback)
+        synthesizer = kbd.select_runnable_assignee(args.synthesizer, fallback=fallback)
+    except ValueError as exc:
+        return _err(f"kanban swarm: {exc}", 2)
     with kbc.connect_closing() as conn:
         created = ks.create_swarm(
-            conn, goal=args.goal, workers=workers, verifier_assignee=args.verifier,
-            synthesizer_assignee=args.synthesizer, tenant=args.tenant,
+            conn, goal=args.goal, workers=workers, verifier_assignee=verifier,
+            synthesizer_assignee=synthesizer, tenant=args.tenant,
             created_by=args.created_by or _profile_author(), priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
         )
