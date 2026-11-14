@@ -830,6 +830,7 @@ class OpenAICompatRoutesMixin:
             return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
                     "model": model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+        streamed_text = False
         try:
             await response.write(_sse_frame(_chunk({"role": "assistant"})))
             async for delta in _iter_stream_items(stream_q, agent_task, response):
@@ -845,6 +846,8 @@ class OpenAICompatRoutesMixin:
                 elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__status__":
                     await response.write(_sse_frame(delta[1], event="hermes.status"))
                 else:
+                    if delta:
+                        streamed_text = True
                     await response.write(_sse_frame(_chunk({"content": delta})))
             # The agent can fail after the queue drains (task raises / result flagged failed or
             # partial): surface a non-"stop" finish_reason like the non-streaming path.
@@ -860,6 +863,15 @@ class OpenAICompatRoutesMixin:
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
+            # Back-fill: when the agent produced its answer without firing stream deltas, send the
+            # final text once (the /v1/responses writer already does this) so clients never get an
+            # empty reply. Local fix, see qwickapps/hermes-overlay.
+            if (not streamed_text and isinstance(result, dict)
+                    and result.get("_notification_presentation_suppressed") is not True):
+                from gateway.platforms.api_server import _resolve_media_to_data_urls
+                _final = _resolve_media_to_data_urls(result.get("final_response") or "")
+                if _final:
+                    await response.write(_sse_frame(_chunk({"content": _final})))
             finish_reason = _finish_reason(completed, is_partial, is_failed, err_msg, agent_error)
             finish_chunk = _chunk({}, finish_reason, usage=_chat_usage_payload(usage))
             presentation_muted = (

@@ -146,12 +146,25 @@ def _shutdown_cached_aux_clients() -> None:
     shutdown_cached_clients()
 
 
+def _shutdown_provider_session_pools() -> None:
+    # This CLI process is exiting for good -- a provider's own pooled session (e.g.
+    # claude-subscription's persistent `claude` subprocess) has no future turn left to be
+    # reused for. Without this, `client.close()` intentionally no-ops for a pooled session
+    # (so the NEXT turn of a persistent process's SAME conversation reuses it), and nothing
+    # else ever tells the pool this process is disappearing -- the subprocess is reparented
+    # to init and never closed (t_2d4e174b). Never called from a persistent process (gateway,
+    # Desktop `serve`) -- only this one-shot CLI exit path.
+    from providers import shutdown_all_session_pools
+    shutdown_all_session_pools()
+
+
 # Ordered teardown steps (attribute names, resolved at call time so tests can patch them)
 # and the exception class each swallows.
 _CLEANUP_STEPS = (
     ("_stop_cli_wake_word", Exception), ("_cleanup_all_terminals", Exception),
     ("_interrupt_async_delegations", Exception), ("_cleanup_all_browsers", Exception),
     ("_shutdown_mcp_servers", BaseException), ("_shutdown_cached_aux_clients", Exception),
+    ("_shutdown_provider_session_pools", Exception),
 )
 
 

@@ -278,11 +278,7 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
             )
 
         for row in conn.execute("SELECT id FROM tasks").fetchall():
-            conn.execute(
-                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-                "VALUES (?, NULL, 'imported', ?, ?)",
-                (row["id"], json.dumps({"board": slug, "parked": row["id"] in parked}, ensure_ascii=False), now),
-            )
+            kb._append_event(conn, row["id"], "imported", {"board": slug, "parked": row["id"] in parked})
 
     return {"attachments": rehomed, "parked": len(parked)}, warnings
 

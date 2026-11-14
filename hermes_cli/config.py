@@ -1150,6 +1150,86 @@ def _validate_web_backends(config: Dict[str, Any], issues: List[ConfigIssue]) ->
                    "Run 'hermes tools' and pick a different Web Search & Extract provider")
 
 
+def _validate_function_pools(config: Dict[str, Any], issues: List[ConfigIssue]) -> None:
+    """Reject pool policies the dispatcher cannot interpret safely.
+
+    ``profiles`` is membership only today.  Mapping-form profile overrides are
+    deliberately rejected until claim-time enforcement for per-profile limits
+    exists; silently accepting them would promise an unenforced quota.
+    """
+    kanban = config.get("kanban")
+    if not isinstance(kanban, dict) or "function_pools" not in kanban:
+        return
+    pools = kanban.get("function_pools")
+    hint = (
+        "Use a mapping such as kanban.function_pools.platform: "
+        "{profiles: [ira], max_slots: 2, reserved_slots: 1}; profiles may be "
+        "a name or list of names. max_slots and reserved_slots are required "
+        "non-negative integers."
+    )
+    if not isinstance(pools, dict):
+        _issue(issues, "error", "kanban.function_pools must be a mapping of pool names to settings", hint)
+        return
+
+    memberships: Dict[str, str] = {}
+    for name, pool in pools.items():
+        label = f"kanban.function_pools.{name}"
+        if not isinstance(name, str) or not name.strip():
+            _issue(issues, "error", "kanban.function_pools has an empty or non-string pool name", hint)
+            continue
+        if not isinstance(pool, dict):
+            _issue(issues, "error", f"{label} must be a mapping, got {type(pool).__name__}", hint)
+            continue
+
+        profiles = pool.get("profiles", [])
+        if isinstance(profiles, str) and profiles.strip():
+            profile_names = [profiles.strip()]
+        elif isinstance(profiles, (list, tuple, set)) and all(
+            isinstance(profile, str) and profile.strip() for profile in profiles
+        ):
+            profile_names = [profile.strip() for profile in profiles]
+        elif isinstance(profiles, dict):
+            _issue(
+                issues, "error",
+                f"{label}.profiles mapping overrides are not supported; use a profile name or sequence of names",
+                hint,
+            )
+            profile_names = []
+        else:
+            _issue(
+                issues, "error",
+                f"{label}.profiles must be a profile name or sequence of non-empty profile names",
+                hint,
+            )
+            profile_names = []
+        for profile in profile_names:
+            prior_pool = memberships.setdefault(profile, name)
+            if prior_pool != name:
+                _issue(
+                    issues, "error",
+                    f"{label}.profiles assigns {profile!r} to both {prior_pool!r} and {name!r}", hint,
+                )
+            elif profile_names.count(profile) > 1:
+                _issue(issues, "error", f"{label}.profiles repeats {profile!r}", hint)
+
+        values: Dict[str, int] = {}
+        for key in ("max_slots", "reserved_slots"):
+            if key not in pool:
+                _issue(issues, "error", f"{label}.{key} is required", hint)
+                continue
+            value = pool[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                _issue(issues, "error", f"{label}.{key} must be a non-negative integer", hint)
+                continue
+            values[key] = value
+        if (
+            "max_slots" in values
+            and values["max_slots"] > 0
+            and values.get("reserved_slots", 0) > values["max_slots"]
+        ):
+            _issue(issues, "error", f"{label}.reserved_slots may not exceed {label}.max_slots", hint)
+
+
 def _container_slots() -> Dict[str, str]:
     """Dotted key -> ``"list"``/``"mapping"`` for every slot the schema fixes to a container:
     ``DEFAULT_CONFIG`` (sections included) plus the known-container table for roots it omits."""
@@ -1231,6 +1311,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                    f"Move '{key}' under the appropriate section")
 
     _validate_web_backends(config, issues)
+    _validate_function_pools(config, issues)
     _validate_quoted_containers(config, issues)
     return issues
 

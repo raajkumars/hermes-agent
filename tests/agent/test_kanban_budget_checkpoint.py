@@ -13,7 +13,7 @@ from tests.agent.test_iteration_budget_warning import _agent
     ("null", "non-owner", False, False),
     ("null", "child", False, False),
     ("0.75", "child", True, False),
-    ("null", "no-completion-tool", False, False),
+    ("null", "no-completion-tool", True, True),
 ])
 def test_checkpoint_requires_opt_in_or_dispatcher_completion_scope(
     tmp_path, monkeypatch, ratio, scope, expected, kanban_notice
@@ -39,6 +39,10 @@ def test_checkpoint_requires_opt_in_or_dispatcher_completion_scope(
             assert messages[:-1] == original[:-1]
             assert (messages[-1]["content"] != "verified artifact") is expected
             assert ("kanban_complete" in messages[-1]["content"]) is kanban_notice
+            if kanban_notice:
+                assert "exact workspace path" in messages[-1]["content"]
+                assert "branch name" in messages[-1]["content"]
+                assert "kanban_comment" in messages[-1]["content"]
             snapshot = deepcopy(messages)
             prepare_iteration(agent, messages=messages, api_call_count=3)
             assert messages == snapshot

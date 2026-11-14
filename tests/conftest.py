@@ -21,6 +21,7 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import atexit
+import contextvars
 import importlib
 import os
 import shutil
@@ -97,6 +98,35 @@ if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
+
+
+# Install this collection-time wrapper before test modules import
+# ``create_task`` directly. An autouse-only monkeypatch is too late for those
+# aliases, so it leaves subprocess, CLI, review, and transfer fixtures exposed
+# to the production context guard.
+from hermes_cli import kanban_db as _kanban_db_for_fixtures
+
+_fixture_card_body_opt_out = contextvars.ContextVar(
+    "fixture_card_body_opt_out", default=False
+)
+_fixture_card_body_target = _kanban_db_for_fixtures.create_task
+_fixture_card_body_targets = {_fixture_card_body_target}
+
+
+def _create_task_with_fixture_body(*args, **kwargs):
+    """Supply harmless context only for legacy test scaffolding."""
+    if (
+        not _fixture_card_body_opt_out.get()
+        and not (kwargs.get("body") or "").strip()
+        and not kwargs.get("parents")
+        and not kwargs.get("creator_task_id")
+        and not kwargs.get("triage")
+    ):
+        kwargs["body"] = "test fixture card"
+    return _fixture_card_body_target(*args, **kwargs)
+
+
+_kanban_db_for_fixtures.create_task = _create_task_with_fixture_body
 
 # Subprocess-surviving isolation marker (#82770). PYTEST_CURRENT_TEST /
 # PYTEST_VERSION are pytest's own vars, and tests that spawn children
@@ -538,6 +568,11 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    # Kanban workers inherit a production board pin. Keep every test's allowed
+    # Kanban paths under its tmp root, so the core connection guard rejects an
+    # accidental HERMES_KANBAN_DB=/opt/data/kanban.db before it can write.
+    monkeypatch.setenv("HERMES_TEST_MODE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_TEST_ROOT", str(tmp_path))
     # A test that pins the process home (hermes_constants.pin_process_hermes_home) must not
     # leak that module-global into the next test's routed-profile decisions.
     try:
@@ -697,6 +732,38 @@ def _neutralize_git_safe_directory_read(request, monkeypatch):
     except Exception:
         return
     monkeypatch.setattr(_subprocess_compat, "_user_safe_directories", lambda base_env: [], raising=False)
+
+
+def _install_fixture_card_body_seam(item):
+    """Restore the fixture seam after setup fixtures can reload Kanban code."""
+    global _fixture_card_body_target
+    if not hasattr(item, "_fixture_card_body_marker"):
+        item._fixture_card_body_marker = _fixture_card_body_opt_out.set(
+            bool(item.get_closest_marker("kanban_context_guard"))
+        )
+    current_kanban_db = importlib.import_module("hermes_cli.kanban_db")
+    if current_kanban_db.create_task is not _create_task_with_fixture_body:
+        _fixture_card_body_target = current_kanban_db.create_task
+        _fixture_card_body_targets.add(_fixture_card_body_target)
+        current_kanban_db.create_task = _create_task_with_fixture_body
+    self_module = sys.modules[__name__]
+    for module in tuple(sys.modules.values()):
+        if module is self_module:
+            continue
+        namespace = getattr(module, "__dict__", None)
+        if namespace is None:
+            continue
+        for name, value in tuple(namespace.items()):
+            if any(value is target for target in _fixture_card_body_targets):
+                setattr(module, name, _create_task_with_fixture_body)
+
+
+def pytest_runtest_teardown(item):
+    """Do not leak the context-guard opt-out to the next test."""
+    context_marker = getattr(item, "_fixture_card_body_marker", None)
+    if context_marker is not None:
+        _fixture_card_body_opt_out.reset(context_marker)
+        del item._fixture_card_body_marker
 
 
 @pytest.fixture(autouse=True)
@@ -900,6 +967,15 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
                 .expanduser()
                 .resolve()
             )
+        if os.environ.get("HERMES_KANBAN_ALLOW_LIVE_IN_TESTS") == "1":
+            return _orig_connect(db_path, *args, **kwargs)
+        test_root = os.environ.get("HERMES_KANBAN_TEST_ROOT", "").strip()
+        if test_root:
+            try:
+                resolved.relative_to(Path(test_root).expanduser().resolve())
+                return _orig_connect(db_path, *args, **kwargs)
+            except ValueError:
+                pass
         try:
             resolved.relative_to(_REAL_KANBAN_ROOT)
         except ValueError:
@@ -1504,6 +1580,12 @@ def _check_symlink_support() -> bool:
 
 
 @pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_fixture_setup(fixturedef, request):
+    """Restore the seam before every fixture can use a reloaded Kanban module."""
+    _install_fixture_card_body_seam(request.node)
+    yield
+
+@pytest.hookimpl(wrapper=True, trylast=True)
 def pytest_runtest_call(item):
     """Join the turn's auto-title threads INSIDE capture, before pytest snaps it.
 
@@ -1512,6 +1594,7 @@ def pytest_runtest_call(item):
     ``_pytest/capture.py::snap``). The teardown join in
     ``_close_leaked_session_dbs`` runs after that snap, too late for this race.
     """
+    _install_fixture_card_body_seam(item)
     try:
         return (yield)
     finally:
@@ -1521,6 +1604,7 @@ def pytest_runtest_call(item):
 
 
 def pytest_runtest_setup(item):
+    _install_fixture_card_body_seam(item)
     if item.get_closest_marker("require_symlinks"):
         if not _check_symlink_support():
             pytest.skip(

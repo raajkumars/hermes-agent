@@ -92,7 +92,9 @@ KANBAN_COMPLETE_SCHEMA = _schema(
         "downstream workers and humans. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
+        "tests_run, decisions, findings, etc). Reviewers must set "
+        "``metadata.verdict``; a rejecting same-card review uses "
+        "``kanban_request_changes`` instead of completion. At least one of "
         "``summary`` or ``result`` is required. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
@@ -221,6 +223,11 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
         "reviewer": _prop("string", (
                 "Optional reviewer profile. When provided, the task is "
                 "reassigned to that profile before review dispatch."
+        )),
+        "implementer": _prop("string", (
+                "Optional author of the work when no fleet run produced it "
+                "(e.g. a console session such as 'maestro'). Recorded so the "
+                "reviewer can always request changes."
         )),
         "metadata": {
             "type": "object",
@@ -478,7 +485,8 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "work. Defaults to false (classic single-shot worker)."
         )),
         "completion_contract": _prop("string", (
-            "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
+            "Declare at creation: local-only (default), a real <owner>/<repository> for PR publication, or an exact GitHub PR URL. "
+            "The literal placeholder OWNER/REPO is invalid. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
         "goal_max_turns": _prop("integer", (
@@ -531,6 +539,20 @@ KANBAN_LINK_SCHEMA = _schema(
     {
         "parent_id": {"type": "string", "description": "Parent task id."},
         "child_id":  {"type": "string", "description": "Child task id."},
+    },
+    ["parent_id", "child_id"],
+)
+
+KANBAN_UNLINK_SCHEMA = _schema(
+    "kanban_unlink",
+    (
+        "Remove a parent→child dependency edge. This is the audited release "
+        "path when a review dependency is superseded; a running child is "
+        "rejected unless its active owning worker proves its run ownership."
+    ),
+    {
+        "parent_id": {"type": "string", "description": "Parent task id."},
+        "child_id": {"type": "string", "description": "Child task id."},
     },
     ["parent_id", "child_id"],
 )

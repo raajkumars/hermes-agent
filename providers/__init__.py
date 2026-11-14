@@ -233,6 +233,31 @@ def list_providers() -> list[ProviderProfile]:
     return result
 
 
+def shutdown_all_session_pools() -> None:
+    """Force-close every registered provider's pooled sessions/subprocesses.
+
+    Call exactly once, from a CLI process that is about to exit for good (the
+    `-z`/`--oneshot` hard-exit path and the `-q`/`-Q` single-query path) --
+    never from a persistent process (gateway, Desktop `serve`, webui), where a
+    provider's own session pool exists precisely to be reused across turns.
+
+    Most providers leave ``shutdown_all_sessions`` unset (None) and are a
+    no-op here; this only matters for providers backed by a real subprocess
+    kept alive across calls (claude-subscription's Agent SDK session). Without
+    this, a one-shot process's own exit tells the pool nothing, and the pooled
+    subprocess -- reparented to init the instant the parent exits -- is never
+    closed by anyone (t_2d4e174b).
+    """
+    for profile in list_providers():
+        hook = getattr(profile, "shutdown_all_sessions", None)
+        if hook is None:
+            continue
+        try:
+            hook()
+        except Exception:
+            logger.debug("provider %s: shutdown_all_sessions failed", profile.name, exc_info=True)
+
+
 def _home_layer(*, force_stamp_check: bool = False) -> _HomeLayer:
     """The layer for the home bound right now, importing plugin dirs it has not seen yet."""
     layer, home, key = _bound_home_layer()

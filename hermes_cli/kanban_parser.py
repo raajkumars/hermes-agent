@@ -82,7 +82,8 @@ _TASK_ID = _arg("task_id")
 _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
-_PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
+_PRIORITY = _arg("--priority", type=int, default=0,
+                 help="Higher numbers dispatch first; default 0.")
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
@@ -204,7 +205,7 @@ _SPECS = [
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
         _arg("--completion-contract", metavar="CONTRACT",
-             help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
+             help="local-only (default), a real <owner>/<repository> for publication, or exact GitHub PR URL; literal OWNER/REPO is invalid; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "
@@ -241,7 +242,8 @@ _SPECS = [
         _arg("--archived", action="store_true", help="Include archived tasks"),
         _json_flag(),
         _arg("--sort", choices=sorted(kb.VALID_SORT_ORDERS.keys()),
-             help="Sort order for listed tasks (default: priority)"),
+             help="Sort order for listed tasks (default: priority = most urgent first (highest number); "
+                  "priority-asc and legacy priority-desc = least urgent first)"),
         _arg("--workflow-template-id", metavar="ID", help="Restrict to tasks with this workflow_template_id"),
         _arg("--step-key", dest="current_step_key", metavar="KEY",
              help="Restrict to tasks with this current_step_key"),
@@ -283,6 +285,18 @@ _SPECS = [
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
     ], help="Append a comment"),
+    _cmd("answer", [
+        _TASK_ID,
+        _arg("text", nargs="*", help="The answer (or use --body)"),
+        _arg("--body", help="The answer text (alternative to positional text)"),
+        _arg("--author", help="Answering identity recorded on the comment "
+                              "(default: $HERMES_PROFILE or 'user'). Refused if it, or the "
+                              "invoking profile, is the agent that filed the block."),
+        _arg("--confirm-human-action", action="store_true",
+             help="Required when the block asked for a credential or other human action: "
+                  "confirms the answer genuinely satisfies it."),
+    ], help="Answer a needs_input block: records the answer as a comment AND returns the "
+            "card to the queue, atomically (a plain comment never unblocks)"),
     _cmd("attach", [
         _TASK_ID,
         _arg("path", help="Path to the local file to attach"),
@@ -308,8 +322,12 @@ _SPECS = [
         _TASK_ID,
         _arg("--title", help="Replace the task title"),
         _arg("--body", help="Replace the task body"),
-        _arg("--priority", type=int, help="Replace the task priority"),
+        _arg("--priority", type=int, help="Higher numbers dispatch first; default 0."),
         _arg("--result", help="Backfilled task result text for a done task"),
+        _arg("--completion-contract", metavar="CONTRACT",
+             help="Rebind the completion contract (same validation as create: local-only, a real "
+                  "<owner>/<repository>, or exact GitHub PR URL; literal OWNER/REPO is invalid). "
+                  "Refused for running, done or archived tasks and for a task already bound to a PR."),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
     _cmd("block", [
@@ -337,6 +355,9 @@ _SPECS = [
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
         _arg("--reviewer", help="Optional reviewer profile; reassigns the task before review dispatch."),
         _arg("--metadata", help="JSON object with structured reviewer handoff facts."),
+        _arg("--implementer", help="Author of the work when no fleet run produced it (a console "
+             "session such as maestro). Recorded so the reviewer can always request changes: the "
+             "card parks blocked for this author instead of refusing for lack of provenance."),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
@@ -459,10 +480,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     kanban_parser = parent_subparsers.add_parser(
         "kanban",
         help="Multi-profile collaboration board (tasks, links, comments)",
-        description="Durable SQLite-backed task board shared across Hermes profiles. "
+        description="Higher numbers dispatch first; default 0. Durable SQLite-backed task board shared across Hermes profiles. "
                     "Tasks are claimed atomically, can depend on other tasks, and "
                     "are executed by a named profile in an isolated workspace. "
                     "See https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban.",
+        epilog="Higher numbers dispatch first; default 0.",
     )
     # --board scopes every subcommand to one board's DB; when omitted the
     # resolution is HERMES_KANBAN_BOARD, then the persisted current-board

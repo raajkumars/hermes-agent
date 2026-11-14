@@ -66,8 +66,17 @@ def _origin_from_env(
         return None
     # A non-push surface (api_server: request/response, ``send()`` is a stub) cannot receive a
     # fire-time report, so an origin stamp would make ``deliver=origin`` fail silently on every
-    # fire (#69304). No origin => the home-channel fallback + creation-time notice apply.
+    # fire (#69304). The dashboard ``webui`` surface is also not a gateway Platform. No origin
+    # => the home-channel fallback + creation-time notice apply.
     if not async_delivery_supported():
+        return None
+    from cron.scheduler_delivery import _NON_PUSH_ORIGIN_PLATFORMS
+    from gateway.config import Platform
+    try:
+        platform = Platform(str(origin_platform).lower())
+    except (ValueError, KeyError):
+        return None
+    if platform.value in _NON_PUSH_ORIGIN_PLATFORMS:
         return None
     thread_id = get_session_env("HERMES_SESSION_THREAD_ID") or None
     # Slack stamps every TOP-LEVEL message's own id as the session thread (a per-message
@@ -252,6 +261,35 @@ def _normalize_deliver_param(value: Any) -> Optional[str]:
     if isinstance(value, (list, tuple)):
         return ",".join(_clean_str_list(value)) or None
     return str(value).strip() or None
+
+
+def _validate_delivery_platforms(deliver: Optional[str]) -> Optional[str]:
+    """Reject explicit non-deliverable platform tokens at create/update time.
+
+    ``origin``, ``local``, ``all`` and ``bot-chat[:profile]`` are routing intents, not gateway
+    platforms. Every other token must name a real push-capable Platform; otherwise a typo or
+    dashboard-only ``webui`` target would save successfully and fail on every fire.
+    """
+    if not deliver:
+        return None
+    from cron.scheduler_delivery import _NON_PUSH_ORIGIN_PLATFORMS, parse_bot_chat_deliver_token
+    from gateway.config import Platform
+    for token in str(deliver).split(","):
+        part = token.strip()
+        if not part:
+            continue
+        lower = part.lower()
+        if lower in {"origin", "local", "all"} or parse_bot_chat_deliver_token(part) is not None:
+            continue
+        platform_name = part.split(":", 1)[0].strip().lower()
+        try:
+            platform = Platform(platform_name)
+        except (ValueError, KeyError):
+            return f"unknown delivery platform '{platform_name}' in deliver='{part}'"
+        if platform.value in _NON_PUSH_ORIGIN_PLATFORMS:
+            return (f"delivery platform '{platform_name}' cannot receive pushed cron delivery; "
+                    "use a gateway-connected platform, bot-chat, or local")
+    return None
 
 
 def _validate_bot_chat_deliver(deliver: Optional[str]) -> Optional[str]:

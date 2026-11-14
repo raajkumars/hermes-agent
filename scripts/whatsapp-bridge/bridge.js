@@ -33,6 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedSender, matchesAllowedUser, matchesInboundWhatsAppGroup, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { createOwnerGroupMediaStash, foldPendingMedia, ownerGroupTagMatch } from './owner_group_tag.js';
 import {
   addMentions,
   buildPollPayload,
@@ -76,6 +77,23 @@ const WHATSAPP_DEBUG =
 // On bridge restart that set is empty, so a few in-flight bot replies may
 // briefly look like owner-typed until they age out. Acceptable; we don't
 // persist the set.
+// Opt-in (bot mode, bot shares the owner's number): owner-typed GROUP
+// messages are normally dropped as the bot's own. When this regex is set,
+// such a message is forwarded as normal inbound iff its body matches (e.g.
+// '^\\s*@(paws|pari)\\b'). Echoes of our own /send are still dropped via
+// recentlySentIds, and REPLY_PREFIX-tagged replies are dropped below.
+const OWNER_GROUP_TAG_RE = (() => {
+  const raw = (typeof process !== 'undefined' && process.env && process.env.WHATSAPP_OWNER_GROUP_TAG_PATTERN) || '';
+  if (!raw.trim()) return null;
+  try { return new RegExp(raw, 'i'); } catch (e) { console.error('Invalid WHATSAPP_OWNER_GROUP_TAG_PATTERN:', e.message); return null; }
+})();
+// Owner's untagged group attachments are held (15 min) and folded into their
+// next tagged message; a tagged message also admits the owner's next attachment
+// for 2 min. See owner_group_tag.js.
+const ownerGroupMedia = createOwnerGroupMediaStash({
+  ttlMs: (parseInt(process.env.WHATSAPP_OWNER_GROUP_MEDIA_TTL_S || '', 10) || 900) * 1000,
+  followWindowMs: (parseInt(process.env.WHATSAPP_OWNER_GROUP_FOLLOW_S || '', 10) || 120) * 1000,
+});
 const FORWARD_OWNER_MESSAGES =
   typeof process !== 'undefined' &&
   process.env &&
@@ -548,7 +566,12 @@ async function startSocket() {
 
       // Handle fromMe messages based on mode
       let fromOwner = false;
-      if (msg.key.fromMe) {
+      let ownerGroupTag = false;
+      if (msg.key.fromMe && isGroup && OWNER_GROUP_TAG_RE && WHATSAPP_MODE === 'bot'
+          && !recentlySentIds.has(msg.key.id)) {
+        // Body is checked against OWNER_GROUP_TAG_RE once the event is built.
+        ownerGroupTag = true;
+      } else if (msg.key.fromMe) {
         if (isGroup || chatId.includes('status')) {
           emitDebugEvent({
             stage: 'ignored',
@@ -736,6 +759,37 @@ async function startSocket() {
         lookupQuotedMedia: (quotedChatId, quotedMessageId) => quotedMediaCache.get(quotedChatId, quotedMessageId),
       });
       event.fromOwner = fromOwner;
+
+      if (ownerGroupTag) {
+        const tagMatch = ownerGroupTagMatch({ re: OWNER_GROUP_TAG_RE, event, msg, allowMention: type === 'notify' });
+        const followTag = !tagMatch.tagged && type === 'notify' && event.hasMedia ? ownerGroupMedia.followTag(chatId) : '';
+        if (tagMatch.tagged) {
+          const pending = type === 'notify' ? ownerGroupMedia.take(chatId) : [];
+          if (pending.length) foldPendingMedia(event, pending);
+          if (type === 'notify') ownerGroupMedia.openFollowWindow(chatId, tagMatch.tag);
+          emitDebugEvent({ stage: 'owner_group_tagged', via: tagMatch.via, foldedMedia: pending.length, chatId: redactWhatsAppId(chatId) });
+        } else if (followTag) {
+          // Attachment sent right after a tagged owner message: forward it
+          // addressed with the same tag so the gateway mention gate passes.
+          event.body = `${followTag} ${event.body || ''}`.trim();
+          emitDebugEvent({ stage: 'owner_group_follow_media', mediaType: event.mediaType, chatId: redactWhatsAppId(chatId) });
+        } else {
+          const stashed = type === 'notify' && ownerGroupMedia.stash(chatId, event);
+          if (stashed) {
+            // Also resolvable if the owner quote-replies to it with a tag.
+            quotedMediaCache.remember(chatId, msg.key.id, {
+              body: event.body, hasMedia: event.hasMedia, mediaType: event.mediaType, mediaUrls: event.mediaUrls,
+            });
+          }
+          emitDebugEvent({
+            stage: 'ignored',
+            reason: stashed ? 'from_me_group_untagged_media_held' : 'from_me_group_untagged',
+            mediaType: event.mediaType || '',
+            chatId: redactWhatsAppId(chatId),
+          });
+          continue;
+        }
+      }
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {

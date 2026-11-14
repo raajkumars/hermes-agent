@@ -1598,6 +1598,8 @@ DEFAULT_CONFIG = {
 
     "whatsapp": {
         # reply_prefix: None = built-in "☤ *Hermes Agent*" header; "" disables; \n allowed.
+        "require_mention": True,  # require @mention/reply-to-bot/slash-command to respond in groups
+        "free_response_chats": "",  # comma-separated group JIDs answered without mention
     },
 
     "telegram": {
@@ -1867,6 +1869,10 @@ DEFAULT_CONFIG = {
         "review_dispatch": True,
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # When a worker's primary provider hits a rate limit, end the run and requeue it (the
+        # dispatcher holds that provider's tasks until the reset) instead of failing over to the
+        # fallback provider. False = workers fail over like interactive sessions do.
+        "pause_on_rate_limit": True,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
@@ -1898,6 +1904,10 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Named function-pool concurrency policy. Each mapping entry may name
+        # ``profiles`` and positive ``max_slots`` / ``reserved_slots`` values.
+        # Unknown profiles are routed to the ``engineering`` pool by the dispatcher.
+        "function_pools": {},
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a

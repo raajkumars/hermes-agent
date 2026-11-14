@@ -32,7 +32,16 @@ _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malform
 
 @dataclass
 class _DispatcherSettings:
-    """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
+    """``kanban.*`` dispatch settings, read once at boot (restart to apply).
+
+    Exception: ``max_in_progress`` is overwritten on ``self`` every tick by
+    ``gateway.kanban_watchers._kanban_dispatcher_watcher`` via
+    ``_resolve_live_max_in_progress`` (t_62f24f45) — the boot-resolved value here
+    only seeds the very first tick before that live re-read runs. Every other
+    field is genuinely boot-only; flip one live only with the same care given
+    to the auto-decompose toggle (#49638): a safety knob an operator expects to
+    take effect on the next tick, not after a restart.
+    """
 
     interval: float
     max_spawn: Any
@@ -42,6 +51,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    function_pools: Any
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -115,6 +125,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        function_pools=kanban_cfg.get("function_pools"),
     )
 
 
@@ -186,7 +197,9 @@ class _KanbanDispatcher:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
             conn = _kbc().connect(board=slug)
-            return _kbd().dispatch_once(conn, board=slug, **kwargs)
+            # Approval-adjudication cards are intentionally claimed only here:
+            # the authority validates the worker's parent gateway PID.
+            return _kbd().dispatch_once(conn, board=slug, gateway_dispatcher=True, **kwargs)
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
@@ -235,6 +248,49 @@ class _KanbanDispatcher:
                         conn.close()
         return False
 
+    def starvation_report(self, results=None):
+        """Assess "spawned nothing" across every board, or None if unreadable.
+
+        Mirrors :meth:`ready_nonempty`: the cap bounds the HOST, so running
+        workers on other boards must count toward it or a busy host reads as
+        starved. Returns a ``kanban_db_dispatch.StarvationReport``.
+        """
+        kbd = _kbd()
+        slugs = self._board_slugs()
+        running_by_slug: dict = {}
+        for slug in slugs:
+            conn = None
+            try:
+                conn = _kbc().connect(board=slug)
+                running_by_slug[slug] = kbd.count_running_tasks(conn)
+            except Exception:
+                running_by_slug[slug] = 0
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+        total_running = sum(running_by_slug.values())
+
+        best = None
+        for slug in slugs:
+            conn = None
+            try:
+                conn = _kbc().connect(board=slug)
+                rep = kbd.assess_starvation(
+                    conn, results or [],
+                    extra_running=total_running - running_by_slug.get(slug, 0))
+            except Exception:
+                continue
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+            # Prefer the board that actually has work the dispatcher wanted to
+            # spawn for -- that is the one whose lane counts explain the tick.
+            if best is None or (rep.spawn_expected and not best.spawn_expected):
+                best = rep
+        return best
+
     def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
         """Auto-decompose up to N triage tasks across all boards into ready workgraphs.
 
@@ -278,13 +334,18 @@ class _KanbanDispatcher:
     def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:
         """Decompose one triage task; returns 1 on success, 0 otherwise."""
         try:
-            outcome = _decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decomp.decompose_task(tid, author="auto-decomposer", require_fanout=True)
         except Exception:
             logger.exception("kanban auto-decompose: decompose_task crashed on %s", tid)
             return 0
         if not outcome.ok:
-            # Common no-op reasons (no aux client) must not spam logs every tick.
-            logger.debug("kanban auto-decompose [%s]: %s skipped: %s", slug, tid, outcome.reason)
+            from hermes_cli import kanban_db as _kb, kanban_db_connect as _kbc
+            with _kbc.connect_closing() as conn:
+                _kb.block_task(
+                    conn, tid, kind="needs_input",
+                    reason=outcome.reason or "budget_exhausted: needs split",
+                )
+            logger.info("kanban auto-decompose [%s]: %s parked: %s", slug, tid, outcome.reason)
             return 0
         if outcome.fanout and outcome.child_ids:
             logger.info("kanban auto-decompose [%s]: %s → %d children", slug, tid, len(outcome.child_ids))

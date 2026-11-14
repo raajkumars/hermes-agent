@@ -551,6 +551,24 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_refuses_context_free_card_but_accepts_body_or_triage(monkeypatch, worker_env):
+    """Operator-created cards must carry actionable context or enter triage."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    rejected = json.loads(kt._handle_create({"title": "empty", "assignee": "peer"}))
+    assert "add a body, link a parent, or file it to triage" in rejected["error"]
+
+    with_body = json.loads(kt._handle_create({
+        "title": "described", "body": "Investigate the regression.", "assignee": "peer",
+    }))
+    triage = json.loads(kt._handle_create({
+        "title": "needs scoping", "assignee": "peer", "triage": True,
+    }))
+    assert with_body["ok"] is True
+    assert triage["ok"] is True and triage["status"] == "triage"
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(

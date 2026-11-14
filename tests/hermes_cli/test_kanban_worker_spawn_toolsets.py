@@ -217,3 +217,42 @@ toolsets:
     assert "kanban_complete" in names
     assert "kanban_list" not in names
     assert resolved != ["kanban"]
+
+
+def test_kanban_lifecycle_tools_are_absent_without_dispatcher_owned_task(monkeypatch, tmp_path):
+    """Ordinary chats must not receive Kanban worker lifecycle capabilities.
+
+    The dispatcher adds them only after it has created a worker environment with
+    HERMES_KANBAN_TASK.  A default/global Kanban toolset must not leak those
+    tools into the assignee's normal CLI session.
+    """
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - terminal
+    - web
+toolsets:
+  - hermes-cli
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    from hermes_cli import kanban_db_dispatch as kbd
+    from model_tools import get_tool_definitions
+
+    resolved = kbd._resolve_worker_cli_toolsets(str(profile))
+    assert resolved is not None
+    names = {
+        tool["function"]["name"]
+        for tool in get_tool_definitions(resolved, quiet_mode=True, skip_tool_search_assembly=True)
+    }
+
+    assert "kanban_complete" not in names
+    assert "kanban_block" not in names

@@ -101,3 +101,32 @@ def test_launch_profiles_own_worker_keeps_its_credentials(tmp_path, monkeypatch)
         kanban_db_dispatch._default_spawn(task, str(tmp_path / "ws"))
 
     assert captured and captured[0].get("OPENAI_API_KEY") == "dispatcher-launch-key"
+
+
+def test_worker_loader_env_uses_dispatchers_exec_image_not_runtime_mutation(monkeypatch):
+    """A .env-loaded PYTHONPATH cannot leak into a worker's procfs image."""
+    runtime_env = {
+        "PYTHONPATH": "/runtime/.env",
+        "PYTHONHOME": "/runtime/home",
+        "LD_PRELOAD": "/runtime/library.so",
+    }
+    monkeypatch.setattr(kanban_db_dispatch, "_dispatcher_exec_environ", lambda: {
+        "PYTHONPATH": "/exec/pythonpath",
+        "LD_PRELOAD": "/exec/library.so",
+    })
+
+    kanban_db_dispatch._align_worker_loader_env_with_dispatcher_exec(runtime_env)
+
+    assert runtime_env["PYTHONPATH"] == "/exec/pythonpath"
+    assert runtime_env["LD_PRELOAD"] == "/exec/library.so"
+    assert "PYTHONHOME" not in runtime_env
+
+
+def test_worker_loader_env_stays_unchanged_without_procfs(monkeypatch):
+    """Non-proc platforms retain existing worker behavior; authority stays fail-closed."""
+    runtime_env = {"PYTHONPATH": "/runtime/.env"}
+    monkeypatch.setattr(kanban_db_dispatch, "_dispatcher_exec_environ", lambda: {})
+
+    kanban_db_dispatch._align_worker_loader_env_with_dispatcher_exec(runtime_env)
+
+    assert runtime_env == {"PYTHONPATH": "/runtime/.env"}

@@ -1729,7 +1729,31 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
     from hermes_cli.auth import AuthError
 
     model = jc.model
-    requested = job.get("provider") or jc.cron_default_provider or None
+    # An explicit per-job or fleet-wide cron provider pin is an operator decision; do not
+    # replace it with a pace-based route. Unpinned jobs remain eligible on every new cron fire.
+    _explicit_pin = job.get("provider") or jc.cron_default_provider or None
+    requested = _explicit_pin
+    _global_provider = (
+        str(jc.model_cfg.get("provider") or "").strip() if isinstance(jc.model_cfg, dict) else "")
+    if not _explicit_pin:
+        try:
+            from cron.lifecycle_guard import _current_profile_name
+            from hermes_cli.pacing_governor_session import resolve_new_session_route
+
+            _profile_name = _current_profile_name() or ""
+            if _profile_name and _global_provider:
+                _route = resolve_new_session_route(
+                    jc.cfg, profile_name=_profile_name, default_provider=_global_provider,
+                    cooldown_key=f"profile:{_profile_name}", context=f"cron:{job_id}",
+                )
+                if _route is not None:
+                    requested, model = _route
+                    logger.info(
+                        "Job '%s': pacing governor routed new agent-session -> provider=%s model=%s",
+                        job_id, requested, model,
+                    )
+        except Exception:
+            logger.debug("Job '%s': pacing governor routing skipped", job_id, exc_info=True)
     try:
         # Do NOT pass HERMES_INFERENCE_PROVIDER as `requested`: it would override persisted config
         # and resurrect stale providers for unpinned jobs.

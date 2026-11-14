@@ -57,6 +57,11 @@ NOISY_STATUS_MESSAGES = [
         "⚠ Skipping concurrent compression — another path is already "
         "compressing this session. Will retry after it finishes."
     ),
+    # Internal fallback/switch diagnostics — must never reach messaging surfaces.
+    "⚠️ Rate limited — switching to fallback provider...",
+    "⚠️ Model fallback: claude-sonnet-5 via claude-subscription unavailable (provider failure); using groq/llama-3.3-70b via custom.",
+    "⚠️ Attempt 1 not retryable failed — trying fallback...",
+    "↻ Switched to fallback: gpt-5.6-sol (openai-codex)",
 ]
 
 # Messages that must NEVER be swallowed by the compression-noise filter:
@@ -242,6 +247,39 @@ def test_chat_gateways_keep_normal_answers(platform):
     answer = "Here is the clean summary you asked for."
 
     assert _sanitize_gateway_final_response(platform, answer) == answer
+
+
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_chat_gateways_strip_trailing_provider_detail(platform):
+    """The raw trailing ``Provider said:``/``Details:`` block must not reach chat.
+
+    agent.turn_failure_copy appends raw provider/engine text after an actionable lead. The
+    lead is worth keeping; the tail leaks internals (protocol names, session ids, HTTP
+    bodies) into groups. A protocol-refusal envelope is >400 chars so it misses the
+    provider-error shape check and used to ride through verbatim.
+    """
+    leaked = (
+        "Claude (subscription) rejected this request as malformed, so the model didn't "
+        "answer. Start a clean session with /new or switch models with /model; if it keeps "
+        "happening, run `hermes doctor`.\n\n"
+        "Provider said: MODEL CALL REFUSED: required role protocol was not received for "
+        "this session. (outbound model request lacks required protocol 'kavya' version "
+        "'2026-10-01')"
+    )
+
+    sanitized = _sanitize_gateway_final_response(platform, leaked)
+
+    assert "MODEL CALL REFUSED" not in sanitized
+    assert "'kavya'" not in sanitized
+    assert "Provider said" not in sanitized
+    # The actionable lead survives.
+    assert "rejected this request as malformed" in sanitized
+
+    # A Details: tail is stripped too, and prose mentioning the words mid-answer is untouched.
+    assert "boom" not in _sanitize_gateway_final_response(
+        platform, "Something went wrong.\n\nDetails: boom\n")
+    prose = "Provider said they would confirm by Friday, so the sheet is done."
+    assert _sanitize_gateway_final_response(platform, prose) == prose
 
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)

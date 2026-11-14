@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
-from dataclasses import dataclass
+import os
+import time
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import httpx
@@ -672,16 +676,255 @@ def _call_plugin_usage_hook(profile, base_url: Optional[str], api_key: Optional[
     return None if bounded.timed_out else bounded.value
 
 
+# ── Cross-process 429 backoff + in-process TTL cache (t_a7c7c792) ──────────────────────────
+#
+# Anthropic's OAuth /api/oauth/usage endpoint backs the ONE shared fleet claude-subscription
+# account. Three independent callers hit it through this module's fetchers with no
+# coordination: aos's pacing_governor poll (every 5 min), the gateway `session.usage` RPC
+# (every Desktop/CLI session panel), and `hermes usage`. The governor persists its own 429
+# backoff to a small JSON sidecar, but the other two callers kept calling straight through a
+# governor-recorded backoff window (and a 429 seen by either of THEM was never shared back
+# either), so the upstream Retry-After escalated across polls instead of clearing. This reads
+# and writes the SAME cache, in the SAME schema, aos.pacing_governor.fetch_provider_usage
+# already uses (``{<usage_key>: {"until": epoch_seconds, "reason": str}}``), so a 429 seen by
+# any one of the three callers backs off all of them.
+DEFAULT_RATE_LIMIT_CACHE_PATH = Path(os.environ.get(
+    "HERMES_PACING_RATE_LIMIT_CACHE", "~/.qwickapps/state/provider_pace_ratelimits.json")).expanduser()
+
+# Last-known-good snapshot per provider, so a caller that hits an active backoff window can
+# still show something (with a staleness note) instead of an empty block.
+DEFAULT_USAGE_SNAPSHOT_CACHE_PATH = Path(os.environ.get(
+    "HERMES_ACCOUNT_USAGE_SNAPSHOT_CACHE", "~/.qwickapps/state/account_usage_snapshot_cache.json")).expanduser()
+
+# In-process only (NOT shared across the governor/gateway/CLI processes) -- coalesces a burst
+# of calls a few seconds apart into one fetch, e.g. several Desktop session panels polling the
+# same gateway process. Deliberately short; the cross-process backoff above is what actually
+# protects the upstream endpoint during a 429 window.
+USAGE_FETCH_TTL_S = 45.0
+_in_process_usage_cache: dict[str, tuple[float, Optional[AccountUsageSnapshot]]] = {}
+
+# Caller-supplied provider ids that resolve to the SAME underlying Anthropic OAuth account/
+# endpoint as the "anthropic" usage fetcher above, and therefore must share its fetcher, its
+# 429 backoff, and its snapshot cache. Fleet profiles configure ``provider: claude-subscription``
+# almost universally (t_a7c7c792 round 2) -- without this alias, the two callers that resolve the
+# RAW configured/requested provider id verbatim (the gateway `session.usage` RPC, whose
+# ``agent.provider`` stays "claude-subscription" for a live SDK-backed session since it never
+# talks to api.anthropic.com directly; and `hermes usage` with no ``--provider``, whose
+# ``resolve_requested_provider`` returns the raw config value unmapped) never look up
+# ``_USAGE_FETCHERS["anthropic"]`` at all -- they fall into the plugin-hook branch below, where
+# ``ClaudeSubscriptionProfile`` has no ``fetch_account_usage`` override, so the call silently
+# returns None. That means those two callers never reach (and never benefit from) the
+# backoff/cache this module maintains -- only a caller passing the literal string "anthropic"
+# (e.g. aos's pacing_governor, which maps this itself via its own ``USAGE_PROVIDER_KEY`` before
+# calling in) did. Mirrors ``aos.pacing_governor.USAGE_PROVIDER_KEY`` (kept in sync there by
+# hand today; aos is a standalone-deployable repo that already imports this module dynamically
+# and fails open when hermes core isn't importable at all, so a hard import dependency the other
+# direction isn't appropriate -- see the docstring on ``fetch_provider_usage`` in
+# aos/pacing_governor.py for the mirrored copy).
+_USAGE_KEY_ALIASES: dict[str, str] = {
+    "claude-subscription": "anthropic",
+    "claude": "anthropic",
+    "claude-max": "anthropic",
+    "anthropic-subscription": "anthropic",
+    "codex": "openai-codex",
+}
+
+
+def _resolve_usage_key(provider: Optional[str]) -> str:
+    """Normalize a caller-supplied provider id to the key ``_USAGE_FETCHERS`` and the shared
+    backoff/snapshot caches use. Identity for anything not in ``_USAGE_KEY_ALIASES`` (including
+    unrecognized/plugin provider names, which fall through unchanged to the plugin-hook branch
+    of ``fetch_account_usage``)."""
+    return _USAGE_KEY_ALIASES.get(str(provider or "").strip().lower(), str(provider or "").strip().lower())
+
+
+def _read_json_doc(path: Path) -> dict:
+    """Fail-open ``{}`` on anything (missing file, corrupt JSON, not a dict)."""
+    try:
+        loaded = json.loads(path.read_text())
+        return loaded if isinstance(loaded, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_json_doc(path: Path, doc: dict) -> None:
+    """Atomic write-then-rename, same technique as aos.pacing_governor's sidecar caches."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(doc, indent=2))
+    tmp.replace(path)
+
+
+def active_ratelimit_backoff(
+    usage_key: str, *, now: Optional[float] = None, cache_path: Path = DEFAULT_RATE_LIMIT_CACHE_PATH,
+) -> Optional[dict]:
+    """The still-active backoff entry (``{"until": epoch, "reason": str}``) for ``usage_key``
+    in the shared cross-process cache, or None when absent/expired. Pure read, no network --
+    safe for any caller to check before hitting the network."""
+    now = now if now is not None else time.time()
+    doc = _read_json_doc(cache_path)
+    entry = doc.get(usage_key) if isinstance(doc, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    until = entry.get("until")
+    return entry if isinstance(until, (int, float)) and until > now else None
+
+
+def record_ratelimit_backoff(
+    usage_key: str, retry_after_s: float, *, now: Optional[float] = None,
+    cache_path: Path = DEFAULT_RATE_LIMIT_CACHE_PATH, reason: Optional[str] = None,
+) -> None:
+    """Persist a 429 backoff window for ``usage_key`` so every other caller (governor,
+    gateway, CLI) skips the network call until it clears -- whichever caller sees the 429
+    first. Best-effort: a write failure is swallowed (non-fatal sidecar cache)."""
+    now = now if now is not None else time.time()
+    doc = _read_json_doc(cache_path)
+    doc[usage_key] = {
+        "until": now + retry_after_s,
+        "reason": reason or f"429 rate_limit_error, Retry-After={retry_after_s:.0f}s (seen at {now:.0f})",
+    }
+    try:
+        _write_json_doc(cache_path, doc)
+    except OSError:
+        logger.debug("account_usage: failed to persist rate-limit backoff (non-fatal)", exc_info=True)
+
+
+def _retry_after_seconds(exc: BaseException) -> Optional[float]:
+    """Best-effort ``Retry-After`` (seconds) off an httpx.HTTPStatusError's response, or None.
+    Never raises -- diagnostics only."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = headers.get("retry-after")
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_429(exc: BaseException) -> bool:
+    return getattr(getattr(exc, "response", None), "status_code", None) == 429
+
+
+def _serialize_snapshot_for_cache(snapshot: AccountUsageSnapshot) -> dict:
+    return {
+        "provider": snapshot.provider, "source": snapshot.source, "title": snapshot.title,
+        "plan": snapshot.plan, "fetched_at": snapshot.fetched_at.isoformat(),
+        "windows": [
+            {"label": w.label, "used_percent": w.used_percent,
+             "reset_at": w.reset_at.isoformat() if w.reset_at else None, "detail": w.detail}
+            for w in snapshot.windows
+        ],
+        "details": list(snapshot.details), "unavailable_reason": snapshot.unavailable_reason,
+    }
+
+
+def _deserialize_snapshot_from_cache(doc: dict) -> Optional[AccountUsageSnapshot]:
+    try:
+        windows = tuple(
+            AccountUsageWindow(
+                label=w["label"], used_percent=w.get("used_percent"),
+                reset_at=_parse_dt(w.get("reset_at")), detail=w.get("detail"),
+            )
+            for w in doc.get("windows") or []
+        )
+        return AccountUsageSnapshot(
+            provider=doc["provider"], source=doc.get("source", "cache"),
+            fetched_at=_parse_dt(doc.get("fetched_at")) or _utc_now(),
+            title=doc.get("title", "Account limits"), plan=doc.get("plan"),
+            windows=windows, details=tuple(doc.get("details") or ()),
+            unavailable_reason=doc.get("unavailable_reason"),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _load_cached_snapshot(
+    usage_key: str, *, cache_path: Path = DEFAULT_USAGE_SNAPSHOT_CACHE_PATH,
+) -> Optional[AccountUsageSnapshot]:
+    doc = _read_json_doc(cache_path).get(usage_key)
+    return _deserialize_snapshot_from_cache(doc) if isinstance(doc, dict) else None
+
+
+def _store_cached_snapshot(
+    usage_key: str, snapshot: AccountUsageSnapshot, *, cache_path: Path = DEFAULT_USAGE_SNAPSHOT_CACHE_PATH,
+) -> None:
+    doc = _read_json_doc(cache_path)
+    doc[usage_key] = _serialize_snapshot_for_cache(snapshot)
+    try:
+        _write_json_doc(cache_path, doc)
+    except OSError:
+        logger.debug("account_usage: failed to persist snapshot cache (non-fatal)", exc_info=True)
+
+
+def _stale_snapshot_with_note(
+    snapshot: AccountUsageSnapshot, backoff_entry: dict, *, now: Optional[float] = None,
+) -> AccountUsageSnapshot:
+    """Last-known snapshot annotated with a staleness note -- used when a 429 backoff window
+    is active and the network call is skipped in its favor."""
+    now = now if now is not None else time.time()
+    age_s = max(0.0, now - snapshot.fetched_at.timestamp())
+    until = backoff_entry.get("until")
+    remaining = f", clears in {max(0.0, until - now):.0f}s" if isinstance(until, (int, float)) else ""
+    note = f"Rate-limited upstream — showing cached snapshot from {age_s:.0f}s ago{remaining}."
+    return replace(snapshot, details=tuple(snapshot.details) + (note,))
+
+
 def fetch_account_usage(
     provider: Optional[str], *, base_url: Optional[str] = None, api_key: Optional[str] = None,
 ) -> Optional[AccountUsageSnapshot]:
-    fetcher = _USAGE_FETCHERS.get(str(provider or "").strip().lower())
+    raw_key = str(provider or "").strip().lower()
+    # Normalize aliases (e.g. "claude-subscription" -> "anthropic") for the fetcher lookup and
+    # every cache/backoff key below, so all provider ids that ultimately hit the SAME upstream
+    # account share the SAME gate. The plugin-hook fallback further down still looks up the
+    # RAW id (a real plugin provider is registered under its own name, not an alias target).
+    key = _resolve_usage_key(raw_key)
+    fetcher = _USAGE_FETCHERS.get(key)
+    now = time.time()
+
+    if fetcher is not None:
+        # In-process TTL cache: only coalesces calls within THIS process (USAGE_FETCH_TTL_S).
+        cached_at, cached_snapshot = _in_process_usage_cache.get(key, (0.0, None))
+        if now - cached_at < USAGE_FETCH_TTL_S:
+            return cached_snapshot
+
+        # Cross-process 429 backoff: skip the network call while ANY caller (this one, the
+        # gateway RPC, the CLI, or aos's pacing_governor poll) has a still-active backoff
+        # recorded for this provider, returning the last-known snapshot (annotated) instead
+        # of re-triggering the same 429.
+        backoff = active_ratelimit_backoff(key, now=now, cache_path=DEFAULT_RATE_LIMIT_CACHE_PATH)
+        if backoff is not None:
+            cached = _load_cached_snapshot(key, cache_path=DEFAULT_USAGE_SNAPSHOT_CACHE_PATH)
+            result = (
+                _stale_snapshot_with_note(cached, backoff, now=now) if cached is not None
+                else _snapshot(
+                    key, "rate_limited", [], [],
+                    unavailable_reason=(
+                        f"Rate-limited upstream ({backoff.get('reason', 'no reason recorded')}); "
+                        "no cached snapshot yet."
+                    ),
+                )
+            )
+            _in_process_usage_cache[key] = (now, result)
+            return result
+
     try:
         if fetcher:
-            return fetcher(base_url, api_key)
-        from providers import get_provider_profile
+            snapshot = fetcher(base_url, api_key)
+        else:
+            from providers import get_provider_profile
 
-        profile = get_provider_profile(str(provider or "").strip().lower())
-        return _call_plugin_usage_hook(profile, base_url, api_key) if profile else None
-    except Exception:
-        return None
+            profile = get_provider_profile(key)
+            snapshot = _call_plugin_usage_hook(profile, base_url, api_key) if profile else None
+    except Exception as exc:
+        if fetcher is not None and _is_429(exc):
+            record_ratelimit_backoff(
+                key, _retry_after_seconds(exc) or 300.0, now=now, cache_path=DEFAULT_RATE_LIMIT_CACHE_PATH,
+            )
+        snapshot = None
+    else:
+        if fetcher is not None and snapshot is not None:
+            _store_cached_snapshot(key, snapshot, cache_path=DEFAULT_USAGE_SNAPSHOT_CACHE_PATH)
+    if fetcher is not None:
+        _in_process_usage_cache[key] = (now, snapshot)
+    return snapshot

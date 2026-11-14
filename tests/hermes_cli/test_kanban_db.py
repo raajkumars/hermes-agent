@@ -18,6 +18,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
+from hermes_cli import kanban as kanban_cli
 
 
 @pytest.fixture
@@ -199,7 +200,7 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert kb.claim_task(conn, t) is None
 
         events = kb.list_events(conn, t)
-        assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
+        assert any(e.kind == "scheduled" and e.payload.get("reason") == "run next week" for e in events)
 
 
 
@@ -504,13 +505,16 @@ def test_respawn_guard_blocker_auth_curated_not_open_stem(
         assert kbd.check_respawn_guard(conn, tid) == expected
 
 
-def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
+def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home, monkeypatch):
     """A plain crash's captured stdout is context, not a diagnosis.
 
     ``_classify_dead_worker`` appends the worker's last output to the persisted
     failure text.  A benign command such as ``claude auth status`` must not turn
     an unrelated crash into a permanent auth guard on the next dispatch.
     """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb.time, "time", lambda: 5_000_100)
     with kbc.connect() as conn:
         crashed_id = kb.create_task(conn, title="crashed", assignee="a")
         kb.claim_task(conn, crashed_id)
@@ -549,6 +553,38 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
 
         assert kbd.check_respawn_guard(conn, crashed_id) is None
         assert kbd.check_respawn_guard(conn, spawn_failed_id) == "blocker_auth"
+
+
+def test_respawn_guard_releases_stale_or_local_filesystem_auth_text(kanban_home, monkeypatch):
+    """A repaired auth failure and a local ``Permission denied`` must retry."""
+    import hermes_cli.kanban_db as _kb
+
+    now = 5_000_000
+    with kbc.connect() as conn:
+        stale_id = kb.create_task(conn, title="stale provider failure", assignee="a")
+        local_id = kb.create_task(conn, title="local permission failure", assignee="a")
+        for task_id, error in (
+            (stale_id, "provider authentication failed"),
+            (local_id, "[Errno 13] Permission denied: /var/log/hermes/worker.log"),
+        ):
+            kb.claim_task(conn, task_id)
+            task = kb.get_task(conn, task_id)
+            assert task is not None and task.current_run_id is not None
+            run_id = task.current_run_id
+            conn.execute(
+                "UPDATE task_runs SET outcome='spawn_failed', status='failed', ended_at=? WHERE id=?",
+                (now - 3601, run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?",
+                (error, task_id),
+            )
+        conn.commit()
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now)
+        assert kbd.check_respawn_guard(conn, stale_id) is None
+        assert kbd.check_respawn_guard(conn, local_id) is None
 
 
 def test_infrastructure_spawn_refusal_never_charges_the_card(
@@ -718,6 +754,47 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         assert len(kb.list_comments(conn, t)) == 0
         assert len(kb.list_events(conn, t)) == 0
         assert len(kb.list_runs(conn, t)) == 0
+
+
+def test_sqlite_triggers_audit_direct_writes_and_keep_delete_tombstone(kanban_home):
+    """The forensic ledger is below the helper layer: raw SQL cannot skip it."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="forensic", assignee="alice")
+        parent_id = kb.create_task(conn, title="parent", assignee="alice")
+        replacement_parent_id = kb.create_task(conn, title="replacement", assignee="alice")
+        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent_id, task_id))
+        link_before = conn.execute("SELECT COALESCE(MAX(id), 0) FROM kanban_audit").fetchone()[0]
+        conn.execute(
+            "UPDATE task_links SET parent_id=? WHERE parent_id=? AND child_id=?",
+            (replacement_parent_id, parent_id, task_id),
+        )
+        link_audit = conn.execute(
+            "SELECT detail FROM kanban_audit WHERE id > ? AND table_name='task_links' AND operation='update'",
+            (link_before,),
+        ).fetchone()
+        assert link_audit is not None
+        assert conn.execute("SELECT json_extract(?, '$.old_parent_id')", (link_audit["detail"],)).fetchone()[0] == parent_id
+        assert conn.execute("SELECT json_extract(?, '$.new_parent_id')", (link_audit["detail"],)).fetchone()[0] == replacement_parent_id
+
+        before = conn.execute("SELECT COALESCE(MAX(id), 0) FROM kanban_audit").fetchone()[0]
+        conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", ("local-only", task_id))
+        conn.execute("DELETE FROM task_events WHERE task_id=?", (task_id,))
+        assert kb.delete_task(conn, task_id)
+
+        audit = conn.execute(
+            "SELECT table_name, operation FROM kanban_audit WHERE id > ? AND task_id=? ORDER BY id",
+            (before, task_id),
+        ).fetchall()
+        assert ("tasks", "update") in {(r["table_name"], r["operation"]) for r in audit}
+        assert ("task_events", "delete") in {(r["table_name"], r["operation"]) for r in audit}
+        assert ("tasks", "delete") in {(r["table_name"], r["operation"]) for r in audit}
+        tombstone = conn.execute(
+            "SELECT title, status, assignee FROM task_tombstones WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert tuple(tombstone) == ("forensic", "ready", "alice")
+        with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+            conn.execute("DELETE FROM kanban_audit WHERE task_id=?", (task_id,))
 
 
 
@@ -1562,7 +1639,7 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kbd._resolve_hermes_argv() == [sys.executable, "-P", "-m", "hermes_cli.main"]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
@@ -1664,6 +1741,83 @@ def test_dispatch_max_in_progress_blocks_review_when_at_limit(
 def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> None:
     """Test helper: set a task's status directly."""
     conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+
+
+def test_effective_priority_inherits_descendants_and_ignores_terminal(kanban_home):
+    """A p0 dependency root must outrank ordinary work when it gates p99990."""
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="blocked root", priority=0)
+        urgent = kb.create_task(conn, title="urgent dependent", priority=99990, parents=[root])
+        ordinary = kb.create_task(conn, title="ordinary", priority=100)
+        negative = kb.create_task(conn, title="negative descendant", priority=-5, parents=[root])
+        terminal = kb.create_task(conn, title="terminal descendant", priority=100000, parents=[root])
+        _set_task_status(conn, terminal, "archived")
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (1, root))
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (2, urgent))
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (3, ordinary))
+
+        effective = kb.effective_priorities(conn, [root, urgent, ordinary, negative, terminal])
+        ordered = kb.list_tasks(conn, order_by="priority")
+
+    assert effective[root] == 99990
+    assert effective[urgent] == 99990
+    assert effective[negative] == -5
+    assert effective[terminal] == 100000
+    nonterminal_ids = [task.id for task in ordered if task.status not in ("done", "archived")]
+    assert nonterminal_ids.index(root) < nonterminal_ids.index(ordinary)
+    assert kb.list_tasks(conn, order_by="priority", limit=1)[0].id == root
+
+
+def test_effective_priority_identity_cycle_and_dispatch_order(kanban_home):
+    """No-descendant values remain exact; cycles raise instead of silently degrading."""
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="root", priority=0)
+        urgent = kb.create_task(conn, title="urgent", priority=99990, parents=[root])
+        ordinary = kb.create_task(conn, title="ordinary", priority=100)
+        assert kb.effective_priorities(conn, [ordinary])[ordinary] == 100
+        assert [row["id"] for row in kbd._lane_rows(conn, "ready")][:2] == [root, ordinary]
+
+        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (urgent, root))
+        with pytest.raises(RuntimeError, match="effective priority cycle"):
+            kb.effective_priorities(conn, [root])
+
+
+def test_effective_priority_handles_chain_beyond_recursion_limit(kanban_home):
+    """An acyclic dependency chain cannot become a RecursionError dispatch outage."""
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="root", priority=0)
+        descendant = root
+        for depth in range(1_100):
+            descendant = kb.create_task(conn, title=f"depth-{depth}", priority=0, parents=[descendant])
+        conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (99990, descendant))
+        assert kb.effective_priorities(conn, [root])[root] == 99990
+
+
+def test_effective_priority_reports_dangling_descendant(kanban_home, caplog):
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="root", priority=0)
+        conn.execute(
+            "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (root, "missing-descendant"),
+        )
+        with pytest.raises(RuntimeError, match="missing descendant of"):
+            kb.effective_priorities(conn, [root])
+
+    assert "kanban effective priority integrity failure: missing descendant" in caplog.text
+
+
+def test_list_json_includes_direct_parents(kanban_home, capsys):
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+    args = types.SimpleNamespace(
+        assignee=None, mine=False, status=None, tenant=None, session=None,
+        archived=False, sort="priority", workflow_template_id=None,
+        current_step_key=None, json=True,
+    )
+    assert kanban_cli._cmd_list(args) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert next(row for row in rows if row["id"] == child)["parents"] == [parent]
 
 
 

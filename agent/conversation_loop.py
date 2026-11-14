@@ -1557,7 +1557,11 @@ def _run_conversation_turn(
             continue
         _run_phase(announce_api_call, agent, s)
 
-        s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries
+        # A transient-failover threshold is an attempt budget, not merely a routing hint.
+        # The generic API budget must therefore reach it before the transport route can switch.
+        s.api_start_time, s.retry_count, s.max_retries = (
+            time.time(), 0, max(agent._api_max_retries, getattr(agent, "_transient_retries", 2))
+        )
         s._retry, s.finish_reason, s.response, s.api_kwargs = TurnRetryState(), "stop", None, None
         s.api_request_id = agent._current_api_request_id = f"{s.turn_id}:api:{s.api_call_count}"
 

@@ -171,6 +171,52 @@ class TestUnknownTopLevelKeys:
 
 
 
+class TestFunctionPoolValidation:
+    def _errors(self, pools):
+        return [
+            issue.message
+            for issue in validate_config_structure({"kanban": {"function_pools": pools}})
+            if issue.severity == "error"
+        ]
+
+    def test_pool_container_must_be_a_mapping(self):
+        errors = self._errors(["platform"])
+        assert any("function_pools must be a mapping" in error for error in errors)
+
+    def test_pool_requires_non_negative_integer_limits(self):
+        errors = self._errors({"platform": {"profiles": ["ira"], "max_slots": -1, "reserved_slots": True}})
+        assert any("max_slots must be a non-negative integer" in error for error in errors)
+        assert any("reserved_slots must be a non-negative integer" in error for error in errors)
+
+    def test_reservation_cannot_exceed_a_positive_pool_cap(self):
+        errors = self._errors({"platform": {"profiles": ["ira"], "max_slots": 2, "reserved_slots": 3}})
+        assert any("reserved_slots may not exceed" in error for error in errors)
+
+    def test_duplicate_or_conflicting_profile_membership_is_rejected(self):
+        errors = self._errors({
+            "platform": {"profiles": ["ira", "ira"], "max_slots": 2, "reserved_slots": 0},
+            "engineering": {"profiles": "ira", "max_slots": 2, "reserved_slots": 0},
+        })
+        assert any("repeats 'ira'" in error for error in errors)
+        assert any("assigns 'ira' to both" in error for error in errors)
+
+    def test_profile_mapping_overrides_are_rejected_until_runtime_supports_them(self):
+        errors = self._errors({
+            "platform": {
+                "profiles": {"ira": {"max_slots": 1}},
+                "max_slots": 2,
+                "reserved_slots": 0,
+            },
+        })
+        assert any("profiles mapping overrides are not supported" in error for error in errors)
+
+    def test_profiles_must_be_names_or_a_sequence_of_names(self):
+        errors = self._errors({
+            "platform": {"profiles": ["ira", 1], "max_slots": 2, "reserved_slots": 0},
+        })
+        assert any("profiles must be a profile name or sequence" in error for error in errors)
+
+
 class TestQuotedContainerValues:
     """A list/mapping slot holding one quoted string is ignored by every reader (#83308, #105706)."""
 

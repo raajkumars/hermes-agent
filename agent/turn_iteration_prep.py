@@ -42,10 +42,20 @@ ITERATION_BUDGET_WARNING_TEMPLATE = (
     "iterations. Checkpoint durable progress now, then continue the task; do not stop "
     "solely because of this warning."
 )
+DISPATCHER_WRAPUP_REMAINING_ITERATIONS = 6
+DISPATCHER_WRAPUP_TEMPLATE = (
+    "[SYSTEM NOTICE — mandatory Kanban wrap-up] Only {remaining} iterations remain. "
+    "Stop starting discretionary new work. Use the remaining budget to finish and verify the "
+    "deliverable. Before any lifecycle handoff, write a kanban_comment with the exact workspace "
+    "path, branch name (or 'none'), completed checks, current progress, and one concrete next "
+    "step. Then call kanban_complete only with verified completion evidence, "
+    "kanban_request_review when ready for review, or kanban_block with a concrete blocker. "
+    "Do not end with a plain-text promise."
+)
 
 
 def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
-    """Append the opt-in one-shot warning to the newest tool result."""
+    """Append a one-shot opt-in checkpoint or mandatory worker wrap-up notice."""
     import os
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -53,34 +63,33 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
     if getattr(agent, "_interrupt_requested", False):
         return False
 
+    budget = getattr(agent, "iteration_budget", None)
     ratio = getattr(agent, "budget_warning_ratio", None)
-    kanban_worker = (
+    dispatcher_worker = (
         bool(os.environ.get("HERMES_KANBAN_TASK"))
         and is_dispatcher_owned_worker_context()
-        and "kanban_complete" in getattr(agent, "valid_tool_names", ())
     )
-    if ratio is None and kanban_worker:
-        ratio = 0.9
-    budget = getattr(agent, "iteration_budget", None)
+    wrapup_due = (
+        dispatcher_worker and budget is not None
+        and budget.remaining <= DISPATCHER_WRAPUP_REMAINING_ITERATIONS
+    )
     if (
-        ratio is None
-        or budget is None
+        budget is None
         or budget.max_total <= 1
         or budget.max_total >= sys.maxsize
         or getattr(agent, "_iteration_budget_warning_injected", False)
-        or budget.used < min(ratio * budget.max_total, budget.max_total - 1)
+        or (not wrapup_due and (
+            ratio is None
+            or budget.used < min(ratio * budget.max_total, budget.max_total - 1)
+        ))
     ):
         return False
-    notice = ITERATION_BUDGET_WARNING_TEMPLATE.format(
-        used=budget.used, maximum=budget.max_total
-    )
-    if kanban_worker:
-        notice += (
-            " While tools are still available, call kanban_complete only if all task "
-            "requirements are verified, or kanban_request_review if it is ready for "
-            "review; otherwise persist a kanban_comment handoff and "
-            "continue. A diff or commit alone is not completion evidence."
+    notice = (
+        DISPATCHER_WRAPUP_TEMPLATE.format(remaining=budget.remaining)
+        if wrapup_due else ITERATION_BUDGET_WARNING_TEMPLATE.format(
+            used=budget.used, maximum=budget.max_total
         )
+    )
     # Only the current tool-result tail is mutable; an older turn may already be cached.
     from agent.context_compressor import _DB_PERSISTED_MARKER
     if (not messages or messages[-1].get("role") != "tool"
