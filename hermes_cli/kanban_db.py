@@ -1554,9 +1554,13 @@ def create_task(
                 # A completed/archived parent with a rejecting review verdict
                 # is still a dependency hold. initial_task_state predates the
                 # child row, so re-gate here after the edges exist.
-                if task_status == "ready" and not _parents_satisfied(conn, task_id):
-                    conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
-                    task_status = "todo"
+                blockers = _unsatisfied_parent_details(conn, task_id)
+                if task_status == "ready" and blockers:
+                    task_status, block_kind = _dependency_hold_state(blockers)
+                    conn.execute(
+                        "UPDATE tasks SET status = ?, block_kind = ? WHERE id = ?",
+                        (task_status, block_kind, task_id),
+                    )
                 _append_event(
                     conn,
                     task_id,
@@ -1589,17 +1593,16 @@ def create_task(
                         "blocked",
                         {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
                     )
-                if task_status == "todo":
-                    # Parked behind an open parent: record why, exactly as
-                    # link_tasks does, so the board never shows an unexplained todo.
-                    gating = _unsatisfied_parent_details(conn, task_id)
-                    if gating:
-                        _append_event(
-                            conn,
-                            task_id,
-                            "dependency_wait",
-                            _dependency_wait_payload(gating[0]),
-                        )
+                if task_status in {"todo", "blocked"} and blockers:
+                    # Parked behind an open parent or a terminal rejection:
+                    # record why, exactly as link_tasks does, so the board
+                    # never shows an unexplained dependency wait.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "dependency_wait",
+                        _dependency_wait_payload(blockers[0]),
+                    )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -1862,9 +1865,10 @@ def link_tasks(
         # verdict-aware dependency check used by claim and promotion.
         blockers = _unsatisfied_parent_details(conn, child_id)
         if blockers:
+            hold_status, block_kind = _dependency_hold_state(blockers)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                (child_id,),
+                "UPDATE tasks SET status = ?, block_kind = ? WHERE id = ? AND status = 'ready'",
+                (hold_status, block_kind, child_id),
             )
             gated = cur.rowcount == 1
             if gated:
@@ -2814,7 +2818,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, body, consecutive_failures, max_retries "
+            "SELECT id, status, body, block_kind, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked', 'ready')"
         ).fetchall()
         for row in todo_rows:
@@ -2826,16 +2830,25 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 continue
             blockers = _unsatisfied_parent_details(conn, task_id)
             if cur_status == "ready":
-                if blockers and conn.execute(
-                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                    (task_id,),
-                ).rowcount == 1:
+                if blockers:
+                    hold_status, block_kind = _dependency_hold_state(blockers)
+                    demoted = conn.execute(
+                        "UPDATE tasks SET status = ?, block_kind = ? WHERE id = ? AND status = 'ready'",
+                        (hold_status, block_kind, task_id),
+                    ).rowcount == 1
+                else:
+                    demoted = False
+                if demoted:
                     _append_event(
                         conn, task_id, "dependency_wait",
                         {**_dependency_wait_payload(blockers[0]), "demoted": True},
                     )
                 continue
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+            if (
+                cur_status == "blocked"
+                and row["block_kind"] != "dependency"
+                and _has_sticky_block(conn, task_id)
+            ):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
             if not blockers:
@@ -2908,6 +2921,19 @@ def _parent_verdict_hold(conn: sqlite3.Connection, parent_id: str) -> tuple[bool
     if _REJECTING_REVIEW_SUMMARY_RE.search(summary[:300]):
         return True, "rejection_summary"
     return False, None
+
+
+def _dependency_hold_state(blockers: list[dict[str, Any]]) -> tuple[str, Optional[str]]:
+    """Visible state for dependency blockers.
+
+    An unfinished parent is ordinary scheduler work and stays ``todo``. A
+    terminal parent with a rejecting completed review is an explicit review
+    refusal, so its dependent stays visibly ``blocked`` as a dependency until
+    the parent is superseded, unlinked, or otherwise released.
+    """
+    if any(item["reason"] == "parent_verdict_not_approve" for item in blockers):
+        return "blocked", "dependency"
+    return "todo", None
 
 
 def _approved_parent_supersedes(conn: sqlite3.Connection, child_id: str, held_parent_id: str) -> bool:
@@ -3031,12 +3057,14 @@ def claim_task(
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
-        if not _parents_satisfied(conn, task_id):
+        blockers = _unsatisfied_parent_details(conn, task_id)
+        if blockers:
+            hold_status, block_kind = _dependency_hold_state(blockers)
             conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'", (task_id,),
+                "UPDATE tasks SET status = ?, block_kind = ? "
+                "WHERE id = ? AND status = 'ready'", (hold_status, block_kind, task_id),
             )
-            _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
+            _append_event(conn, task_id, "claim_rejected", _dependency_wait_payload(blockers[0]))
             return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
@@ -3061,10 +3089,13 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        if not _parents_satisfied(conn, task_id):
+        blockers = _unsatisfied_parent_details(conn, task_id)
+        if blockers:
+            hold_status, block_kind = _dependency_hold_state(blockers)
             demoted = conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),
+                "UPDATE tasks SET status = ?, block_kind = ? "
+                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+                (hold_status, block_kind, task_id),
             )
             if demoted.rowcount == 1:
                 _append_event(
@@ -4613,7 +4644,8 @@ def request_changes(
 
         if implementer is not None and not external:
             new_status = _landing_status_after_parents(conn, task_id)
-            assignee_value, block_kind = implementer, None
+            assignee_value = implementer
+            block_kind = "dependency" if new_status == "blocked" else None
         else:
             new_status = "blocked"
             assignee_value = implementer if external else None
@@ -4706,13 +4738,9 @@ def promote_task(
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the
     # first claim silently reverts (#106195). The dependency itself is the knob.
-    parents = conn.execute(
-        "SELECT t.id, t.status FROM tasks t "
-        "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ?", (task_id,),
-    ).fetchall()
-    unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
-    if unsatisfied:
+    blockers = _unsatisfied_parent_details(conn, task_id)
+    if blockers:
+        unsatisfied = [item["id"] for item in blockers]
         return False, (
             f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
             f"(the ready -> running claim re-checks parents, so promotion cannot "
@@ -4760,9 +4788,9 @@ def _reclaim_dangling_run(
 
 
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
-    """``ready`` if every parent is terminal else ``todo`` — the re-gate shared by
-    unblock/reopen so neither can spawn a child whose upstream is unfinished."""
-    return "ready" if _parents_satisfied(conn, task_id) else "todo"
+    """Landing state for unblock/reopen after applying dependency review gates."""
+    blockers = _unsatisfied_parent_details(conn, task_id)
+    return "ready" if not blockers else _dependency_hold_state(blockers)[0]
 
 
 _DELEGATED_APPROVAL_ADJUDICATION_REASON = "awaiting delegated approval adjudication"
@@ -4830,14 +4858,15 @@ def unblock_task(
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        # ``block_kind`` describes a live block only, so no non-blocked row may
-        # retain it. The loop counter deliberately survives: re-blocking
-        # compares against the prior event trail rather than stale row state.
+        # ``block_kind`` describes a live block only. A dependency rejection
+        # remains blocked when its parent still rejects it; all other landing
+        # states clear the live block kind.
         # Failure state and its retry budget are reset by a deliberate unblock.
+        block_kind = "dependency" if new_status == "blocked" else None
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, block_kind = NULL, "
+            "UPDATE tasks SET status = ?, current_run_id = NULL, block_kind = ?, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
+            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, block_kind, task_id),
         )
         if cur.rowcount != 1:
             return False
@@ -4999,11 +5028,14 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         review_event = _latest_event(conn, task_id, "review_requested")
         handoff = _json_dict(_row_get(review_event, "payload"))
         implementer = _nonblank_str(handoff.get("implementer"))
-        params: tuple[Any, ...] = (new_status, *((implementer,) if implementer else ()), task_id)
+        block_kind = "dependency" if new_status == "blocked" else None
+        params: tuple[Any, ...] = (
+            new_status, block_kind, *((implementer,) if implementer else ()), task_id,
+        )
         cur = conn.execute(
             # consecutive_failures deliberately PRESERVED: review reopen is not
             # a success signal; only complete_task resets the breaker (#35072).
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "UPDATE tasks SET status = ?, current_run_id = NULL, block_kind = ?, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
             + (", assignee = ?" if implementer else "")
             + " WHERE id = ? AND status = 'review'",
