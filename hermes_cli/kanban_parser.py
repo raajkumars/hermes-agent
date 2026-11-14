@@ -323,6 +323,9 @@ _SPECS = [
         _arg("--title", help="Replace the task title"),
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Higher numbers dispatch first; default 0."),
+        _arg("--deliverable", metavar="KEY",
+             help="Set the task's own deliverable (must exist in kanban_deliverables); "
+                  "an empty value clears it so the task inherits from open dependents again."),
         _arg("--result", help="Backfilled task result text for a done task"),
         _arg("--completion-contract", metavar="CONTRACT",
              help="Rebind the completion contract (same validation as create: local-only, a real "

@@ -1043,10 +1043,12 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
     contract = getattr(args, "completion_contract", None)
+    deliverable = getattr(args, "deliverable", None)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result, contract)):
-        return _err("kanban edit: provide --title, --body, --priority, --completion-contract, or --result", 2)
+    if all(value is None for value in (title, body, priority, result, contract, deliverable)):
+        return _err("kanban edit: provide --title, --body, --priority, --completion-contract, "
+                    "--deliverable, or --result", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
@@ -1055,7 +1057,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             ok = kb.edit_task(
                 conn, args.task_id, title=title, body=body, priority=priority,
                 result=result, summary=summary, metadata=metadata,
-                completion_contract=contract,
+                completion_contract=contract, deliverable_key=deliverable,
             )
     except ValueError as exc:
         return _err(f"kanban edit: {exc}", 2)

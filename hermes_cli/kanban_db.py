@@ -733,6 +733,8 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Own kanban_deliverables key; None inherits (kanban_db_deliverables).
+    deliverable_key: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -767,6 +769,7 @@ _TASK_OPTIONAL_COLUMNS = (
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "deliverable_key",
 )
 
 
@@ -967,13 +970,27 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Optional key into kanban_deliverables. NULL = inherit the key of the
+    -- nearest open dependent at read time (kanban_db_deliverables).
+    deliverable_key      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
     PRIMARY KEY (parent_id, child_id)
+);
+
+-- Operator-curated deliverable bands. ``rank`` (higher dispatches first) is
+-- independent of free-form tasks.priority so noisy priorities cannot starve
+-- a deliverable.
+CREATE TABLE IF NOT EXISTS kanban_deliverables (
+    key          TEXT PRIMARY KEY,
+    rank         INTEGER NOT NULL DEFAULT 0,
+    owner        TEXT,
+    dod          TEXT,
+    epic_task_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -4000,6 +4017,7 @@ def edit_task(
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    deliverable_key: Optional[str] = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result.
 
@@ -4007,11 +4025,21 @@ def edit_task(
     :func:`validate_contract` that ``create_task`` uses, so a placeholder such as
     ``OWNER/REPO`` can be replaced but never reintroduced. Raises ``ValueError``
     for an invalid value or a task whose state forbids rebinding.
+
+    ``deliverable_key`` sets the task's own deliverable (which then overrides
+    any inherited one); a blank value clears it so the task inherits again.
+    An unknown key raises ``ValueError`` rather than silently ranking at 0.
     """
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
     ]
+    old_deliverable = new_deliverable = None
+    if deliverable_key is not None:
+        from hermes_cli.kanban_db_deliverables import get_deliverable, normalize_key
+        new_deliverable = normalize_key(deliverable_key)
+        if new_deliverable is not None and get_deliverable(conn, new_deliverable) is None:
+            raise ValueError(f"unknown deliverable {new_deliverable!r}; create it first")
     if completion_contract is not None:
         from hermes_cli.kanban_pr_acceptance import validate_contract
         completion_contract = validate_contract(completion_contract)
@@ -4041,6 +4069,12 @@ def edit_task(
             assignments.append("completion_contract = ?")
             params.append(completion_contract)
             changed_fields.append("completion_contract")
+        if deliverable_key is not None:
+            old_deliverable = conn.execute(
+                "SELECT deliverable_key FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()[0] or None
+            assignments.append("deliverable_key = ?")
+            params.append(new_deliverable)
         for field, value in (("title", title), ("body", body), ("priority", priority)):
             if value is not None:
                 assignments.append(f"{field} = ?")
@@ -4057,6 +4091,9 @@ def edit_task(
         )
         if priority is not None:
             _append_event(conn, task_id, "reprioritized", {"priority": priority})
+        if deliverable_key is not None:
+            _append_event(conn, task_id, "deliverable_set",
+                          {"old": old_deliverable, "new": new_deliverable})
         if result is None:
             non_priority_fields = [field for field in changed_fields if field != "priority"]
             if non_priority_fields:
