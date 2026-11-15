@@ -1005,6 +1005,7 @@ SCRATCH_TMP_ENV_VARS = ("TMPDIR", "TMP", "TEMP")
 SCRATCH_DIR_MARKER_ENV = "HERMES_SCRATCH_DIR"
 SCRATCH_MAX_AGE_HOURS = 72
 _SCRATCH_PRUNE_STAMP = ".last_prune"
+_PROFILE_SCRATCH_PRUNE_STAMP = ".last_profile_scratch_prune"
 _SCRATCH_PRUNE_INTERVAL_SECONDS = 3600
 _scratch_pruned_once = False
 
@@ -1217,6 +1218,27 @@ def prune_profile_scratch_dirs(
             continue
         removed += prune_scratch_dir(home / "cache" / "scratch", max_age_hours)
     return removed
+
+
+def prune_profile_scratch_dirs_once(profiles_dir: Path | None = None) -> int:
+    """Run the host-wide profile scratch janitor at most once per hour.
+
+    The stamp is held at the profiles root so separate one-shot dispatcher
+    processes share the same throttle without creating any profile homes.
+    """
+    import time
+    root = profiles_dir if profiles_dir is not None else get_default_hermes_root() / "profiles"
+    stamp = root / _PROFILE_SCRATCH_PRUNE_STAMP
+    try:
+        if time.time() - stamp.stat().st_mtime < _SCRATCH_PRUNE_INTERVAL_SECONDS:
+            return 0
+    except OSError:
+        pass
+    try:
+        stamp.touch()
+    except OSError:
+        return 0
+    return prune_profile_scratch_dirs(root)
 
 
 def _prune_scratch_dir_once(scratch: Path) -> None:
