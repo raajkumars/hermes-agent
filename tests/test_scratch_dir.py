@@ -9,7 +9,12 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_constants import apply_scratch_tmp_env, get_scratch_dir, prune_scratch_dir
+from hermes_constants import (
+    apply_scratch_tmp_env,
+    get_scratch_dir,
+    prune_profile_scratch_dirs,
+    prune_scratch_dir,
+)
 
 
 def test_scratch_env_follows_home_and_respects_user_tmpdir(tmp_path):
@@ -56,6 +61,39 @@ def test_prune_removes_only_stale_top_level_entries(tmp_path):
     os.utime(stale, (ancient, ancient))
     assert prune_scratch_dir(scratch) == 1
     assert not stale.exists() and fresh.exists()
+
+
+def test_profile_scratch_prune_reclaims_stale_entries_without_touching_non_profiles(tmp_path):
+    profiles = tmp_path / "profiles"
+    profile_scratch = profiles / "active" / "cache" / "scratch"
+    stale = profile_scratch / "stale"
+    stale.mkdir(parents=True)
+    (profiles / "active" / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    ignored = profiles / "stray" / "cache" / "scratch" / "stale"
+    ignored.mkdir(parents=True)
+    ancient = time.time() - 100 * 3600
+    os.utime(stale, (ancient, ancient))
+    os.utime(ignored, (ancient, ancient))
+
+    assert prune_profile_scratch_dirs(profiles) == 1
+    assert not stale.exists()
+    assert ignored.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+def test_profile_scratch_prune_does_not_follow_profile_home_symlink(tmp_path):
+    profiles = tmp_path / "profiles"
+    external = tmp_path / "external-profile"
+    stale = external / "cache" / "scratch" / "stale"
+    stale.mkdir(parents=True)
+    (external / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    (profiles / "linked").parent.mkdir()
+    (profiles / "linked").symlink_to(external, target_is_directory=True)
+    ancient = time.time() - 100 * 3600
+    os.utime(stale, (ancient, ancient))
+
+    assert prune_profile_scratch_dirs(profiles) == 0
+    assert stale.exists()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory modes")
