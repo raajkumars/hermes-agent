@@ -3705,6 +3705,14 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
+def _maybe_prune_profile_scratch_dirs() -> None:
+    """Run the persistently throttled host-wide scratch janitor."""
+    # A dormant profile never reaches get_scratch_dir() to run its lazy prune.
+    # The host-wide dispatcher is the one process guaranteed to see active work.
+    from hermes_constants import prune_profile_scratch_dirs_once
+    prune_profile_scratch_dirs_once()
+
+
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -3718,6 +3726,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         raise ValueError(f"task {task.id} has no assignee")
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    _maybe_prune_profile_scratch_dirs()
 
     profile_arg = normalize_profile_name(task.assignee)
 

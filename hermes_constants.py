@@ -1005,6 +1005,7 @@ SCRATCH_TMP_ENV_VARS = ("TMPDIR", "TMP", "TEMP")
 SCRATCH_DIR_MARKER_ENV = "HERMES_SCRATCH_DIR"
 SCRATCH_MAX_AGE_HOURS = 72
 _SCRATCH_PRUNE_STAMP = ".last_prune"
+_PROFILE_SCRATCH_PRUNE_STAMP = ".last_profile_scratch_prune"
 _SCRATCH_PRUNE_INTERVAL_SECONDS = 3600
 _scratch_pruned_once = False
 
@@ -1189,6 +1190,55 @@ def prune_scratch_dir(scratch: Path | None = None, max_age_hours: float = SCRATC
         except OSError:
             continue
     return removed
+
+
+def prune_profile_scratch_dirs(
+    profiles_dir: Path | None = None,
+    max_age_hours: float = SCRATCH_MAX_AGE_HOURS,
+) -> int:
+    """Prune stale scratch entries for every real named profile without creating directories.
+
+    A profile that has not started a Hermes process recently cannot run its own lazy
+    scratch pruning hook. The dispatcher is host-wide, so it is the right place to
+    reclaim those abandoned top-level entries. Only profile homes with an identity
+    marker are visited; arbitrary directories below ``profiles/`` remain untouched.
+    """
+    root = profiles_dir if profiles_dir is not None else get_default_hermes_root() / "profiles"
+    try:
+        homes = list(root.iterdir())
+    except OSError:
+        return 0
+    removed = 0
+    for home in homes:
+        # A profile-home symlink could point outside ``profiles/``. Scratch
+        # pruning is destructive, so do not follow it even when its target is
+        # otherwise a valid profile home.
+        if (home.name.startswith(".") or home.is_symlink() or not home.is_dir()
+                or not named_profile_has_identity(home)):
+            continue
+        removed += prune_scratch_dir(home / "cache" / "scratch", max_age_hours)
+    return removed
+
+
+def prune_profile_scratch_dirs_once(profiles_dir: Path | None = None) -> int:
+    """Run the host-wide profile scratch janitor at most once per hour.
+
+    The stamp is held at the profiles root so separate one-shot dispatcher
+    processes share the same throttle without creating any profile homes.
+    """
+    import time
+    root = profiles_dir if profiles_dir is not None else get_default_hermes_root() / "profiles"
+    stamp = root / _PROFILE_SCRATCH_PRUNE_STAMP
+    try:
+        if time.time() - stamp.stat().st_mtime < _SCRATCH_PRUNE_INTERVAL_SECONDS:
+            return 0
+    except OSError:
+        pass
+    try:
+        stamp.touch()
+    except OSError:
+        return 0
+    return prune_profile_scratch_dirs(root)
 
 
 def _prune_scratch_dir_once(scratch: Path) -> None:
