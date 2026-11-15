@@ -77,6 +77,7 @@ class TestContinuationRepetitionGuard:
 
         assert result["completed"] is False
         assert result["partial"] is True
+        assert result["failure_reason"] == "repetition_loop"
         assert "Repetition" in (result["final_response"] or "")
         # The pathological fragment must NOT be appended to the history.
         assert not any(

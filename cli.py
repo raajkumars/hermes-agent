@@ -183,6 +183,7 @@ from hermes_cli.cli_terminal_input import (  # noqa: F401,E402
 from hermes_cli.cli_single_query import (  # noqa: F401,E402
     _TERMINAL_PROVIDER_REASONS,
     _TRANSIENT_PROVIDER_REASONS,
+    _block_kanban_capacity_exhaustion,
     _collect_kanban_task_images,
     _configure_quiet_agent,
     _install_single_query_signal_handlers,
