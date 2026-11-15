@@ -130,6 +130,11 @@ def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
         return None, "unknown task id"
     if task.status != "triage":
         return None, f"task is not in triage (status={task.status!r})"
+    # A human-input block remains authoritative even if a historical writer
+    # left the task in triage.  Automated specification/decomposition must not
+    # resume it or create children until an explicit unblock.
+    if task.block_kind == "needs_input":
+        return None, "task is blocked pending human input"
     return task, ""
 
 

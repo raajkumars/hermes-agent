@@ -257,3 +257,23 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_needs_input_triage_task_is_not_sent_to_decomposer(kanban_home):
+    """A stale triage status must not reopen the explicit human-input lane."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="waiting for operator", triage=True)
+        conn.execute("UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?", (tid,))
+        conn.commit()
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok is False
+    assert outcome.reason == "task is blocked pending human input"
+    call_llm.assert_not_called()
+    with kbc.connect() as conn:
+        children = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?", (tid,)
+        ).fetchall()
+    assert children == []
+
+
