@@ -74,3 +74,9 @@ def test_gateway_dispatcher_stuck_warning_names_guard_reason(monkeypatch, caplog
     stuck = [r.getMessage() for r in caplog.records if "dispatcher stuck" in r.getMessage()]
     assert stuck, [r.getMessage() for r in caplog.records]
     assert "Last tick held back: active_pr=1." in stuck[0]
+
+
+def test_describe_suppression_names_sticky_respawn_cap():
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    assert kbd.describe_suppression([kbd.DispatchResult(respawn_cap_blocked=True)]) == "respawn_cap=1"
