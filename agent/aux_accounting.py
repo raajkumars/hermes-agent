@@ -44,7 +44,7 @@ def reset_accounting_context(token) -> None:
 
 def record_aux_usage(
     response: Any, task: Optional[str], *, provider: Optional[str] = None,
-    base_url: Optional[str] = None,
+    base_url: Optional[str] = None, api_key: Optional[str] = None,
 ) -> None:
     """Record an auxiliary response's token usage against the ambient session.
 
@@ -76,7 +76,9 @@ def record_aux_usage(
         model = str(getattr(response, "model", "") or "") or "unknown"
         estimated_cost = None
         try:
-            cost = estimate_usage_cost(model, usage, provider=provider, base_url=base_url)
+            cost = estimate_usage_cost(
+                model, usage, provider=provider, base_url=base_url, api_key=api_key,
+            )
             if cost.amount_usd is not None:
                 estimated_cost = float(cost.amount_usd)
         except Exception:
