@@ -63,6 +63,32 @@ def _run(outcome="completed", run_id=1, error=None):
     }
 
 
+def test_dependency_stranded_reports_terminal_parent_graph():
+    diagnostics = kd.compute_task_diagnostics(
+        _task(id="t_child", status="todo"), [], [], now=100,
+        graph={"parents": [{"id": "t_done", "status": "done"}, {"id": "t_archived", "status": "archived"}]},
+    )
+
+    stranded = [diagnostic for diagnostic in diagnostics if diagnostic.kind == "dependency_stranded"]
+
+    assert len(stranded) == 1
+    assert stranded[0].data == {"terminal_parent_ids": ["t_done", "t_archived"]}
+
+
+def test_dependency_stranded_ignores_open_or_parentless_todo_graphs():
+    assert not any(
+        diagnostic.kind == "dependency_stranded"
+        for diagnostic in kd.compute_task_diagnostics(
+            _task(status="todo"), [], [], now=100,
+            graph={"parents": [{"id": "t_open", "status": "running"}]},
+        )
+    )
+    assert not any(
+        diagnostic.kind == "dependency_stranded"
+        for diagnostic in kd.compute_task_diagnostics(_task(status="todo"), [], [], now=100, graph={"parents": []})
+    )
+
+
 # ---------------------------------------------------------------------------
 # Each rule — positive + negative + clearing
 # ---------------------------------------------------------------------------
