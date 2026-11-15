@@ -13,7 +13,8 @@ from hermes_cli.kanban_db_connect import connect
 
 @pytest.fixture
 def github(tmp_path, monkeypatch):
-    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": []}
+    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": [],
+             "pr_state": "OPEN", "merged_at": None}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -23,7 +24,8 @@ def github(tmp_path, monkeypatch):
                 required_checks = [] if state.get("no_protection") else [
                     {"context": "required", "app": {"databaseId": 1}}]
                 value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                    "headRefOid": sha, "baseRefName": "main", "state": state["pr_state"],
+                    "mergedAt": state["merged_at"],
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": required_checks}}}}}}
             elif "/rules/branches/" in self.path:
                 if state.get("rules_403"):
@@ -34,10 +36,11 @@ def github(tmp_path, monkeypatch):
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
                        "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
+                       "started_at": "2026-11-15T03:00:00Z",
                        "html_url": "https://github.com/acme/repo/actions/runs/42"}
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
-                runs = [] if state.get("missing") else [run]
+                runs = [] if state.get("missing") else state.get("runs", [run])
                 value = [{"total_count": 100 + len(runs), "check_runs": [
                     {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
                     for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
@@ -48,7 +51,9 @@ def github(tmp_path, monkeypatch):
             elif "/statuses" in self.path:
                 value = [[]]
             elif "/pulls/" in self.path:
-                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+                value = {"head": {"sha": sha}, "base": {"ref": "main"},
+                         "state": "closed" if state["pr_state"] == "MERGED" else "open",
+                         "merged": state["pr_state"] == "MERGED"}
             else:
                 self.send_error(404)
                 return
@@ -142,6 +147,64 @@ def test_pr_completion_falls_back_to_head_sha_check_runs_on_rulesets_403(github)
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))]
         assert receipts[-1]["acceptance_basis"] == "head-sha-check-runs"
         assert "No check runs on the head commit" in receipts[-1]["detail"]
+
+
+@pytest.mark.linux_only
+def test_merged_pr_head_sha_acceptance_ignores_post_merge_check_runs(github):
+    """Only checks that started before merge could have informed the merge decision.
+
+    Closing-workflow runs share the PR head SHA but are not merge evidence.
+    """
+    def run(identifier, name, conclusion, started_at):
+        return {"id": identifier, "name": name, "head_sha": "a" * 40,
+                "app": {"id": 1}, "status": "completed", "conclusion": conclusion,
+                "started_at": started_at,
+                "html_url": f"https://github.com/acme/repo/actions/runs/{identifier}"}
+
+    with connect() as conn:
+        pre_merge_successes = [run(i, f"validation-{i}", "success", "2026-11-15T03:07:00Z")
+                               for i in range(1, 10)]
+        post_merge_failure = run(10, "Cleanup Merged Branch", "failure", "2026-11-15T03:08:00Z")
+        github.update(pr_state="MERGED", merged_at="2026-11-15T03:07:52Z",
+                      rules_403=True, no_protection=True,
+                      runs=pre_merge_successes + [post_merge_failure])
+        tid = kb.create_task(conn, title="merged-post-check", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        assert receipt["classification"] == "success"
+        assert receipt["post_merge_ignored"] == [{"name": "Cleanup Merged Branch", "id": 10,
+            "url": "https://github.com/acme/repo/actions/runs/10", "conclusion": "failure"}]
+
+        same_second_failure = run(13, "Cleanup Merge Boundary", "failure", "2026-11-15T03:07:52Z")
+        github.update(runs=pre_merge_successes + [same_second_failure])
+        tid = kb.create_task(conn, title="merged-boundary-check", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        assert receipt["post_merge_ignored"] == [{"name": "Cleanup Merge Boundary", "id": 13,
+            "url": "https://github.com/acme/repo/actions/runs/13", "conclusion": "failure"}]
+
+        github.update(runs=[run(11, "validation", "failure", "2026-11-15T03:07:00Z"), post_merge_failure])
+        tid = kb.create_task(conn, title="merged-pre-failure", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+
+        github.update(pr_state="OPEN", merged_at=None,
+                      runs=[run(12, "validation", "failure", "2026-11-15T03:08:00Z")])
+        tid = kb.create_task(conn, title="open-failure", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+
+        github.update(pr_state="MERGED", merged_at="2026-11-15T03:07:52Z", runs=[post_merge_failure])
+        tid = kb.create_task(conn, title="merged-only-post-check", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        assert "began after merge" in receipt["detail"]
 
 
 @pytest.mark.linux_only
