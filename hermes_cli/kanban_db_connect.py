@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import random
 import re
 import secrets
@@ -1204,6 +1205,55 @@ def _main_db_file(conn: sqlite3.Connection) -> Optional[str]:
     return None
 
 
+class KanbanDbHeaderCorruptionError(sqlite3.DatabaseError):
+    """The main Kanban database header changed while a connection remained open."""
+
+
+def _read_main_db_header_from_live_fd(path: str) -> bytes | None:
+    """Return the header through an existing same-inode FD without opening the DB.
+
+    POSIX closes are process-wide advisory-lock cancellation points, so a raw
+    ``open()`` is unsafe while SQLite owns the file. ``pread()`` does not alter
+    an FD's stream position and works through a live descriptor. The descriptor
+    need not be SQLite-owned: the invariant is the file header itself, which
+    avoids treating an unrelated reader's offset as board corruption.
+    """
+    try:
+        expected = os.stat(path)
+        entries = list(Path("/proc/self/fd").iterdir())
+    except OSError:
+        return None
+    expected_id = expected.st_dev, expected.st_ino
+    for entry in entries:
+        try:
+            fd = int(entry.name)
+            before = os.fstat(fd)
+            if (before.st_dev, before.st_ino) != expected_id:
+                continue
+            header = os.pread(fd, len(_SQLITE_HEADER), 0)
+            # The FD can be recycled between fstat and pread; only trust a
+            # second matching fstat, otherwise continue the best-effort scan.
+            after = os.fstat(fd)
+            if (after.st_dev, after.st_ino) == expected_id:
+                return header
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _assert_main_db_header_intact(conn: sqlite3.Connection) -> None:
+    """Refuse a write when a live Kanban DB's SQLite magic was overwritten."""
+    path = _main_db_file(conn)
+    if not path:
+        return
+    header = _read_main_db_header_from_live_fd(path)
+    if header is not None and header != _SQLITE_HEADER:
+        raise KanbanDbHeaderCorruptionError(
+            f"refusing Kanban DB write: SQLite header magic changed for {path}; "
+            "the board may have been overwritten by foreign I/O. Repair or restore it before retrying."
+        )
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """IMMEDIATE write transaction; a claim CAS inside is atomic — at most one
@@ -1216,6 +1266,10 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     since those side effects would fire while the outer txn can still roll back.
     """
     _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
+    # Check before every write boundary, including savepoints. A TLS BIO can
+    # overwrite the header through a recycled SQLite fd after the connection
+    # opened; detect that exact corruption without penalizing unrelated readers.
+    _assert_main_db_header_intact(conn)
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(
@@ -1248,6 +1302,10 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         raise
     else:
         try:
+            # A foreign writer can race after BEGIN IMMEDIATE; refuse COMMIT so
+            # this transaction cannot publish further board changes after the
+            # guard detects an overwritten database header.
+            _assert_main_db_header_intact(conn)
             _execute_boundary_with_retry(conn, "COMMIT")
         except Exception:
             # COMMIT exhausted retries with the txn still open; roll back so the
