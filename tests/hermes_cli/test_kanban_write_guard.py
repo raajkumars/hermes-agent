@@ -53,13 +53,8 @@ def test_connect_raises_for_explicit_db_path_under_real_root():
 
 
 @pytest.mark.linux_only
-def test_write_txn_refuses_nonzero_offset_on_live_kanban_fd(tmp_path, monkeypatch):
-    """A TLS BIO writing through a recycled SQLite fd advances its offset.
-
-    The guard must fail before BEGIN IMMEDIATE, leaving the requested mutation
-    uncommitted instead of silently publishing data after foreign I/O touched
-    the board descriptor.
-    """
+def test_write_txn_allows_unrelated_nonzero_offset_on_same_db(tmp_path, monkeypatch):
+    """A backup/inspection FD must not be mistaken for SQLite descriptor reuse."""
     _allow_tmp_kanban_db(monkeypatch, tmp_path)
     home = tmp_path / "hermes_home"
     home.mkdir()
@@ -69,11 +64,34 @@ def test_write_txn_refuses_nonzero_offset_on_live_kanban_fd(tmp_path, monkeypatc
     with kbc.connect_closing(db_path) as conn:
         with db_path.open("r+b") as foreign_file:
             foreign_file.seek(29)
-            with pytest.raises(kbc.KanbanDbFdReuseError, match="non-zero file offset"):
+            with kbc.write_txn(conn):
+                conn.execute(
+                    "INSERT INTO tasks (id, title, status, created_at) "
+                    "VALUES ('t-unrelated-fd', 'must commit', 'ready', 1)"
+                )
+
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE id = 't-unrelated-fd'").fetchone()[0] == 1
+
+
+@pytest.mark.linux_only
+def test_write_txn_refuses_live_db_with_overwritten_header(tmp_path, monkeypatch):
+    """Foreign I/O that overwrites the live SQLite header cannot be committed."""
+    _allow_tmp_kanban_db(monkeypatch, tmp_path)
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    db_path = home / "kanban.db"
+
+    with kbc.connect_closing(db_path) as conn:
+        changes_before = conn.total_changes
+        with db_path.open("r+b") as foreign_file:
+            foreign_file.write(b"X")
+            foreign_file.flush()
+            with pytest.raises(kbc.KanbanDbHeaderCorruptionError, match="header magic changed"):
                 with kbc.write_txn(conn):
                     conn.execute(
                         "INSERT INTO tasks (id, title, status, created_at) "
-                        "VALUES ('t-fd-reuse', 'must not commit', 'ready', 1)"
+                        "VALUES ('t-overwritten-header', 'must not commit', 'ready', 1)"
                     )
 
-        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE id = 't-fd-reuse'").fetchone()[0] == 0
+        assert conn.total_changes == changes_before

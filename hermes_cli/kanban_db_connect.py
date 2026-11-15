@@ -1205,70 +1205,52 @@ def _main_db_file(conn: sqlite3.Connection) -> Optional[str]:
     return None
 
 
-class KanbanDbFdReuseError(sqlite3.DatabaseError):
-    """A Kanban DB descriptor has a non-zero stream offset.
+class KanbanDbHeaderCorruptionError(sqlite3.DatabaseError):
+    """The main Kanban database header changed while a connection remained open."""
 
-    SQLite uses positional I/O for database pages, so its descriptors normally
-    remain at offset zero. A changed offset means another subsystem performed a
-    plain ``read()`` or ``write()`` through a reused descriptor; do not allow a
-    Kanban mutation to make that cross-subsystem corruption durable.
+
+def _read_main_db_header_from_live_fd(path: str) -> bytes | None:
+    """Return the header through an existing same-inode FD without opening the DB.
+
+    POSIX closes are process-wide advisory-lock cancellation points, so a raw
+    ``open()`` is unsafe while SQLite owns the file. ``pread()`` does not alter
+    an FD's stream position and works through a live descriptor. The descriptor
+    need not be SQLite-owned: the invariant is the file header itself, which
+    avoids treating an unrelated reader's offset as board corruption.
     """
-
-
-def _nonzero_main_db_fd_positions(path: str) -> list[tuple[int, int]]:
-    """Best-effort Linux ``/proc`` scan for non-zero descriptors to ``path``.
-
-    This deliberately uses only descriptor metadata: opening the database for a
-    byte probe while SQLite has it open can release this process's POSIX locks.
-    A TLS BIO that retained a recycled SQLite fd advances that fd's kernel file
-    position; SQLite's own page I/O does not. Unsupported platforms and raced
-    descriptors fail open here, while Linux production fails closed on a hit.
-    """
-    fd_dir = Path("/proc/self/fd")
-    fdinfo_dir = Path("/proc/self/fdinfo")
     try:
         expected = os.stat(path)
-        entries = list(fd_dir.iterdir())
+        entries = list(Path("/proc/self/fd").iterdir())
     except OSError:
-        return []
-
-    bad: list[tuple[int, int]] = []
+        return None
+    expected_id = expected.st_dev, expected.st_ino
     for entry in entries:
         try:
             fd = int(entry.name)
-        except ValueError:
-            continue
-        try:
-            target = entry.stat()
-            if (target.st_dev, target.st_ino) != (expected.st_dev, expected.st_ino):
+            before = os.fstat(fd)
+            if (before.st_dev, before.st_ino) != expected_id:
                 continue
-            pos = None
-            for line in (fdinfo_dir / entry.name).read_text(encoding="ascii").splitlines():
-                if line.startswith("pos:"):
-                    pos = int(line.partition(":")[2].strip())
-                    break
-            if pos not in (None, 0):
-                bad.append((fd, pos))
-        except (OSError, ValueError, UnicodeError):
-            # A descriptor can disappear or be reused while this best-effort
-            # scan runs. A stable non-zero observation is the only fail-closed
-            # condition; transient scan races are not board corruption.
+            header = os.pread(fd, len(_SQLITE_HEADER), 0)
+            # The FD can be recycled between fstat and pread; only trust a
+            # second matching fstat, otherwise continue the best-effort scan.
+            after = os.fstat(fd)
+            if (after.st_dev, after.st_ino) == expected_id:
+                return header
+        except (OSError, ValueError):
             continue
-    return bad
+    return None
 
 
-def _assert_main_db_fd_positions_zero(conn: sqlite3.Connection) -> None:
-    """Reject a write when any live descriptor for its main DB was repurposed."""
+def _assert_main_db_header_intact(conn: sqlite3.Connection) -> None:
+    """Refuse a write when a live Kanban DB's SQLite magic was overwritten."""
     path = _main_db_file(conn)
     if not path:
         return
-    bad = _nonzero_main_db_fd_positions(path)
-    if bad:
-        rendered = ", ".join(f"fd {fd} pos {pos}" for fd, pos in bad)
-        raise KanbanDbFdReuseError(
-            "refusing Kanban DB write: non-zero file offset on database descriptor(s) "
-            f"for {path}: {rendered}. This indicates foreign I/O through a reused fd; "
-            "stop the owning worker and repair/restore the board before retrying."
+    header = _read_main_db_header_from_live_fd(path)
+    if header is not None and header != _SQLITE_HEADER:
+        raise KanbanDbHeaderCorruptionError(
+            f"refusing Kanban DB write: SQLite header magic changed for {path}; "
+            "the board may have been overwritten by foreign I/O. Repair or restore it before retrying."
         )
 
 
@@ -1284,10 +1266,10 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     since those side effects would fire while the outer txn can still roll back.
     """
     _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
-    # Check before every write boundary, including savepoints. This catches a
-    # TLS BIO (or similar foreign owner) that retained a recycled SQLite fd and
-    # advanced its file offset before any Kanban mutation can proceed.
-    _assert_main_db_fd_positions_zero(conn)
+    # Check before every write boundary, including savepoints. A TLS BIO can
+    # overwrite the header through a recycled SQLite fd after the connection
+    # opened; detect that exact corruption without penalizing unrelated readers.
+    _assert_main_db_header_intact(conn)
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(
@@ -1322,8 +1304,8 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         try:
             # A foreign writer can race after BEGIN IMMEDIATE; refuse COMMIT so
             # this transaction cannot publish further board changes after the
-            # guard detects the reused descriptor.
-            _assert_main_db_fd_positions_zero(conn)
+            # guard detects an overwritten database header.
+            _assert_main_db_header_intact(conn)
             _execute_boundary_with_retry(conn, "COMMIT")
         except Exception:
             # COMMIT exhausted retries with the txn still open; roll back so the
