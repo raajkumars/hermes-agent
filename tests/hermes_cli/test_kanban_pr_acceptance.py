@@ -151,7 +151,10 @@ def test_pr_completion_falls_back_to_head_sha_check_runs_on_rulesets_403(github)
 
 @pytest.mark.linux_only
 def test_merged_pr_head_sha_acceptance_ignores_post_merge_check_runs(github):
-    """Only checks that started before merge could have informed the merge decision."""
+    """Only checks that started before merge could have informed the merge decision.
+
+    Closing-workflow runs share the PR head SHA but are not merge evidence.
+    """
     def run(identifier, name, conclusion, started_at):
         return {"id": identifier, "name": name, "head_sha": "a" * 40,
                 "app": {"id": 1}, "status": "completed", "conclusion": conclusion,
