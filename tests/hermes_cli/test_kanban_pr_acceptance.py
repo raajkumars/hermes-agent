@@ -177,6 +177,16 @@ def test_merged_pr_head_sha_acceptance_ignores_post_merge_check_runs(github):
         assert receipt["post_merge_ignored"] == [{"name": "Cleanup Merged Branch", "id": 10,
             "url": "https://github.com/acme/repo/actions/runs/10", "conclusion": "failure"}]
 
+        same_second_failure = run(13, "Cleanup Merge Boundary", "failure", "2026-11-15T03:07:52Z")
+        github.update(runs=pre_merge_successes + [same_second_failure])
+        tid = kb.create_task(conn, title="merged-boundary-check", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        assert receipt["post_merge_ignored"] == [{"name": "Cleanup Merge Boundary", "id": 13,
+            "url": "https://github.com/acme/repo/actions/runs/13", "conclusion": "failure"}]
+
         github.update(runs=[run(11, "validation", "failure", "2026-11-15T03:07:00Z"), post_merge_failure])
         tid = kb.create_task(conn, title="merged-pre-failure", completion_contract="acme/repo")
         assert not kb.complete_task(conn, tid, result="done",

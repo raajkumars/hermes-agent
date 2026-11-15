@@ -97,7 +97,10 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
                 eligible_runs = []
                 for run in runs:
                     started_at = _parse_github_timestamp(run.get("started_at"))
-                    if started_at > merged_at:
+                    # GitHub timestamps are second-granular. A run timestamped in
+                    # the same second as merge cannot be proved to have informed
+                    # the merge, so grade only runs that began strictly before it.
+                    if started_at >= merged_at:
                         receipt["post_merge_ignored"].append({
                             "name": run["name"], "id": run["id"], "url": run.get("html_url"),
                             "conclusion": run.get("conclusion"),
