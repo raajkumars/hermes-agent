@@ -9,6 +9,7 @@ protocol violation (#111770, #101800; salvage of #110917 / #97623).
 from __future__ import annotations
 
 from types import SimpleNamespace
+from contextlib import nullcontext
 
 import pytest
 
@@ -72,6 +73,35 @@ def test_dispatcher_spawned_worker_keeps_a_plain_failure_at_one(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
     assert _run_non_quiet(monkeypatch, {"failed": True, "failure_reason": "some_unknown_reason"}) == 1
     assert _run_non_quiet(monkeypatch, {"failed": True}) == 1
+
+
+@pytest.mark.parametrize("reason", ["context_window_full", "context_overflow", "repetition_loop"])
+def test_dispatcher_worker_blocks_deterministic_capability_failures(monkeypatch, reason):
+    """A full context or repeated output is a capability mismatch, not a crash retry."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "41")
+    calls = []
+    import hermes_cli.kanban_db as kb
+    import hermes_cli.kanban_db_connect as kbc
+
+    monkeypatch.setattr(kbc, "connect_closing", lambda: nullcontext(object()))
+    monkeypatch.setattr(kb, "block_task", lambda conn, task_id, **kw: calls.append((task_id, kw)) or True)
+    result = {
+        "failed": True,
+        "failure_reason": reason,
+        "capability_failure": {"model": "gpt-test", "context_tokens": 72525, "context_limit": 81920},
+    }
+
+    assert _run_non_quiet(monkeypatch, result) == 0
+    assert calls == [("t_abc123", {
+        "reason": (
+            f"Worker capability exhausted ({reason}); model=gpt-test; "
+            "context_tokens=72525; context_limit=81920. "
+            "Change the model/context budget or reduce task context before retrying."
+        ),
+        "kind": "capability",
+        "expected_run_id": 41,
+    })]
 
 
 @pytest.mark.parametrize(
