@@ -52,6 +52,24 @@ def test_connect_raises_for_explicit_db_path_under_real_root():
         kbc.connect(_conftest._REAL_KANBAN_ROOT / "kanban.db")
 
 
+def test_write_txn_proceeds_when_pread_is_unavailable(tmp_path, monkeypatch):
+    """Platforms without ``os.pread`` skip the POSIX live-FD header probe."""
+    _allow_tmp_kanban_db(monkeypatch, tmp_path)
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delattr(kbc.os, "pread")
+
+    with kbc.connect_closing(home / "kanban.db") as conn:
+        with kbc.write_txn(conn):
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, created_at) "
+                "VALUES ('t-no-pread', 'must commit', 'ready', 1)"
+            )
+
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE id = 't-no-pread'").fetchone()[0] == 1
+
+
 @pytest.mark.linux_only
 def test_write_txn_allows_unrelated_nonzero_offset_on_same_db(tmp_path, monkeypatch):
     """A backup/inspection FD must not be mistaken for SQLite descriptor reuse."""

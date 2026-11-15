@@ -1218,6 +1218,12 @@ def _read_main_db_header_from_live_fd(path: str) -> bytes | None:
     need not be SQLite-owned: the invariant is the file header itself, which
     avoids treating an unrelated reader's offset as board corruption.
     """
+    pread = getattr(os, "pread", None)
+    if pread is None:
+        # Windows has no pread and its close semantics do not have the POSIX
+        # advisory-lock hazard this probe avoids. Leave the guard as a safe
+        # no-op rather than preventing every Kanban write.
+        return None
     try:
         expected = os.stat(path)
         entries = list(Path("/proc/self/fd").iterdir())
@@ -1230,7 +1236,7 @@ def _read_main_db_header_from_live_fd(path: str) -> bytes | None:
             before = os.fstat(fd)
             if (before.st_dev, before.st_ino) != expected_id:
                 continue
-            header = os.pread(fd, len(_SQLITE_HEADER), 0)
+            header = pread(fd, len(_SQLITE_HEADER), 0)
             # The FD can be recycled between fstat and pread; only trust a
             # second matching fstat, otherwise continue the best-effort scan.
             after = os.fstat(fd)
