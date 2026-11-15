@@ -97,6 +97,24 @@ def test_profile_scratch_prune_does_not_follow_profile_home_symlink(tmp_path):
     assert stale.exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+def test_profile_scratch_prune_does_not_follow_scratch_symlink(tmp_path):
+    profiles = tmp_path / "profiles"
+    profile = profiles / "active"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    external_scratch = tmp_path / "external-scratch"
+    stale = external_scratch / "stale"
+    stale.mkdir(parents=True)
+    (profile / "cache").mkdir()
+    (profile / "cache" / "scratch").symlink_to(external_scratch, target_is_directory=True)
+    ancient = time.time() - 100 * 3600
+    os.utime(stale, (ancient, ancient))
+
+    assert prune_profile_scratch_dirs(profiles) == 0
+    assert stale.exists()
+
+
 def test_profile_scratch_prune_stamp_throttles_separate_dispatcher_processes(tmp_path, monkeypatch):
     """The profiles-root stamp survives a fresh dispatcher module process."""
     import hermes_constants
