@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from datetime import datetime
 from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -47,7 +48,7 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
 
 def collect_acceptance(contract: str, published_pr: str | None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
-               "pr_url": published_pr, "checks": [],
+               "pr_url": published_pr, "checks": [], "post_merge_ignored": [],
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
@@ -60,7 +61,7 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
-        query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
+        query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state mergedAt
             baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
                 json.dumps(owner), json.dumps(name), number)
         pr = _api("graphql", query=query)["data"]["repository"]["pullRequest"]
@@ -91,6 +92,19 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
             # the head SHA's own runs instead of declaring the card unfinishable.
             pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest", paginate=True)
             runs = [r for page in pages for r in page["check_runs"]]
+            if pr["state"] == "MERGED":
+                merged_at = _parse_github_timestamp(pr.get("mergedAt"))
+                eligible_runs = []
+                for run in runs:
+                    started_at = _parse_github_timestamp(run.get("started_at"))
+                    if started_at > merged_at:
+                        receipt["post_merge_ignored"].append({
+                            "name": run["name"], "id": run["id"], "url": run.get("html_url"),
+                            "conclusion": run.get("conclusion"),
+                        })
+                    else:
+                        eligible_runs.append(run)
+                runs = eligible_runs
             graded = [r for r in runs if r.get("conclusion") not in ("skipped", "neutral", None)]
             receipt["acceptance_basis"] = "head-sha-check-runs"
             receipt["checks"] = [{"name": r["name"], "id": r["id"], "url": r.get("html_url"),
@@ -99,6 +113,10 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
                                   "conclusion": r.get("conclusion")} for r in graded]
             if not graded:
                 receipt["detail"] = (
+                    "All check runs on the merged PR head began after merge and were excluded "
+                    "from acceptance. At least one real pre-merge check must run before a PR "
+                    "contract can be accepted."
+                    if receipt["post_merge_ignored"] else
                     "No check runs on the head commit. This repo cannot enforce required "
                     "checks (private repo on GitHub Free), so at least one real check must "
                     "run before a PR contract can be accepted.")
@@ -199,3 +217,9 @@ def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
     if is_run and check.get("status") != "completed":
         return "pending"
     return {"success": "success", "failure": "failure", "error": "infra", "pending": "pending"}.get(outcome, "infra")
+
+
+def _parse_github_timestamp(value: str | None) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("GitHub supplied no timestamp for merged PR acceptance evidence")
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
