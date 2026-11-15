@@ -41,6 +41,8 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
     from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    pruned = []
+    monkeypatch.setattr(kbd, "_maybe_prune_profile_scratch_dirs", lambda: pruned.append(True))
 
     captured: dict = {}
 
@@ -55,6 +57,7 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     kbd._default_spawn(_make_task(kb), workspace)
+    captured["pruned"] = pruned
     return captured
 
 
@@ -77,5 +80,25 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     # The subprocess cwd and TERMINAL_CWD must agree — both anchor the workspace.
     assert captured["cwd"] == str(workspace)
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert captured["pruned"] == [True]
+
+
+def test_profile_scratch_janitor_is_throttled(monkeypatch):
+    """Multiple worker spawns do not rescan every profile in the same hour."""
+    import hermes_constants
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    calls = []
+    monkeypatch.setattr(hermes_constants, "prune_profile_scratch_dirs", lambda: calls.append(True))
+    monkeypatch.setattr(kbd, "_profile_scratch_pruned_at", 0.0)
+    clock = [10_000.0]
+    monkeypatch.setattr(kbd.time, "monotonic", lambda: clock[0])
+
+    kbd._maybe_prune_profile_scratch_dirs()
+    kbd._maybe_prune_profile_scratch_dirs()
+    clock[0] += kbd._PROFILE_SCRATCH_PRUNE_INTERVAL_SECONDS
+    kbd._maybe_prune_profile_scratch_dirs()
+
+    assert calls == [True, True]
 
 
