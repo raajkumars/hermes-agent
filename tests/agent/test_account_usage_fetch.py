@@ -1,11 +1,17 @@
 import concurrent.futures
 import contextvars
+import json
+import multiprocessing
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
+import httpx
 import pytest
 
+from agent import account_usage
 from agent.account_usage import (
     AccountUsageSnapshot,
     AccountUsageWindow,
@@ -70,6 +76,183 @@ class _RoutingClient:
 
     def get(self, url, headers=None):
         return _Response(self._payloads[url])
+
+
+def _anthropic_usage_payload():
+    return {"five_hour": {"utilization": 0.25, "resets_at": "2026-11-03T12:00:00Z"}}
+
+
+def _fetch_rate_limited_usage_in_process(cache_path: str, calls_path: str, ready, result) -> None:
+    """Fork-only helper proving the cache/lock coordinates separate processes."""
+    account_usage._anthropic_usage_cache_path = lambda: Path(cache_path)
+
+    def rate_limited(*args, **kwargs):
+        with open(calls_path, "a", encoding="utf-8") as handle:
+            handle.write("1")
+        time.sleep(0.05)
+        request = httpx.Request("GET", "https://api.anthropic.com/api/oauth/usage")
+        response = httpx.Response(429, request=request, headers={"Retry-After": "47"})
+        raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+    account_usage._get_json = rate_limited
+    ready.wait(5)
+    try:
+        account_usage._fetch_anthropic_usage_payload("xA", {})
+    except httpx.HTTPStatusError as exc:
+        result.put(exc.response.status_code)
+
+
+def test_anthropic_usage_cache_singleflights_same_account(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: tmp_path / "anthropic-usage.json")
+
+    def fetch_once(*args, **kwargs):
+        calls.append(args)
+        time.sleep(0.02)
+        return _anthropic_usage_payload()
+
+    monkeypatch.setattr(account_usage, "_get_json", fetch_once)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _i: account_usage._fetch_anthropic_usage_payload("xA", {}), range(8)))
+
+    assert len(calls) == 1
+    assert results == [_anthropic_usage_payload()] * 8
+
+
+def test_anthropic_usage_cache_is_scoped_to_oauth_account(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: tmp_path / "anthropic-usage.json")
+    monkeypatch.setattr(account_usage, "_get_json", lambda *args, **kwargs: calls.append(args) or _anthropic_usage_payload())
+
+    account_usage._fetch_anthropic_usage_payload("xA", {})
+    account_usage._fetch_anthropic_usage_payload("xB", {})
+
+    assert len(calls) == 2
+
+
+def test_anthropic_usage_cache_is_scoped_to_organization_uuid(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: tmp_path / "anthropic-usage.json")
+    monkeypatch.setattr(account_usage, "_get_json", lambda *args, **kwargs: calls.append(args) or _anthropic_usage_payload())
+
+    account_usage._fetch_anthropic_usage_payload("xA", {"x-organization-uuid": "org-a"})
+    account_usage._fetch_anthropic_usage_payload("xA", {"x-organization-uuid": "org-b"})
+
+    assert len(calls) == 2
+
+
+def test_anthropic_usage_cache_prunes_stale_and_excess_entries(monkeypatch, tmp_path):
+    cache_path = tmp_path / "anthropic-usage.json"
+    now = time.time()
+    cache_path.write_text(json.dumps({
+        "version": 1,
+        "entries": {
+            **{f"fresh-{index}": {"fetched_at": now - 1, "payload": _anthropic_usage_payload()}
+               for index in range(account_usage._ANTHROPIC_USAGE_CACHE_MAX_ENTRIES + 5)},
+            "stale": {"fetched_at": now - 120, "payload": _anthropic_usage_payload()},
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: cache_path)
+    monkeypatch.setattr(account_usage, "_get_json", lambda *args, **kwargs: _anthropic_usage_payload())
+
+    account_usage._fetch_anthropic_usage_payload("xA", {})
+
+    entries = json.loads(cache_path.read_text(encoding="utf-8"))["entries"]
+    assert len(entries) == account_usage._ANTHROPIC_USAGE_CACHE_MAX_ENTRIES
+    assert "stale" not in entries
+    assert "xA" not in entries
+
+
+def test_anthropic_usage_429_is_shared_as_a_cooldown_without_another_request(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: tmp_path / "anthropic-usage.json")
+
+
+    def rate_limited(*args, **kwargs):
+        calls.append(args)
+        request = httpx.Request("GET", "https://api.anthropic.com/api/oauth/usage")
+        response = httpx.Response(429, request=request, headers={"Retry-After": "47"})
+        raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+    monkeypatch.setattr(account_usage, "_get_json", rate_limited)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        account_usage._fetch_anthropic_usage_payload("xA", {})
+    with pytest.raises(httpx.HTTPStatusError) as cooled:
+        account_usage._fetch_anthropic_usage_payload("xA", {})
+
+    assert len(calls) == 1
+    assert cooled.value.response.status_code == 429
+    assert 1 <= int(cooled.value.response.headers["Retry-After"]) <= 47
+
+
+@pytest.mark.parametrize("entry_kind", ["cooldown", "payload"])
+def test_anthropic_usage_queued_after_lock_uses_current_time(monkeypatch, tmp_path, entry_kind):
+    """A caller blocked on the lock must not use a timestamp from before it queued."""
+    cache_path = tmp_path / "anthropic-usage.json"
+    scope = account_usage._anthropic_usage_scope("xA", None)
+    fresh_payload = {"five_hour": {"utilization": 0.5}}
+    entry = (
+        {"cooldown_until": time.time() + 0.1}
+        if entry_kind == "cooldown"
+        else {
+            "fetched_at": time.time() - account_usage._ANTHROPIC_USAGE_CACHE_TTL_SECONDS + 0.1,
+            "payload": _anthropic_usage_payload(),
+        }
+    )
+    cache_path.write_text(json.dumps({
+        "version": 1,
+        "entries": {scope: entry},
+    }), encoding="utf-8")
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_path", lambda: cache_path)
+    monkeypatch.setattr(account_usage, "_get_json", lambda *args, **kwargs: fresh_payload)
+
+    original_lock = account_usage._anthropic_usage_cache_lock
+    waiting_for_lock = threading.Event()
+
+    @contextmanager
+    def observed_lock(path):
+        waiting_for_lock.set()
+        with original_lock(path):
+            yield
+
+    monkeypatch.setattr(account_usage, "_anthropic_usage_cache_lock", observed_lock)
+    result = []
+
+    def fetch_after_lock_release():
+        result.append(account_usage._fetch_anthropic_usage_payload("xA", {}))
+
+    with original_lock(cache_path):
+        worker = threading.Thread(target=fetch_after_lock_release)
+        worker.start()
+        assert waiting_for_lock.wait(timeout=1)
+        time.sleep(2)
+    worker.join(timeout=1)
+
+    assert result == [fresh_payload]
+
+
+@pytest.mark.linux_only
+def test_anthropic_usage_429_cooldown_is_shared_across_processes(tmp_path):
+    """One process receives the upstream 429; peers read its cached cooldown."""
+    context = multiprocessing.get_context("fork")
+    cache_path = tmp_path / "anthropic-usage.json"
+    calls_path = tmp_path / "upstream-calls"
+    ready = context.Barrier(2)
+    result = context.Queue()
+    processes = [
+        context.Process(target=_fetch_rate_limited_usage_in_process,
+                        args=(str(cache_path), str(calls_path), ready, result))
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(5)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert sorted(result.get(timeout=1) for _ in processes) == [429, 429]
+    assert calls_path.read_text(encoding="utf-8") == "1"
 
 
 def test_fetch_account_usage_codex(monkeypatch):
