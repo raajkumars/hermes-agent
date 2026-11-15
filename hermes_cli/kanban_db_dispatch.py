@@ -51,12 +51,6 @@ KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 # (two default dispatch ticks).
 TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
 
-# The dispatcher can start multiple workers in one locked pass. Profile-wide
-# scratch pruning may recurse over stale trees, so cap it to once per hour for
-# the whole dispatcher process rather than repeating it for every spawn.
-_PROFILE_SCRATCH_PRUNE_INTERVAL_SECONDS = 3600
-_profile_scratch_pruned_at = -_PROFILE_SCRATCH_PRUNE_INTERVAL_SECONDS
-
 # ---------------------------------------------------------------------------
 # Respawn guard constants
 # ---------------------------------------------------------------------------
@@ -3712,16 +3706,11 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
 
 
 def _maybe_prune_profile_scratch_dirs() -> None:
-    """Run the host-wide scratch janitor at most once per dispatcher hour."""
-    global _profile_scratch_pruned_at
-    now = time.monotonic()
-    if now - _profile_scratch_pruned_at < _PROFILE_SCRATCH_PRUNE_INTERVAL_SECONDS:
-        return
-    _profile_scratch_pruned_at = now
+    """Run the persistently throttled host-wide scratch janitor."""
     # A dormant profile never reaches get_scratch_dir() to run its lazy prune.
     # The host-wide dispatcher is the one process guaranteed to see active work.
-    from hermes_constants import prune_profile_scratch_dirs
-    prune_profile_scratch_dirs()
+    from hermes_constants import prune_profile_scratch_dirs_once
+    prune_profile_scratch_dirs_once()
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
