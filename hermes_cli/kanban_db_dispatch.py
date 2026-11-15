@@ -3159,10 +3159,28 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, body FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+
+
+def _is_approval_request_card(row: sqlite3.Row) -> bool:
+    """Whether a task body is an authority request, never work to route.
+
+    Approval requests are intentionally unassigned until their dedicated
+    authority lane creates an adjudication card.  The qwick-guard envelope is
+    canonical; accept the generic spelling too for cards created by older
+    integrations.
+    """
+    try:
+        body = json.loads(row["body"] or "")
+    except (TypeError, ValueError):
+        return False
+    return isinstance(body, dict) and body.get("type") in {
+        "approval-request",
+        "qwick_approval_request",
+    }
 
 
 def _any_spawnable_review(
@@ -3302,8 +3320,13 @@ def _dispatch_once_locked(
             break
         row_assignee = row["assignee"]
         if not row_assignee:
-            # Honour kanban.default_assignee so an unassigned task doesn't
-            # park in 'ready' forever.
+            # Approval requests are authority records, not implementation
+            # work. They must remain unassigned for their dedicated route.
+            if _is_approval_request_card(row):
+                result.skipped_unassigned.append(row["id"])
+                continue
+            # Honour kanban.default_assignee so ordinary unassigned work
+            # doesn't park in 'ready' forever.
             if not default_assignee or not _apply_default_assignee(
                 conn, row["id"], default_assignee, dry_run=dry_run,
             ):
