@@ -1216,7 +1216,13 @@ def prune_profile_scratch_dirs(
         if (home.name.startswith(".") or home.is_symlink() or not home.is_dir()
                 or not named_profile_has_identity(home)):
             continue
-        removed += prune_scratch_dir(home / "cache" / "scratch", max_age_hours)
+        cache = home / "cache"
+        scratch = cache / "scratch"
+        # Profile state can itself contain convenience symlinks. Do not let a
+        # host-wide cleanup escape an otherwise valid profile home through one.
+        if cache.is_symlink() or scratch.is_symlink():
+            continue
+        removed += prune_scratch_dir(scratch, max_age_hours)
     return removed
 
 
