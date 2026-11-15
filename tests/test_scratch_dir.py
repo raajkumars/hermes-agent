@@ -13,6 +13,7 @@ from hermes_constants import (
     apply_scratch_tmp_env,
     get_scratch_dir,
     prune_profile_scratch_dirs,
+    prune_profile_scratch_dirs_once,
     prune_scratch_dir,
 )
 
@@ -94,6 +95,21 @@ def test_profile_scratch_prune_does_not_follow_profile_home_symlink(tmp_path):
 
     assert prune_profile_scratch_dirs(profiles) == 0
     assert stale.exists()
+
+
+def test_profile_scratch_prune_stamp_throttles_separate_dispatcher_processes(tmp_path, monkeypatch):
+    """The profiles-root stamp survives a fresh dispatcher module process."""
+    import hermes_constants
+
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    calls = []
+    monkeypatch.setattr(hermes_constants, "prune_profile_scratch_dirs", lambda root: calls.append(root) or 3)
+
+    assert prune_profile_scratch_dirs_once(profiles) == 3
+    assert prune_profile_scratch_dirs_once(profiles) == 0
+    assert calls == [profiles]
+    assert (profiles / ".last_profile_scratch_prune").exists()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory modes")
