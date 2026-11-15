@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from hermes_cli import kanban_db
@@ -54,7 +52,7 @@ def test_connect_raises_for_explicit_db_path_under_real_root():
         kbc.connect(_conftest._REAL_KANBAN_ROOT / "kanban.db")
 
 
-@pytest.mark.skipif(not os.path.isdir("/proc/self/fdinfo"), reason="requires Linux /proc fd metadata")
+@pytest.mark.linux_only
 def test_write_txn_refuses_nonzero_offset_on_live_kanban_fd(tmp_path, monkeypatch):
     """A TLS BIO writing through a recycled SQLite fd advances its offset.
 
@@ -69,16 +67,13 @@ def test_write_txn_refuses_nonzero_offset_on_live_kanban_fd(tmp_path, monkeypatc
     db_path = home / "kanban.db"
 
     with kbc.connect_closing(db_path) as conn:
-        foreign_fd = os.open(db_path, os.O_RDWR)
-        try:
-            os.lseek(foreign_fd, 29, os.SEEK_SET)
+        with db_path.open("r+b") as foreign_file:
+            foreign_file.seek(29)
             with pytest.raises(kbc.KanbanDbFdReuseError, match="non-zero file offset"):
                 with kbc.write_txn(conn):
                     conn.execute(
                         "INSERT INTO tasks (id, title, status, created_at) "
                         "VALUES ('t-fd-reuse', 'must not commit', 'ready', 1)"
                     )
-        finally:
-            os.close(foreign_fd)
 
         assert conn.execute("SELECT COUNT(*) FROM tasks WHERE id = 't-fd-reuse'").fetchone()[0] == 0
