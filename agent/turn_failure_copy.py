@@ -29,6 +29,31 @@ def stamp_failure(result: Dict[str, Any], reason: str, retryable: bool) -> Dict[
     return result
 
 
+def capability_failure_facts(agent: Any, context_tokens: Any = 0) -> Dict[str, Any]:
+    """Current model/window facts for a terminal context-capacity blocker.
+
+    Prefer the caller's request measurement; when a preflight path has none,
+    use only the compressor's most recent prompt measurement (never cumulative
+    session throughput).
+    """
+    compressor = getattr(agent, "context_compressor", None)
+
+    def _nonnegative_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    used = _nonnegative_int(context_tokens)
+    if not used and compressor is not None:
+        used = _nonnegative_int(getattr(compressor, "last_prompt_tokens", 0))
+    return {
+        "model": str(getattr(agent, "model", "") or "unknown"),
+        "context_tokens": used,
+        "context_limit": _nonnegative_int(getattr(compressor, "context_length", 0)),
+    }
+
+
 # ---- failed-turn transcript boundary ----------------------------------------------------------
 # The Hermes-authored assistant row that closes a durable turn which ended without one. A
 # transcript boundary, NOT the model's answer: no provider/model error or refusal detail is

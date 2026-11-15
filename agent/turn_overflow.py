@@ -26,7 +26,7 @@ from agent.model_metadata import (
     get_context_length_from_provider_error, is_output_cap_error,
     parse_available_output_tokens_from_error,
 )
-from agent.turn_failure_copy import site_copy, stamp_failure
+from agent.turn_failure_copy import capability_failure_facts, site_copy, stamp_failure
 from agent.turn_retry_state import TurnRetryState
 from utils import base_url_host_matches
 
@@ -121,6 +121,8 @@ class _Recovery(OverflowVerdict):
             # bloated transcript remains intact while future input can move to a clean session instead of
             # replaying the summarize-timeout loop.
             result["compression_exhausted"] = True
+        if reason == "context_overflow":
+            result["capability_failure"] = capability_failure_facts(agent, self.approx_tokens)
         result.update(extra)
         return self.done("return", result)
 
