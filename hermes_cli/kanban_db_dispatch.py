@@ -3719,6 +3719,12 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
+    # A dormant profile never reaches get_scratch_dir() to run its lazy prune.
+    # The host-wide dispatcher is the one process guaranteed to see active work,
+    # so reclaim all profile scratch roots here before starting the first worker.
+    from hermes_constants import prune_profile_scratch_dirs
+    prune_profile_scratch_dirs()
+
     profile_arg = normalize_profile_name(task.assignee)
 
     from agent.secret_scope import is_multiplex_active
