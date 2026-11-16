@@ -116,6 +116,13 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    parent_verdict_holds: list[dict[str, str]] = field(default_factory=list)
+    """Current cards intentionally held by a terminal rejecting review.
+
+    This is refreshed on every dispatch tick for fleet-pulse consumers.  It is
+    read-only telemetry rather than a repeated task event, so a long-lived
+    legitimate hold does not flood the board history.
+    """
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -2956,6 +2963,7 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    result.parent_verdict_holds = _kb.list_parent_verdict_holds(conn)
 
 
 def _tick_spawn_budget(

@@ -2899,21 +2899,38 @@ def _normalise_verdict(value: Any) -> str:
     return re.sub(r"[\s-]+", "_", value.strip().lower())
 
 
-def _latest_completed_handoff(conn: sqlite3.Connection, task_id: str) -> tuple[dict, str]:
-    """Metadata and summary from the parent task's newest completed run."""
+def _latest_completed_handoff(conn: sqlite3.Connection, task_id: str) -> tuple[dict, str, Optional[int]]:
+    """Metadata, summary, and run id from the parent's newest completed run."""
     row = conn.execute(
-        "SELECT metadata, summary FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+        "SELECT id, metadata, summary FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
         "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if row is None:
-        return {}, ""
-    return _json_dict(row["metadata"]), str(row["summary"] or "")
+        return {}, "", None
+    return _json_dict(row["metadata"]), str(row["summary"] or ""), int(row["id"])
+
+
+def _completed_run_was_review(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> bool:
+    """Whether the terminal handoff was produced by a claimed review run.
+
+    ``metadata.verdict`` is a generic handoff field used by implementation,
+    planning, and verification work too.  Only a run claimed from the explicit
+    ``review`` state is entitled to hold downstream dependencies.  The claim
+    event is the durable lifecycle provenance; free-form summaries and the
+    assignee name are deliberately not inferred as review evidence.
+    """
+    if run_id is None:
+        return False
+    event = _latest_event(conn, task_id, "claimed", run_id)
+    return _json_dict(_row_get(event, "payload")).get("source_status") == "review"
 
 
 def _parent_verdict_hold(conn: sqlite3.Connection, parent_id: str) -> tuple[bool, Optional[str]]:
     """Whether a terminal parent holds children for a non-approval review."""
-    metadata, summary = _latest_completed_handoff(conn, parent_id)
+    metadata, summary, run_id = _latest_completed_handoff(conn, parent_id)
+    if not _completed_run_was_review(conn, parent_id, run_id):
+        return False, None
     if "verdict" in metadata:
         raw = metadata["verdict"]
         normalised = _normalise_verdict(raw)
@@ -2944,7 +2961,9 @@ def _approved_parent_supersedes(conn: sqlite3.Connection, child_id: str, held_pa
         (child_id, held_parent_id),
     ).fetchall()
     for row in rows:
-        metadata, _summary = _latest_completed_handoff(conn, row["id"])
+        metadata, _summary, run_id = _latest_completed_handoff(conn, row["id"])
+        if not _completed_run_was_review(conn, row["id"], run_id):
+            continue
         if _normalise_verdict(metadata.get("verdict")) not in _APPROVE_VERDICTS:
             continue
         supersedes = metadata.get("supersedes")
@@ -2992,6 +3011,28 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
         (item["id"], item["status"], item["reason"], item.get("verdict"))
         for item in _unsatisfied_parent_details(conn, task_id)
     ]
+
+
+def list_parent_verdict_holds(conn: sqlite3.Connection) -> list[dict[str, str]]:
+    """Return the current terminal-review holds for periodic dispatcher telemetry.
+
+    The result is read-only and intentionally includes the parent and verdict,
+    so fleet health can distinguish a legitimate review refusal from a scheduler
+    promotion stall without scraping event prose.
+    """
+    rows = conn.execute(
+        "SELECT id, status FROM tasks WHERE status IN ('todo', 'blocked') ORDER BY priority DESC, created_at ASC, id ASC"
+    ).fetchall()
+    holds: list[dict[str, str]] = []
+    for row in rows:
+        for parent_id, _status, reason, verdict in unsatisfied_parents(conn, row["id"]):
+            if reason == "parent_verdict_not_approve":
+                holds.append({
+                    "task_id": str(row["id"]),
+                    "parent_id": str(parent_id),
+                    "verdict": str(verdict or ""),
+                })
+    return holds
 
 
 def _claim_and_open_run(
