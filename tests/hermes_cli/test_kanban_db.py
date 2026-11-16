@@ -428,6 +428,45 @@ def test_dead_worker_reap_marks_only_workspaces_saved_after_session_checkpoint(
         event = next(e for e in kb.list_events(conn, tid) if e.kind == "crashed")
         recovered = event.payload["workspaces"]
         assert [workspace["has_unsaved_work"] for workspace in recovered] == expected
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.worker_pid is None
+
+
+@pytest.mark.parametrize(
+    ("session", "last_saved", "expected"),
+    [
+        ({"started_at": 90, "last_save": 100}, 101, True),
+        ({"started_at": 90, "last_save": 100}, 99, False),
+        ({"started_at": 90, "last_save": 100}, 100, False),
+        # A run without a checkpoint and a missing run record both provide only
+        # the task/session start time to the comparison helper.
+        ({"started_at": 100}, 101, True),
+        ({"started_at": 100}, None, False),
+    ],
+)
+def test_mark_workspace_unsaved_work_uses_strict_session_reference(
+    session, last_saved, expected,
+):
+    workspaces = [{"metadata": {"last_saved": last_saved}}]
+
+    kbd._mark_workspace_unsaved_work(workspaces, session)
+
+    assert workspaces[0]["has_unsaved_work"] is expected
+
+
+def test_mark_workspace_unsaved_work_handles_malformed_or_uncheckpointed_entries():
+    workspaces = [
+        {"metadata": {}},
+        {"metadata": None},
+        {},
+        "not a workspace",
+    ]
+
+    kbd._mark_workspace_unsaved_work(workspaces, {"started_at": 100})
+
+    assert [workspace.get("has_unsaved_work") for workspace in workspaces[:3]] == [False] * 3
+    assert workspaces[3] == "not a workspace"
 
 
 @pytest.mark.parametrize("lane", ["ready", "review"])
