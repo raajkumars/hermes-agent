@@ -1031,6 +1031,31 @@ def test_request_review_rollback_discards_staged_copies(kanban_home):
 
 
 
+def test_shared_scratch_survives_until_all_decomposed_children_are_terminal(kanban_home):
+    """One completed child must not reap a scratch path still used by a sibling."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="scratch parent")
+        first = kb.create_task(conn, title="first shared child")
+        second = kb.create_task(conn, title="second shared child")
+        kb.link_tasks(conn, parent, first)
+        kb.link_tasks(conn, parent, second)
+
+        parent_ws = kbw.resolve_workspace(kb.get_task(conn, parent))
+        kbw.set_workspace_path(conn, parent, parent_ws)
+        kbw.set_workspace_path(conn, first, parent_ws)
+        kbw.set_workspace_path(conn, second, parent_ws)
+
+        kb.complete_task(conn, parent, result="handoff")
+        assert parent_ws.exists(), "parent defers while children are live"
+
+        kb.complete_task(conn, first, result="first complete")
+        assert parent_ws.exists(), "live sibling keeps the shared workspace"
+
+        kb.complete_task(conn, second, result="second complete")
+
+    assert not parent_ws.exists(), "last shared workspace user reaps the scratch path"
+
+
 def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_path):
     """A non-scratch ('dir') child completing must still sweep its scratch parent.
 
