@@ -94,6 +94,17 @@ def test_provider_without_model_rejected(conn):
         )
 
 
+def test_create_task_rejects_model_override_with_routing_lane(conn):
+    """The canonical creator rejects ambiguity before a dispatcher claims it."""
+    with pytest.raises(ValueError, match="cannot combine routing_lane with model_override"):
+        kb.create_task(
+            conn, title="ambiguous route", assignee="worker",
+            model_override="gpt-5.6", provider_override="openai",
+            routing_lane="file-heavy",
+        )
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
 def test_create_task_with_model_and_provider(conn):
     tid = kb.create_task(
         conn, title="t", assignee="worker",

@@ -1327,6 +1327,8 @@ def create_task(
     routing_lane = str(routing_lane or "").strip() or None
     if routing_lane and not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", routing_lane):
         raise ValueError("routing_lane must be a lowercase slug (a-z, 0-9, _ or -)")
+    if routing_lane and model_override:
+        raise ValueError("task cannot combine routing_lane with model_override")
     min_context_window = _opt_int(min_context_window)
     if min_context_window is not None and min_context_window < 1:
         raise ValueError("min_context_window must be >= 1")

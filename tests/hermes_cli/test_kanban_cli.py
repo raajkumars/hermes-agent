@@ -276,6 +276,17 @@ def test_run_slash_reclaim_running_task(kanban_home):
     assert "ready" in out2.lower()
 
 
+def test_run_slash_create_rejects_model_override_with_routing_lane(kanban_home):
+    output = kc.run_slash(
+        "create 'ambiguous task' --assignee worker --model gpt-5.6 "
+        "--provider openai --routing-lane file-heavy"
+    )
+
+    assert "cannot combine routing_lane with model_override" in output
+    with kbc.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
 
 
 # ---------------------------------------------------------------------------
