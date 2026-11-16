@@ -25,6 +25,13 @@ if TYPE_CHECKING:
 
 _REMOVABLE_KINDS = ("scratch", "worktree")
 
+# A single clean checkout is cheaper than cloning the Hermes source tree into
+# every card workspace. Linked task worktrees keep edits isolated while sharing
+# this checkout's object database. The checkout itself is never modified by
+# workspace resolution.
+_SHARED_HERMES_UPSTREAM = Path("/opt/data/repos/hermes-upstream")
+_HERMES_UPSTREAM_REMOTE = "https://github.com/NousResearch/hermes-agent.git"
+
 
 def _path_key(path: Path | str | None) -> str:
     """Unicode-form-insensitive identity for a filesystem path.
@@ -389,6 +396,69 @@ def _git_toplevel(path: Path) -> Optional[Path]:
         return Path(out).expanduser()
 
 
+def _is_git_checkout(path: Path) -> bool:
+    """Return whether *path* is a usable non-bare checkout."""
+    result = _git(path, "rev-parse", "--is-inside-work-tree", timeout=30)
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def _local_hermes_checkout() -> Optional[Path]:
+    """Return this installed source checkout when it is available as a clone reference."""
+    source_root = Path(__file__).resolve().parents[1]
+    return source_root if _is_git_checkout(source_root) else None
+
+
+def _ensure_shared_hermes_upstream() -> Path:
+    """Create the shared Hermes source checkout once and return it.
+
+    The clone is published only after Git has completed it, so a killed first
+    dispatcher cannot leave later workers treating a partial directory as a
+    source checkout. Existing valid checkouts are intentionally left untouched:
+    the dispatcher must not fetch, reset, or otherwise mutate shared source.
+    """
+    shared = _SHARED_HERMES_UPSTREAM.expanduser()
+    if _is_git_checkout(shared):
+        return shared.resolve(strict=False)
+    if shared.exists():
+        raise ValueError(
+            f"shared Hermes upstream exists but is not a git checkout: {shared}"
+        )
+
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    staging = shared.with_name(f".{shared.name}.staging-{os.getpid()}-{time.time_ns()}")
+    reference = _local_hermes_checkout()
+    command = ["git", "clone"]
+    if reference is not None:
+        command.extend(["--reference-if-able", str(reference)])
+    command.extend([_HERMES_UPSTREAM_REMOTE, str(staging)])
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+            check=False,
+        )
+        if result.returncode != 0 or not _is_git_checkout(staging):
+            detail = (result.stderr or result.stdout or "git clone produced no checkout").strip()
+            raise RuntimeError(f"failed to clone shared Hermes upstream: {detail}")
+        try:
+            staging.rename(shared)
+        except FileExistsError:
+            # Another dispatcher won the race. Its checkout is safe to reuse
+            # only after validating it rather than assuming its clone finished.
+            if not _is_git_checkout(shared):
+                raise RuntimeError(
+                    f"shared Hermes upstream was created concurrently but is invalid: {shared}"
+                )
+        return shared.resolve(strict=False)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
 def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     try:
         result = _git(repo_root, "show-ref", "--verify", f"refs/heads/{branch_name}", timeout=30)
@@ -475,12 +545,10 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         board_slug = board if board else _kb.get_current_board()
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
         if not board_default:
-            raise ValueError(
-                f"task {task.id} has workspace_kind=worktree but no workspace_path, "
-                f"and board {board_slug!r} has no default_workdir set. Set a board "
-                "default workdir (a git repo) or create the task with "
-                "--workspace worktree:<absolute-repo-path>."
-            )
+            # A fresh install has no board default yet. Fall back to the
+            # shared, clean Hermes checkout so each card still gets a linked
+            # worktree instead of an expensive standalone clone.
+            return _anchored_worktree(_ensure_shared_hermes_upstream(), task.id, branch_name)
         anchor = Path(board_default).expanduser()
         if not anchor.is_absolute():
             raise ValueError(
@@ -545,7 +613,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     dispatcher's CWD — confused-deputy traversal). ``worktree``: a linked git
     worktree; a repo-root ``workspace_path`` anchors ``<repo>/.worktrees/<id>``,
     a concrete path is created/reused, none -> the board's ``default_workdir``
-    (raises if unset rather than guessing). Persist via ``set_workspace_path``.
+    or the shared clean Hermes checkout. Persist via ``set_workspace_path``.
     """
     kind = task.workspace_kind or "scratch"
     if kind == "worktree":
