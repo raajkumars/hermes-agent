@@ -151,14 +151,18 @@ def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
     assert cmd[j + 1] == "openrouter"
 
 
-def test_worker_argv_resolves_configured_routing_lane(monkeypatch, tmp_path):
-    """A declarative lane pins the configured model and provider at spawn."""
-    task = kb.Task(
+def _routing_task(*, lane="deep", min_context_window=200000):
+    return kb.Task(
         id="t_route", title="deep review", body=None, assignee="worker", status="running",
         priority=0, created_by=None, created_at=1, started_at=None, completed_at=None,
         workspace_kind="scratch", workspace_path=None, claim_lock=None, claim_expires=None,
-        tenant=None, routing_lane="deep", min_context_window=200000,
+        tenant=None, routing_lane=lane, min_context_window=min_context_window,
     )
+
+
+def test_worker_argv_resolves_configured_routing_lane(monkeypatch, tmp_path):
+    """A declarative lane pins the configured model and provider at spawn."""
+    task = _routing_task()
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
@@ -169,6 +173,58 @@ def test_worker_argv_resolves_configured_routing_lane(monkeypatch, tmp_path):
     cmd = kbd._worker_argv(task, "worker", str(tmp_path))
     assert cmd[cmd.index("-m") + 1] == "gpt-5.6"
     assert cmd[cmd.index("--provider") + 1] == "openai"
+
+
+@pytest.mark.parametrize(
+    ("routing", "error"),
+    [
+        ({"lanes": {}}, "has no configured lane 'deep'"),
+        ({"lanes": {"deep": {"model": "gpt-5.6", "context_window": "400000"}}},
+         "requires integer context_window"),
+        ({"lanes": {"deep": {"model": "gpt-5.6", "context_window": 65535}}},
+         "context_window 65535 is below task minimum 200000"),
+    ],
+)
+def test_routing_lane_rejects_incapable_or_malformed_config(monkeypatch, tmp_path, routing, error):
+    """Declared routing never falls back to the assignee's default model."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"model_routing": routing}},
+    )
+
+    with pytest.raises(ValueError, match=error):
+        kbd._resolve_task_model_route(_routing_task(), str(tmp_path))
+
+
+def test_routing_validation_failure_is_persisted_as_a_spawn_error(monkeypatch, conn, tmp_path):
+    """A bad route returns the card to ready with a durable explicit error."""
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"model_routing": {"lanes": {
+            "deep": {"model": "gpt-5.6", "context_window": 65535},
+        }}}},
+    )
+    task_id = kb.create_task(
+        conn, title="file-heavy review", assignee="worker", routing_lane="deep",
+        min_context_window=65536,
+    )
+
+    def spawn_with_route_validation(task, _workspace, board=None):
+        return kbd._resolve_task_model_route(task, str(tmp_path))
+
+    result = kbd.dispatch_once(conn, spawn_fn=spawn_with_route_validation)
+    task = kb.get_task(conn, task_id)
+    run = conn.execute(
+        "SELECT outcome, status FROM task_runs WHERE task_id = ?", (task_id,),
+    ).fetchone()
+
+    assert result.spawned == []
+    assert task is not None
+    assert task.status == "ready"
+    assert task.last_failure_error is not None
+    assert "context_window 65535 is below task minimum 65536" in task.last_failure_error
+    assert (run["outcome"], run["status"]) == ("spawn_failed", "spawn_failed")
 
 
 # ---------------------------------------------------------------------------
