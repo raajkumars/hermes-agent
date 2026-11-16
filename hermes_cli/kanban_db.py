@@ -2885,6 +2885,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 # --- Claim / complete / block ---
 
 _APPROVE_VERDICTS = frozenset({"approve", "approved", "pass", "passed", "accept", "accepted", "lgtm"})
+# Terminal implementation and verification handoffs release dependencies even when
+# their generic ``metadata.verdict`` field is populated.
+_NON_HOLDING_TERMINAL_VERDICTS = frozenset({
+    "already_satisfied", "implementation_complete", "no_op", "verified", "merged",
+})
 _REJECTING_REVIEW_SUMMARY_RE = re.compile(
     r"\b(?:changes?\s+(?:required|requested|needed)|request\s+changes|"
     r"reject(?:ed|ion)?|not\s+approved|do\s+not\s+merge|verdict\s*:\s*fail)\b",
@@ -2927,14 +2932,23 @@ def _completed_run_was_review(conn: sqlite3.Connection, task_id: str, run_id: Op
 
 
 def _parent_verdict_hold(conn: sqlite3.Connection, parent_id: str) -> tuple[bool, Optional[str]]:
-    """Whether a terminal parent holds children for a non-approval review."""
+    """Whether a terminal parent holds children for a legitimate rejected review.
+
+    Review provenance is necessary but not sufficient: only a verdict or summary
+    matching the rejection contract holds a dependency.  Generic terminal
+    handoff verdicts always release it.
+    """
     metadata, summary, run_id = _latest_completed_handoff(conn, parent_id)
     if not _completed_run_was_review(conn, parent_id, run_id):
         return False, None
     if "verdict" in metadata:
         raw = metadata["verdict"]
         normalised = _normalise_verdict(raw)
-        return normalised not in _APPROVE_VERDICTS, normalised or str(raw)
+        if normalised in _APPROVE_VERDICTS | _NON_HOLDING_TERMINAL_VERDICTS:
+            return False, None
+        if _REJECTING_REVIEW_SUMMARY_RE.search(f"verdict: {normalised.replace('_', ' ')}"):
+            return True, normalised or str(raw)
+        return False, None
     if _REJECTING_REVIEW_SUMMARY_RE.search(summary[:300]):
         return True, "rejection_summary"
     return False, None
