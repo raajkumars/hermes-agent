@@ -121,6 +121,9 @@ def test_migration_adds_provider_override_column(conn):
 
 def _spawn_and_capture(monkeypatch, tmp_path, task):
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    # This test verifies argument construction only.  Avoid coupling it to
+    # whether the host is currently running beneath a systemd gateway scope.
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda _task, cmd: cmd)
     captured = {}
 
     class FakeProc:
@@ -213,6 +216,7 @@ def test_routing_validation_failure_is_persisted_as_a_spawn_error(
 ):
     """Every invalid route returns to ready with a durable explicit failure."""
     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
+    monkeypatch.setattr(kbd, "_installed_profile_exists_fn", lambda: lambda _name: True)
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"model_routing": routing}},
