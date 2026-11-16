@@ -151,6 +151,128 @@ def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
     assert cmd[j + 1] == "openrouter"
 
 
+def _routing_task(*, lane="deep", min_context_window=200000):
+    return kb.Task(
+        id="t_route", title="deep review", body=None, assignee="worker", status="running",
+        priority=0, created_by=None, created_at=1, started_at=None, completed_at=None,
+        workspace_kind="scratch", workspace_path=None, claim_lock=None, claim_expires=None,
+        tenant=None, routing_lane=lane, min_context_window=min_context_window,
+    )
+
+
+def test_worker_argv_resolves_configured_routing_lane(monkeypatch, tmp_path):
+    """A declarative lane pins the configured model and provider at spawn."""
+    task = _routing_task()
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"model_routing": {"lanes": {
+            "deep": {"model": "gpt-5.6", "provider": "openai", "context_window": 400000},
+        }}}},
+    )
+    cmd = kbd._worker_argv(task, "worker", str(tmp_path))
+    assert cmd[cmd.index("-m") + 1] == "gpt-5.6"
+    assert cmd[cmd.index("--provider") + 1] == "openai"
+
+
+@pytest.mark.parametrize(
+    ("routing", "error"),
+    [
+        ({"lanes": {}}, "has no configured lane 'deep'"),
+        ({"lanes": {"deep": {"model": "gpt-5.6", "context_window": "400000"}}},
+         "requires integer context_window"),
+        ({"lanes": {"deep": {"model": "gpt-5.6", "context_window": 65535}}},
+         "context_window 65535 is below task minimum 200000"),
+    ],
+)
+def test_routing_lane_rejects_incapable_or_malformed_config(monkeypatch, tmp_path, routing, error):
+    """Declared routing never falls back to the assignee's default model."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"model_routing": routing}},
+    )
+
+    with pytest.raises(ValueError, match=error):
+        kbd._resolve_task_model_route(_routing_task(), str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("lane", "minimum", "routing", "error"),
+    [
+        ("missing", 1, {"lanes": {}}, "has no configured lane 'missing'"),
+        ("malformed", 1, {"lanes": {"malformed": {
+            "model": "gpt-5.6", "context_window": "65536",
+        }}}, "requires integer context_window"),
+        ("undersized", 65536, {"lanes": {"undersized": {
+            "model": "gpt-5.6", "context_window": 65535,
+        }}}, "context_window 65535 is below task minimum 65536"),
+    ],
+)
+def test_routing_validation_failure_is_persisted_as_a_spawn_error(
+    monkeypatch, conn, tmp_path, lane, minimum, routing, error,
+):
+    """Every invalid route returns to ready with a durable explicit failure."""
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
+    monkeypatch.setattr(kbd, "_installed_profile_exists_fn", lambda: lambda _name: True)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"model_routing": routing}},
+    )
+    task_id = kb.create_task(
+        conn, title="file-heavy review", assignee="worker", routing_lane=lane,
+        min_context_window=minimum,
+    )
+
+    def spawn_with_route_validation(task, _workspace, board=None):
+        return kbd._resolve_task_model_route(task, str(tmp_path))
+
+    result = kbd.dispatch_once(conn, spawn_fn=spawn_with_route_validation)
+    task = kb.get_task(conn, task_id)
+    run = conn.execute(
+        "SELECT outcome, status FROM task_runs WHERE task_id = ?", (task_id,),
+    ).fetchone()
+
+    assert result.spawned == []
+    assert task is not None
+    assert task.status == "ready"
+    assert task.last_failure_error is not None
+    assert error in task.last_failure_error
+    assert (run["outcome"], run["status"]) == ("spawn_failed", "spawn_failed")
+
+
+@pytest.mark.parametrize(
+    ("lane", "minimum", "model"),
+    [
+        ("orchestration", 200000, "claude-opus-5-5"),
+        ("lead", 200000, "claude-sonnet-5"),
+        ("file-heavy", 65536, "claude-sonnet-5"),
+    ],
+)
+def test_configured_lane_matrix_reaches_the_required_model_capability(
+    monkeypatch, tmp_path, lane, minimum, model,
+):
+    """Policy lanes resolve through the worker path without profile fallback."""
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"model_routing": {"lanes": {
+            "orchestration": {
+                "model": "claude-opus-5-5", "provider": "anthropic", "context_window": 200000,
+            },
+            "lead": {
+                "model": "claude-sonnet-5", "provider": "anthropic", "context_window": 200000,
+            },
+            "file-heavy": {
+                "model": "claude-sonnet-5", "provider": "anthropic", "context_window": 65536,
+            },
+        }}}},
+    )
+
+    cmd = kbd._worker_argv(_routing_task(lane=lane, min_context_window=minimum), "worker", str(tmp_path))
+    assert cmd[cmd.index("-m") + 1] == model
+    assert cmd[cmd.index("--provider") + 1] == "anthropic"
+
+
 # ---------------------------------------------------------------------------
 # Dashboard API — PATCH / bulk / create / model-options
 # ---------------------------------------------------------------------------
