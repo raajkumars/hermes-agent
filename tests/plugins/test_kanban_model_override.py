@@ -105,6 +105,21 @@ def test_create_task_rejects_model_override_with_routing_lane(conn):
     assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
+def test_set_model_override_rejects_routed_task_but_allows_a_clear(conn):
+    task_id = kb.create_task(
+        conn, title="routed task", assignee="worker", routing_lane="file-heavy",
+    )
+
+    with pytest.raises(ValueError, match="cannot combine routing_lane with model_override"):
+        kb.set_model_override(conn, task_id, "gpt-5.6", provider="openai")
+    task = kb.get_task(conn, task_id)
+    assert (task.model_override, task.provider_override) == (None, None)
+
+    assert kb.set_model_override(conn, task_id, None)
+    task = kb.get_task(conn, task_id)
+    assert (task.model_override, task.provider_override) == (None, None)
+
+
 def test_create_task_with_model_and_provider(conn):
     tid = kb.create_task(
         conn, title="t", assignee="worker",

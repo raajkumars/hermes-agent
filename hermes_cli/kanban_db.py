@@ -1638,12 +1638,27 @@ def set_model_override(
     Allowed while ``running``: it applies on the NEXT dispatch, which is the
     rate-limit-recovery flow (set, then reclaim/retry)."""
     model, provider = _validate_model_override(model, provider)
-    return _set_task_override(
-        conn, task_id,
-        "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
-        "model_override_set", {"model": model, "provider": provider},
-        ("model_override", "provider_override"), archived_msg="cannot set model override",
-    )
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, routing_lane FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if task is None:
+            return False
+        if task["status"] == "archived":
+            raise RuntimeError(f"cannot set model override on archived task {task_id}")
+        # A lane owns model/provider selection.  Clearing remains valid for
+        # remediation of legacy rows that predate this invariant.
+        if model is not None and task["routing_lane"]:
+            raise ValueError("task cannot combine routing_lane with model_override")
+        conn.execute(
+            "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
+            (model, provider, task_id),
+        )
+        _append_event(
+            conn, task_id, "model_override_set", {"model": model, "provider": provider},
+        )
+    notify_task_updated(conn, task_id, ("model_override", "provider_override"))
+    return True
 
 
 def _set_task_override(
