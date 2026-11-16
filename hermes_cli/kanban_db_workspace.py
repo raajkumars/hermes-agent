@@ -152,6 +152,33 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+def _cleanup_orphaned_scratch_workspace(conn: sqlite3.Connection, task_id: str, path: str) -> bool:
+    """Remove one managed scratch workspace only after every live user releases it.
+
+    Completion cleanup, deferred-parent cleanup, and headless ``kanban gc``
+    all use this one gate.  A task may share its inherited scratch path with a
+    live child or sibling, so an archived row is not sufficient evidence that
+    its directory is orphaned.
+    """
+    try:
+        wp = Path(path).expanduser()
+        if (
+            not wp.is_dir()
+            or not _is_managed_scratch_path(wp)
+            or _has_active_children(conn, task_id)
+            or _has_active_workspace_peer(conn, task_id, str(wp))
+        ):
+            return False
+        release_lsp_clients(str(wp))
+        shutil.rmtree(wp, ignore_errors=True)
+        if not wp.exists():
+            _kb._log.debug("Removed orphaned scratch workspace for task %s: %s", task_id, wp)
+            return True
+    except Exception:
+        pass  # best-effort — never block completion or maintenance
+    return False
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
@@ -186,22 +213,15 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             _try_cleanup_parent_workspaces(conn, task_id)
             return
         wp = Path(path)
-        if wp.is_dir():
-            # Containment guard: a board's ``default_workdir`` can pair
-            # ``workspace_kind='scratch'`` with a user path pointing at a real
-            # source tree; without this, completion would rmtree the user's data.
-            # See #28818.
-            if _is_managed_scratch_path(wp):
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _kb._log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
-                )
+        if wp.is_dir() and not _is_managed_scratch_path(wp):
+            _kb._log.warning(
+                "Refusing to remove out-of-scratch workspace for task %s: %s "
+                "(workspace_kind='scratch' but path is outside any "
+                "kanban-managed workspaces root)",
+                task_id, wp,
+            )
+        else:
+            _cleanup_orphaned_scratch_workspace(conn, task_id, path)
         # Kill the owning worker's tmux session if it is now dead, then let any
         # parent whose children are all done run its deferred cleanup.
         _cleanup_worker_tmux(conn, task_id)
@@ -310,11 +330,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             if row["workspace_kind"] == "worktree":
                 _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
                 continue
-            wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+            _cleanup_orphaned_scratch_workspace(conn, parent_id, row["workspace_path"])
     except Exception:
         pass  # best-effort
 
