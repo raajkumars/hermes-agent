@@ -46,6 +46,15 @@ _ACTIVE_CHILDREN_SQL = (
     "LIMIT 1"
 )
 
+# A decomposed child may inherit its parent's scratch path. The first child to
+# complete has no children of its own, so the direct-child check alone would
+# remove a still-live sibling's shared workspace.
+_ACTIVE_WORKSPACE_PEERS_SQL = (
+    "SELECT id, workspace_path FROM tasks "
+    "WHERE id != ? AND status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+    "AND workspace_path IS NOT NULL AND workspace_path != ''"
+)
+
 _WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?"
 
 
@@ -62,6 +71,22 @@ def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProce
 
 def _has_active_children(conn: sqlite3.Connection, task_id: str) -> bool:
     return conn.execute(_ACTIVE_CHILDREN_SQL, (task_id,)).fetchone() is not None
+
+
+def _has_active_workspace_peer(conn: sqlite3.Connection, task_id: str, path: str) -> bool:
+    """Whether another live task names the same workspace path."""
+    try:
+        wanted = Path(path).expanduser().resolve(strict=False)
+    except OSError:
+        return True  # Preserve on an unresolvable path rather than guessing.
+    for row in conn.execute(_ACTIVE_WORKSPACE_PEERS_SQL, (task_id,)):
+        try:
+            candidate = Path(row["workspace_path"]).expanduser().resolve(strict=False)
+        except OSError:
+            continue
+        if _path_key(candidate) == _path_key(wanted):
+            return True
+    return False
 
 
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
@@ -145,12 +170,11 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # See #33774.
             _try_cleanup_parent_workspaces(conn, task_id)
             return
-        # Defer while any child is not yet terminal so it can still read
-        # handoff artifacts from this workspace.
-        if _has_active_children(conn, task_id):
+        # Defer while a child or another task sharing this workspace is not yet
+        # terminal so it can still read handoff artifacts from the workspace.
+        if _has_active_children(conn, task_id) or _has_active_workspace_peer(conn, task_id, path):
             _kb._log.debug(
-                "Deferring %s workspace cleanup for task %s: "
-                "active children still need workspace at %s",
+                "Deferring %s workspace cleanup for task %s: live task still needs workspace at %s",
                 kind, task_id, path,
             )
             return
@@ -280,6 +304,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 or row["workspace_kind"] not in _REMOVABLE_KINDS
                 or not row["workspace_path"]
                 or _has_active_children(conn, parent_id)
+                or _has_active_workspace_peer(conn, parent_id, row["workspace_path"])
             ):
                 continue
             if row["workspace_kind"] == "worktree":
