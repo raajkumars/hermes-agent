@@ -213,6 +213,7 @@ def test_routing_validation_failure_is_persisted_as_a_spawn_error(
 ):
     """Every invalid route returns to ready with a durable explicit failure."""
     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
+    monkeypatch.setattr(kbd, "_installed_profile_exists_fn", lambda: lambda _name: True)
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"model_routing": routing}},
