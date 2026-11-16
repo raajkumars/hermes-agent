@@ -21,6 +21,7 @@ import hermes_state_wal
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_ops
 from hermes_cli import kanban_db_workspace as kbw
 
 
@@ -1054,6 +1055,22 @@ def test_shared_scratch_survives_until_all_decomposed_children_are_terminal(kanb
         kb.complete_task(conn, second, result="second complete")
 
     assert not parent_ws.exists(), "last shared workspace user reaps the scratch path"
+
+
+def test_gc_defers_shared_scratch_while_a_child_is_live(kanban_home):
+    """Headless GC must use the lifecycle cleanup gate, not rmtree an active child's handoff."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="archived scratch parent")
+        child = kb.create_task(conn, title="live shared child")
+        kb.link_tasks(conn, parent, child)
+        parent_ws = kbw.resolve_workspace(kb.get_task(conn, parent))
+        kbw.set_workspace_path(conn, parent, parent_ws)
+        kbw.set_workspace_path(conn, child, parent_ws)
+        assert kb.archive_task(conn, parent)
+
+    assert parent_ws.exists(), "live child keeps the archived parent's shared scratch workspace"
+    assert kanban_ops._cmd_gc(types.SimpleNamespace(event_retention_days=30, log_retention_days=30)) == 0
+    assert parent_ws.exists(), "headless GC must not remove a live child's shared workspace"
 
 
 def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_path):
