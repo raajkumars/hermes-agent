@@ -1050,10 +1050,52 @@ def test_shared_scratch_survives_until_all_decomposed_children_are_terminal(kanb
 
         kb.complete_task(conn, first, result="first complete")
         assert parent_ws.exists(), "live sibling keeps the shared workspace"
+        assert not [
+            event for event in kb.list_events(conn, first)
+            if event.kind == "workspace_cleanup"
+        ]
 
         kb.complete_task(conn, second, result="second complete")
+        cleanup = [
+            event for event in kb.list_events(conn, second)
+            if event.kind == "workspace_cleanup"
+        ]
 
     assert not parent_ws.exists(), "last shared workspace user reaps the scratch path"
+    assert len(cleanup) == 1
+    assert cleanup[0].payload == {
+        "workspace": str(parent_ws), "kind": "scratch", "outcome": "removed",
+    }
+
+
+def test_running_task_keeps_shared_scratch_until_its_own_completion(kanban_home):
+    """A child completion cannot wipe a root's active shared workspace."""
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="active root")
+        child = kb.create_task(conn, title="completed child")
+        root_ws = kbw.resolve_workspace(kb.get_task(conn, root))
+        kbw.set_workspace_path(conn, root, root_ws)
+        kbw.set_workspace_path(conn, child, root_ws)
+        kb.claim_task(conn, root)
+
+        kb.complete_task(conn, child, result="child complete")
+        assert root_ws.exists(), "running root keeps the shared scratch workspace"
+        assert not [
+            event for event in kb.list_events(conn, child)
+            if event.kind == "workspace_cleanup"
+        ]
+
+        kb.complete_task(conn, root, result="root complete", force=True)
+        cleanup = [
+            event for event in kb.list_events(conn, root)
+            if event.kind == "workspace_cleanup"
+        ]
+
+    assert not root_ws.exists()
+    assert len(cleanup) == 1
+    assert cleanup[0].payload == {
+        "workspace": str(root_ws), "kind": "scratch", "outcome": "removed",
+    }
 
 
 def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_path):
@@ -1080,11 +1122,19 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
         assert parent_ws.exists(), "deferred while dir child active"
 
         kb.complete_task(conn, child, result="built")
+        cleanup = [
+            event for event in kb.list_events(conn, parent)
+            if event.kind == "workspace_cleanup"
+        ]
 
     assert not parent_ws.exists(), (
         "A 'dir' child completing must trigger the parent scratch sweep"
     )
     assert child_dir.exists(), "Non-scratch 'dir' child workspace is never deleted"
+    assert len(cleanup) == 1
+    assert cleanup[0].payload == {
+        "workspace": str(parent_ws), "kind": "scratch", "outcome": "removed",
+    }
 
 
 

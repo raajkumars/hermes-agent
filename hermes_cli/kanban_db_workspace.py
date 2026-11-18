@@ -89,6 +89,21 @@ def _has_active_workspace_peer(conn: sqlite3.Connection, task_id: str, path: str
     return False
 
 
+def _record_workspace_cleanup(
+    conn: sqlite3.Connection, task_id: str, path: Path | str, kind: str,
+) -> None:
+    """Journal an actual managed-workspace removal after it succeeds."""
+    try:
+        with _kb.write_txn(conn):
+            _kb._append_event(
+                conn, task_id, "workspace_cleanup",
+                {"workspace": str(path), "kind": kind, "outcome": "removed"},
+            )
+    except Exception:
+        # Cleanup is best-effort; failure to journal must not resurrect a task.
+        _kb._log.warning("Could not record workspace cleanup for task %s", task_id)
+
+
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
     """Return whether *p* is managed scratch storage and the matching board."""
     try:
@@ -193,8 +208,13 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # See #28818.
             if _is_managed_scratch_path(wp):
                 release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Removed scratch workspace: %s", wp)
+                try:
+                    shutil.rmtree(wp)
+                except OSError as exc:
+                    _kb._log.warning("Could not remove scratch workspace %s: %s", wp, exc)
+                else:
+                    _record_workspace_cleanup(conn, task_id, wp, "scratch")
+                    _kb._log.debug("Removed scratch workspace: %s", wp)
             else:
                 _kb._log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -313,8 +333,13 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
                 release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                try:
+                    shutil.rmtree(wp)
+                except OSError as exc:
+                    _kb._log.warning("Could not remove deferred scratch workspace %s: %s", wp, exc)
+                else:
+                    _record_workspace_cleanup(conn, parent_id, wp, "scratch")
+                    _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
 
