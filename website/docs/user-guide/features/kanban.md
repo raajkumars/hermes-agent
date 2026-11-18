@@ -1429,24 +1429,129 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
 
-## Deployment validation for stranded dependencies
+## Platform engineering runbook: dependency-health deployment hook
 
-Before declaring a Hermes deployment healthy, query the deployed dashboard API
-rather than opening its local SQLite database. The API exposes only the board
-and count at `GET /api/plugins/kanban/health/dependencies`, so a deployment
-hook does not need task titles, bodies, or database access.
+Use this hook after every deployment that changes the Kanban dispatcher,
+dependency transitions, board storage, or dashboard plugin API. It prevents a
+rollout from being declared healthy while a `todo` card is stranded behind
+parents that are already terminal.
+
+### Architecture and API contract
+
+The check is deliberately remote and content-free:
+
+1. The deployed Kanban plugin resolves the requested board and calls
+   `list_dependency_stranded_tasks()` against that board's SQLite database.
+2. `GET /api/plugins/kanban/health/dependencies` returns only the resolved board
+   slug and the number of stranded tasks; it never returns task titles, bodies,
+   comments, or identifiers.
+3. `scripts/observability/validate_kanban_dependency_health.py` reads that API
+   with Python's standard-library `urllib.request.urlopen`, validates the JSON,
+   and maps the result to a stable process exit code for deployment automation.
+
+An optional `board` query parameter selects a board. Omit it to inspect the
+active board. Board names are URL-encoded by the client.
+
+```http
+GET /api/plugins/kanban/health/dependencies?board=production
+```
+
+```json
+{
+  "board": "production",
+  "dependency_stranded_task_count": 0
+}
+```
+
+The client uses a 10-second timeout by default (`--timeout` overrides it),
+requires `dependency_stranded_task_count` to be a non-negative JSON integer,
+and fails closed for transport, HTTP, JSON-decoding, and schema errors. It does
+not open the runner's local Kanban database and does not print response content
+or task data.
+
+### Run the hook
+
+Run the checked-out script against the newly deployed instance, after API
+readiness succeeds but before promotion or rollout completion:
 
 ```bash
 python scripts/observability/validate_kanban_dependency_health.py \
   --api-url https://hermes.example.com \
-  --board production
+  --board production \
+  --timeout 10
 ```
 
-The command exits `0` when the count is zero, `1` when dependency-stranded
-tasks exist, and `2` when the API cannot be queried or returns an invalid
-response. Make it a required post-deployment step; a nonzero exit status must
-block rollout completion until the stranded dependency is repaired or the
-deployment is rolled back.
+The client currently sends no credential header. Run it only where the normal
+dashboard access boundary already permits the request, such as a deployment
+runner with an approved authenticated proxy or other controlled service path.
+Do not make the entire dashboard public to accommodate this probe. A `401` or
+`403` is an integration failure and must remain fail-closed; configure the
+runner's approved access path instead of weakening dashboard authentication.
+
+### Exit codes and exact messages
+
+| Exit | Meaning | Output |
+|---|---|---|
+| `0` | The API returned a valid count of zero. | `PASS: no dependency-stranded Kanban tasks detected.` |
+| `1` | The API returned a positive count. | `FAIL: N dependency-stranded Kanban task(s) detected.` |
+| `2` | The API was unreachable, returned HTTP failure or invalid JSON, or violated the response schema. | `ERROR: could not read dependency health from URL: ...` or `ERROR: dependency health response from URL did not contain a non-negative integer dependency_stranded_task_count` |
+
+`ERROR` output can include the endpoint and underlying exception, but never a
+credential or response body. Treat all nonzero results as deployment failures.
+
+### CI/CD integration
+
+Make the hook a required post-deployment gate, not a best-effort observation.
+A typical pipeline order is:
+
+1. Deploy the new revision.
+2. Wait for process and API readiness.
+3. Establish the approved dashboard access path for the runner.
+4. Run the hook against each deployed board that the release can affect.
+5. Promote or mark the rollout successful only when every invocation exits `0`.
+6. On exit `1`, stop promotion and repair the dependency transition or roll
+   back. On exit `2`, stop promotion and repair API reachability, access, or the
+   response contract before retrying.
+
+```yaml
+- name: Validate Kanban dependency promotion
+  env:
+    HERMES_API_URL: ${{ vars.HERMES_API_URL }}
+  run: |
+    python scripts/observability/validate_kanban_dependency_health.py \
+      --api-url "$HERMES_API_URL" \
+      --board production
+```
+
+Do not append `|| true`, use `continue-on-error`, or translate exit `1`/`2` to
+success. For multi-board deployments, invoke the script once per board and fail
+the job when any invocation fails.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| `FAIL: N ... detected` | Terminal parents exist but one or more children remain `todo`. | Inspect dependency diagnostics, repair the missed promotion or bad edge, then rerun. Do not override the gate without resolving the stranded cards. |
+| `HTTP Error 401` or `403` in an `ERROR` line | The runner did not use the approved dashboard access path. | Fix the authenticated proxy/service path. Do not expose the dashboard publicly. |
+| `HTTP Error 404` | The Kanban plugin API is not mounted, the plugin is disabled, or the deployed revision predates the endpoint. | Verify the bundled Kanban plugin is enabled and the deployment contains the endpoint. |
+| `Connection refused`, DNS failure, or timeout | Wrong base URL, service not ready, network policy, or unhealthy deployment. | Check API readiness and runner-to-service connectivity; increase `--timeout` only when startup is legitimately slow. |
+| `did not contain a non-negative integer` | API/client version skew or a broken response contract. | Compare the deployed endpoint response with the two-field contract above; redeploy matching server and script revisions. |
+| Wrong board in the response | `--board` was omitted or points at the wrong board slug. | Pass the intended slug explicitly and verify the returned `board` field. |
+
+### Acceptance criteria
+
+The deployment integration is complete only when all of the following are
+verified in the target environment:
+
+- the endpoint returns HTTP `200` and exactly the expected content-free fields;
+- the hook exits `0` and prints the exact `PASS` line for a zero count;
+- a controlled positive-count response exits `1` and blocks the pipeline;
+- an unreachable endpoint and malformed/schema-invalid response exit `2` and
+  block the pipeline;
+- board selection is exercised when the deployment hosts more than one board;
+- runner access works without making dashboard or task data public;
+- CI treats every nonzero exit as a failed required gate; and
+- no task content, credential, session token, or response body appears in logs.
 
 ## Out of scope
 
