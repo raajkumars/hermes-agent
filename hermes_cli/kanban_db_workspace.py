@@ -89,19 +89,45 @@ def _has_active_workspace_peer(conn: sqlite3.Connection, task_id: str, path: str
     return False
 
 
-def _record_workspace_cleanup(
-    conn: sqlite3.Connection, task_id: str, path: Path | str, kind: str,
-) -> None:
-    """Journal an actual managed-workspace removal after it succeeds."""
+def _workspace_sharers(conn: sqlite3.Connection, path: Path | str) -> list[str]:
+    """All tasks naming *path*, including terminal peers, by resolved identity."""
+    wanted = Path(path).expanduser().resolve(strict=False)
+    sharers: list[str] = []
+    rows = conn.execute(
+        "SELECT id, workspace_path FROM tasks "
+        "WHERE workspace_path IS NOT NULL AND workspace_path != ''"
+    )
+    for row in rows:
+        try:
+            candidate = Path(row["workspace_path"]).expanduser().resolve(strict=False)
+        except OSError:
+            continue
+        if _path_key(candidate) == _path_key(wanted):
+            sharers.append(row["id"])
+    return sharers
+
+
+def _remove_scratch_with_audit(conn: sqlite3.Connection, path: Path) -> bool:
+    """Remove managed scratch only when every sharer receives cleanup proof.
+
+    The event fan-out and deletion share one write transaction: an event insert
+    failure prevents ``rmtree``, while an ``rmtree`` failure rolls every staged
+    event back. This keeps shared-workspace evidence complete rather than
+    attributing cleanup only to whichever terminal task triggered the sweep.
+    """
+    payload = {"workspace": str(path), "kind": "scratch", "outcome": "removed"}
     try:
         with _kb.write_txn(conn):
-            _kb._append_event(
-                conn, task_id, "workspace_cleanup",
-                {"workspace": str(path), "kind": kind, "outcome": "removed"},
-            )
-    except Exception:
-        # Cleanup is best-effort; failure to journal must not resurrect a task.
-        _kb._log.warning("Could not record workspace cleanup for task %s", task_id)
+            sharers = _workspace_sharers(conn, path)
+            if not sharers:
+                return False
+            for sharer_id in sharers:
+                _kb._append_event(conn, sharer_id, "workspace_cleanup", payload)
+            shutil.rmtree(path)
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        _kb._log.warning("Could not remove audited scratch workspace %s: %s", path, exc)
+        return False
+    return True
 
 
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
@@ -208,12 +234,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # See #28818.
             if _is_managed_scratch_path(wp):
                 release_lsp_clients(str(wp))
-                try:
-                    shutil.rmtree(wp)
-                except OSError as exc:
-                    _kb._log.warning("Could not remove scratch workspace %s: %s", wp, exc)
-                else:
-                    _record_workspace_cleanup(conn, task_id, wp, "scratch")
+                if _remove_scratch_with_audit(conn, wp):
                     _kb._log.debug("Removed scratch workspace: %s", wp)
             else:
                 _kb._log.warning(
@@ -333,12 +354,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
                 release_lsp_clients(str(wp))
-                try:
-                    shutil.rmtree(wp)
-                except OSError as exc:
-                    _kb._log.warning("Could not remove deferred scratch workspace %s: %s", wp, exc)
-                else:
-                    _record_workspace_cleanup(conn, parent_id, wp, "scratch")
+                if _remove_scratch_with_audit(conn, wp):
                     _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort

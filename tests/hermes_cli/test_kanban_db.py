@@ -1056,16 +1056,20 @@ def test_shared_scratch_survives_until_all_decomposed_children_are_terminal(kanb
         ]
 
         kb.complete_task(conn, second, result="second complete")
-        cleanup = [
-            event for event in kb.list_events(conn, second)
-            if event.kind == "workspace_cleanup"
-        ]
+        cleanup_by_task = {
+            task_id: [
+                event for event in kb.list_events(conn, task_id)
+                if event.kind == "workspace_cleanup"
+            ]
+            for task_id in (parent, first, second)
+        }
 
     assert not parent_ws.exists(), "last shared workspace user reaps the scratch path"
-    assert len(cleanup) == 1
-    assert cleanup[0].payload == {
-        "workspace": str(parent_ws), "kind": "scratch", "outcome": "removed",
-    }
+    for cleanup in cleanup_by_task.values():
+        assert len(cleanup) == 1
+        assert cleanup[0].payload == {
+            "workspace": str(parent_ws), "kind": "scratch", "outcome": "removed",
+        }
 
 
 def test_running_task_keeps_shared_scratch_until_its_own_completion(kanban_home):
@@ -1086,16 +1090,48 @@ def test_running_task_keeps_shared_scratch_until_its_own_completion(kanban_home)
         ]
 
         kb.complete_task(conn, root, result="root complete", force=True)
-        cleanup = [
-            event for event in kb.list_events(conn, root)
-            if event.kind == "workspace_cleanup"
-        ]
+        cleanup_by_task = {
+            task_id: [
+                event for event in kb.list_events(conn, task_id)
+                if event.kind == "workspace_cleanup"
+            ]
+            for task_id in (root, child)
+        }
 
     assert not root_ws.exists()
-    assert len(cleanup) == 1
-    assert cleanup[0].payload == {
-        "workspace": str(root_ws), "kind": "scratch", "outcome": "removed",
-    }
+    for cleanup in cleanup_by_task.values():
+        assert len(cleanup) == 1
+        assert cleanup[0].payload == {
+            "workspace": str(root_ws), "kind": "scratch", "outcome": "removed",
+        }
+
+
+def test_scratch_cleanup_is_fail_closed_when_audit_fanout_fails(kanban_home, monkeypatch):
+    """A missing cleanup event must preserve the shared workspace."""
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="audited root")
+        peer = kb.create_task(conn, title="audited peer")
+        root_ws = kbw.resolve_workspace(kb.get_task(conn, root))
+        kbw.set_workspace_path(conn, root, root_ws)
+        kbw.set_workspace_path(conn, peer, root_ws)
+        kb.complete_task(conn, peer, result="peer complete")
+
+        append_event = kb._append_event
+
+        def fail_cleanup_event(conn, task_id, kind, payload, **kwargs):
+            if kind == "workspace_cleanup":
+                raise sqlite3.OperationalError("audit unavailable")
+            return append_event(conn, task_id, kind, payload, **kwargs)
+
+        monkeypatch.setattr(kb, "_append_event", fail_cleanup_event)
+        kb.complete_task(conn, root, result="root complete")
+
+        assert root_ws.exists()
+        for task_id in (root, peer):
+            assert not [
+                event for event in kb.list_events(conn, task_id)
+                if event.kind == "workspace_cleanup"
+            ]
 
 
 def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_path):
