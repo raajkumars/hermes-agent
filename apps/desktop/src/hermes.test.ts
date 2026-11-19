@@ -101,7 +101,7 @@ describe('Hermes REST helpers', () => {
       expect.objectContaining({
         path:
           '/api/profiles/sessions/sidebar?recents_profile=work&recents_limit=30&cron_limit=50' +
-          '&messaging_limit=100&recents_exclude=cron%2Ctool&messaging_exclude=cron%2Cdesktop',
+          '&messaging_limit=100&kind=interactive&recents_exclude=cron%2Ctool&messaging_exclude=cron%2Cdesktop',
         timeoutMs: 60_000
       })
     )

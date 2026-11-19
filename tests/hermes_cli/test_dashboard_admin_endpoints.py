@@ -527,6 +527,16 @@ class TestSessionManagementEndpoints:
         assert r.status_code == 200
         body = r.json()
         assert body["by_source"]["cli"] >= 1
+        # The dashboard groups its source picker by these; they must agree
+        # with the backend's own kind classification.
+        from hermes_state_sessions import session_kind
+        assert body["background_sources"]
+        assert all(
+            session_kind({"source": s}) == "background"
+            for s in body["background_sources"]
+        )
+        assert session_kind({"source": "cli"}) == "interactive"
+        assert "cli" not in body["background_sources"]
 
 
 

@@ -435,6 +435,102 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
+    def test_session_kind_defaults_to_interactive_and_explicit_source_bypasses_it(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            for session_id, source in (("chat", "desktop"), ("worker", "kanban"), ("cron", "cron")):
+                db.create_session(session_id, source=source)
+                db.append_message(session_id, role="user", content="hi")
+            assert db.set_session_pinned("chat", True)
+        finally:
+            db.close()
+
+        default = self.client.get("/api/sessions?limit=50").json()
+        assert {row["id"] for row in default["sessions"]} == {"chat"}
+        assert {row["session_kind"] for row in default["sessions"]} == {"interactive"}
+
+        background = self.client.get("/api/sessions?kind=background&limit=50").json()
+        assert {row["id"] for row in background["sessions"]} == {"worker", "cron"}
+        assert {row["session_kind"] for row in background["sessions"]} == {"background"}
+
+        all_rows = self.client.get("/api/sessions?kind=all&limit=50").json()["sessions"]
+        assert {row["id"] for row in all_rows} == {"chat", "worker", "cron"}
+        assert self.client.get("/api/sessions?kind=unknown&limit=50").status_code == 400
+        # An explicit source bypasses kind filtering but never kind validation.
+        bad_with_source = self.client.get("/api/sessions?kind=automation&source=cron&limit=50")
+        assert bad_with_source.status_code == 400
+        assert "kind must be one of" in bad_with_source.json()["detail"]
+
+        explicit = self.client.get("/api/sessions?source=cron&limit=50").json()
+        assert [row["id"] for row in explicit["sessions"]] == ["cron"]
+        assert explicit["sessions"][0]["session_kind"] == "background"
+
+    def test_session_search_kind_scopes_results_like_the_list(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            for session_id, source in (("s-chat", "cli"), ("s-worker", "kanban")):
+                db.create_session(session_id, source=source)
+                db.append_message(session_id, role="user", content="kindprobe needle")
+        finally:
+            db.close()
+
+        def hits(query: str) -> set:
+            resp = self.client.get(f"/api/sessions/search?q=kindprobe{query}")
+            assert resp.status_code == 200
+            return {row["session_id"] for row in resp.json()["results"]}
+
+        # Each tab's search returns exactly what its list returns.
+        for kind in ("interactive", "background", "all"):
+            listed = self.client.get(f"/api/sessions?kind={kind}&limit=50").json()["sessions"]
+            assert hits(f"&kind={kind}") == {row["id"] for row in listed}
+        assert hits("") == {"s-chat", "s-worker"}
+        assert self.client.get("/api/sessions/search?q=kindprobe&kind=bogus").status_code == 400
+
+    def test_profiles_session_kind_filters_and_preserves_source_sections(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            for session_id, source in (("profile-chat", "cli"), ("profile-worker", "a2a"), ("profile-cron", "cron")):
+                db.create_session(session_id, source=source)
+                db.append_message(session_id, role="user", content="hi")
+            assert db.set_session_pinned("profile-chat", True)
+            assert db.set_session_pinned("profile-worker", True)
+        finally:
+            db.close()
+
+        default = self.client.get("/api/profiles/sessions?limit=50").json()
+        assert {row["id"] for row in default["sessions"]} == {"profile-chat"}
+        assert default["sessions"][0]["session_kind"] == "interactive"
+
+        background = self.client.get("/api/profiles/sessions?kind=background&limit=50").json()
+        assert {row["id"] for row in background["sessions"]} == {"profile-worker", "profile-cron"}
+        all_rows = self.client.get("/api/profiles/sessions?kind=all&limit=50").json()["sessions"]
+        assert {row["id"] for row in all_rows} == {"profile-chat", "profile-worker", "profile-cron"}
+
+        sidebar = self.client.get(
+            "/api/profiles/sessions/sidebar?recents_limit=19&recents_exclude=cron"
+        ).json()
+        assert {row["id"] for row in sidebar["recents"]["sessions"]} == {"profile-chat"}
+        assert {row["session_kind"] for row in sidebar["recents"]["sessions"]} == {"interactive"}
+        assert {row["id"] for row in sidebar["cron"]["sessions"]} == {"profile-cron"}
+        assert sidebar["cron"]["sessions"][0]["session_kind"] == "background"
+
+        # Pins are back-filled only after all source/kind filters apply: an
+        # interactive pin cannot leak into a background-only sidebar request.
+        background_sidebar = self.client.get(
+            "/api/profiles/sessions/sidebar?kind=background&recents_limit=1&recents_exclude=cron"
+        ).json()
+        assert {row["id"] for row in background_sidebar["recents"]["sessions"]} == {"profile-worker"}
+        assert {row["session_kind"] for row in background_sidebar["recents"]["sessions"]} == {"background"}
+        # Cron has an explicit source selector and deliberately bypasses the
+        # interactive default, mirroring the standalone list endpoint.
+        assert {row["id"] for row in background_sidebar["cron"]["sessions"]} == {"profile-cron"}
+
     @pytest.mark.parametrize(
         "missing_column", ["archived", "pinned", "last_activity_at"]
     )

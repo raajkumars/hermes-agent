@@ -171,10 +171,19 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
 
 # Lifecycle statuses surfaced by session pickers; classified from the final
 # message row ONLY so it stays O(1) per session.
-# Sessions that are not human conversations (kanban workers, third-party tool integrations, finite one-shot
-# runs): every human picker — TUI/Desktop session lists, ``/sessions`` in the CLI, ``sessions list`` in the
-# console — excludes them. A deny-list, so new interactive platforms surface automatically.
-INTERNAL_LISTING_SOURCES = ("kanban", "tool", "oneshot")
+# Sessions that are not human conversations (workers, automations, and finite one-shot runs).  This is a
+# deny-list: new interactive platforms surface automatically.  Picker filtering derives from the same set so
+# a source cannot be classified as background yet accidentally appear in a human session listing.
+BACKGROUND_SESSION_SOURCES = frozenset({
+    "kanban", "subagent", "cron", "a2a", "oneshot", "tool", "webhook", "acp", "hermes_flow",
+    "vulcan_delegate",
+})
+INTERNAL_LISTING_SOURCES = BACKGROUND_SESSION_SOURCES
+
+
+def session_kind(row: Dict[str, Any]) -> str:
+    """Return the session's picker kind from its persisted source only."""
+    return "background" if row["source"] in BACKGROUND_SESSION_SOURCES else "interactive"
 
 SESSION_STATUS_COMPLETE = "complete"
 SESSION_STATUS_INTERRUPTED = "interrupted"

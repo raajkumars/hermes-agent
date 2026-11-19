@@ -9,11 +9,14 @@ import pytest
 
 from hermes_state import SessionDB
 from hermes_state_sessions import (
+    BACKGROUND_SESSION_SOURCES,
+    INTERNAL_LISTING_SOURCES,
     SESSION_STATUS_COMPLETE,
     SESSION_STATUS_EMPTY,
     SESSION_STATUS_ERROR,
     SESSION_STATUS_INTERRUPTED,
     classify_session_status,
+    session_kind,
 )
 
 
@@ -29,6 +32,36 @@ def db(tmp_path):
 # ---------------------------------------------------------------------------
 # Pure classifier
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("source", (
+    "kanban", "subagent", "cron", "a2a", "oneshot", "tool", "webhook", "acp", "hermes_flow",
+    "vulcan_delegate",
+))
+def test_session_kind_marks_every_background_source(source):
+    assert session_kind({"source": source}) == "background"
+
+
+def test_listing_sources_are_the_background_sources():
+    assert INTERNAL_LISTING_SOURCES is BACKGROUND_SESSION_SOURCES
+
+
+def test_session_kind_uses_recorded_source_not_title_or_id_prefix():
+    assert session_kind({
+        "id": "kanban-worker-42",
+        "title": "cron: reconcile sessions",
+        "source": "cli",
+    }) == "interactive"
+
+
+def test_session_kind_keeps_compression_continuation_on_parent_source():
+    continuation = {
+        "id": "compressed-child",
+        "parent_session_id": "parent",
+        "end_reason": "compression",
+        "source": "cli",
+    }
+    assert session_kind(continuation) == "interactive"
 
 @pytest.mark.parametrize(
     "role,has_tool_calls,finish_reason,expected",
