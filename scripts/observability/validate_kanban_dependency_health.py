@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 import json
+import math
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -24,6 +25,8 @@ class DependencyHealthAPIError(RuntimeError):
 
 def stranded_task_count(*, api_url: str, board: Optional[str] = None, timeout: float = 10.0) -> int:
     """Return the deployed board's dependency-stranded count through Hermes API."""
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise DependencyHealthAPIError("timeout must be a positive finite number of seconds")
     query = urlencode({"board": board}) if board else ""
     endpoint = f"{api_url.rstrip('/')}/api/plugins/kanban/health/dependencies"
     if query:

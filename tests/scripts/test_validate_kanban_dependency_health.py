@@ -66,3 +66,19 @@ def test_validation_hook_fails_closed_for_invalid_deployed_api_response(monkeypa
 
     assert mod.main(["--api-url", "https://hermes.example"]) == 2
     assert "ERROR: dependency health response" in capsys.readouterr().out
+
+
+def test_validation_hook_fails_closed_for_non_positive_timeout(monkeypatch, capsys):
+    mod = _load()
+    called = False
+
+    def fake_urlopen(url, *, timeout):
+        nonlocal called
+        called = True
+        return _json_response({"dependency_stranded_task_count": 0})
+
+    monkeypatch.setattr(mod, "urlopen", fake_urlopen)
+
+    assert mod.main(["--api-url", "https://hermes.example", "--timeout", "-1"]) == 2
+    assert called is False
+    assert capsys.readouterr().out == "ERROR: timeout must be a positive finite number of seconds\n"

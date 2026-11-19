@@ -1436,25 +1436,65 @@ dependency transitions, board storage, or dashboard plugin API. It prevents a
 rollout from being declared healthy while a `todo` card is stranded behind
 parents that are already terminal.
 
-### Architecture and API contract
+### Hook architecture
+
+Register the hook as a required post-deployment pipeline step for every board a
+release can affect. Trigger it after process and API readiness succeeds but
+before promotion, traffic cutover, or rollout completion. Keep registration in
+the deployment workflow rather than in a long-running Hermes process: each run
+is an independent, fail-closed probe with a stable exit code, so the CI/CD
+system remains the owner of retries, timeouts, and release blocking.
 
 The check is deliberately remote and content-free:
 
-1. The deployed Kanban plugin resolves the requested board and calls
+1. The deployment workflow invokes the checked-out
+   `scripts/observability/validate_kanban_dependency_health.py` once per board.
+2. The deployed Kanban plugin resolves the requested board and calls
    `list_dependency_stranded_tasks()` against that board's SQLite database.
-2. `GET /api/plugins/kanban/health/dependencies` returns only the resolved board
+3. `GET /api/plugins/kanban/health/dependencies` returns only the resolved board
    slug and the number of stranded tasks; it never returns task titles, bodies,
    comments, or identifiers.
-3. `scripts/observability/validate_kanban_dependency_health.py` reads that API
-   with Python's standard-library `urllib.request.urlopen`, validates the JSON,
-   and maps the result to a stable process exit code for deployment automation.
+4. The client validates that response and maps it to a stable process exit code.
+   The deployment workflow blocks promotion on any nonzero result.
 
-An optional `board` query parameter selects a board. Omit it to inspect the
-active board. Board names are URL-encoded by the client.
+Manage the hook and endpoint as one versioned contract. A release that changes
+the route or response schema must update the checked-out client and its contract
+tests in the same change. Multi-board deployments register one invocation per
+board; do not aggregate by opening SQLite directly or bypass a failing board.
+
+### API client details
+
+The reusable Python interface is:
+
+```python
+stranded_task_count(
+    *,
+    api_url: str,
+    board: Optional[str] = None,
+    timeout: float = 10.0,
+) -> int
+```
+
+It raises `DependencyHealthAPIError` for transport, HTTP, JSON-decoding, or
+schema failures. The command-line `main()` converts that exception to exit `2`;
+a positive returned count becomes exit `1`, and zero becomes exit `0`.
+
+Request schema:
+
+| Field | Location | Type | Required | Meaning |
+|---|---|---|---|---|
+| `api_url` | client argument | URL string | yes | Deployed Hermes base URL; a trailing slash is removed. |
+| `board` | query string | string | no | Board slug. Omit it to inspect the active board. The client URL-encodes it. |
+| `timeout` | client argument | positive finite seconds | no | `urlopen` timeout; defaults to `10.0`; invalid values fail before the request. |
+
+The request has no body. The current client sends no credential header, so the
+runner must reach the route through the approved dashboard access boundary.
 
 ```http
 GET /api/plugins/kanban/health/dependencies?board=production
 ```
+
+Successful response schema:
 
 ```json
 {
@@ -1463,11 +1503,15 @@ GET /api/plugins/kanban/health/dependencies?board=production
 }
 ```
 
-The client uses a 10-second timeout by default (`--timeout` overrides it),
-requires `dependency_stranded_task_count` to be a non-negative JSON integer,
-and fails closed for transport, HTTP, JSON-decoding, and schema errors. It does
-not open the runner's local Kanban database and does not print response content
-or task data.
+| Field | Type | Client validation |
+|---|---|---|
+| `board` | string | Returned by the server for operator visibility; the current client does not use it to select the result. |
+| `dependency_stranded_task_count` | integer | Required, non-negative, and not a JSON boolean. |
+
+The client uses Python's standard-library `urllib.request.urlopen` and
+`json.load`. It does not open the runner's local Kanban database, and error
+messages include the endpoint and exception but never the response body, task
+data, or credentials.
 
 ### Run the hook
 
