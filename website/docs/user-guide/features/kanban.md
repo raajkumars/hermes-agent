@@ -1557,7 +1557,8 @@ runner's approved access path instead of weakening dashboard authentication.
 |---|---|---|
 | `0` | The API returned a valid count of zero. | `PASS: no dependency-stranded Kanban tasks detected.` |
 | `1` | The API returned a positive count. | `FAIL: N dependency-stranded Kanban task(s) detected.` |
-| `2` | `--timeout` was zero, negative, infinite, or not a number. | `ERROR: timeout must be a positive finite number of seconds` |
+| `2` | `--timeout` was zero, negative, `inf`, or `nan`. | `ERROR: timeout must be a positive finite number of seconds` |
+| `2` | `--timeout` was not a number (for example `abc`); argparse rejects it before the script runs. | On stderr, the usage line followed by `validate_kanban_dependency_health.py: error: argument --timeout: invalid float value: 'abc'` |
 | `2` | The API was unreachable, timed out, returned an HTTP failure, or returned invalid JSON. | `ERROR: could not read dependency health from <endpoint>: <exception>` |
 | `2` | The response omitted the count or returned a negative, boolean, or non-integer count. | `ERROR: dependency health response from <endpoint> did not contain a non-negative integer dependency_stranded_task_count` |
 
@@ -1569,6 +1570,17 @@ unauthenticated request commonly prints:
 ```text
 ERROR: could not read dependency health from https://hermes.example.com/api/plugins/kanban/health/dependencies?board=production: HTTP Error 401: Unauthorized
 ```
+
+Other common `<exception>` texts (errno wording is platform-dependent; Linux shown):
+
+| Cause | `<exception>` text |
+|---|---|
+| Request timeout | `timed out` |
+| HTTP 403 | `HTTP Error 403: Forbidden` |
+| HTTP 404 | `HTTP Error 404: Not Found` |
+| Connection refused | `<urlopen error [Errno 111] Connection refused>` |
+| DNS failure | `<urlopen error [Errno -2] Name or service not known>` |
+| Non-JSON body, such as a proxy login page | `Expecting value: line 1 column 1 (char 0)` |
 
 The HTTP reason phrase is supplied by the server, so it may differ while the
 message prefix and endpoint remain stable. `ERROR` output never includes a
@@ -1610,6 +1622,8 @@ the job when any invocation fails.
 | `HTTP Error 401` or `403` in an `ERROR` line | The runner did not use the approved dashboard access path. | Fix the authenticated proxy/service path. Do not expose the dashboard publicly. |
 | `HTTP Error 404` | The Kanban plugin API is not mounted, the plugin is disabled, or the deployed revision predates the endpoint. | Verify the bundled Kanban plugin is enabled and the deployment contains the endpoint. |
 | `Connection refused`, DNS failure, or timeout | Wrong base URL, service not ready, network policy, or unhealthy deployment. | Check API readiness and runner-to-service connectivity; increase `--timeout` only when startup is legitimately slow. |
+| `invalid float value` on stderr | `--timeout` was given a non-numeric value. | Pass a number of seconds, for example `--timeout 20`. |
+| `Expecting value: line 1 column 1 (char 0)` | A proxy answered the unauthenticated request with an HTML login page (HTTP 200), or the route returned non-JSON. | Treat it first as an access-path failure, as for `401`/`403`; if access is correct, check for version skew. |
 | `did not contain a non-negative integer` | API/client version skew or a broken response contract. | Compare the deployed endpoint response with the two-field contract above; redeploy matching server and script revisions. |
 | Wrong board in the response | `--board` was omitted or points at the wrong board slug. | Pass the intended slug explicitly and verify the returned `board` field. |
 
@@ -1624,15 +1638,18 @@ Hook result
 │  ├─ Inspect dependency diagnostics for terminal-parent todo children.
 │  └─ Repair the transition or edge, rerun the hook, and continue only on PASS.
 └─ exit 2 / ERROR
-   ├─ "timeout must be a positive finite number"?
-   │  └─ Supply a finite --timeout greater than zero.
+   ├─ "timeout must be a positive finite number" or "invalid float value"?
+   │  └─ Supply a numeric, finite --timeout greater than zero.
    ├─ HTTP 401 or 403?
    │  └─ Restore the runner's approved authenticated access path.
+   ├─ "Expecting value: line 1 column 1 (char 0)"?
+   │  ├─ Likely a proxy login page: restore the approved access path first.
+   │  └─ Access confirmed correct? Treat as version skew (below).
    ├─ HTTP 404?
    │  └─ Verify the Kanban plugin is enabled and the deployed revision has the route.
-   ├─ Connection, DNS, or timeout exception?
+   ├─ Connection refused, DNS failure, or "timed out"?
    │  └─ Verify readiness, URL, network policy, and service health.
-   └─ Invalid JSON or count-schema error?
+   └─ Other invalid JSON or count-schema error?
       └─ Deploy matching endpoint/client versions and verify the response contract.
 ```
 
