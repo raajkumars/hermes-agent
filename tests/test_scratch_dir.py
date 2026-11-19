@@ -5,6 +5,7 @@ import stat
 import subprocess
 import sys
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -128,6 +129,86 @@ def test_profile_scratch_prune_stamp_throttles_separate_dispatcher_processes(tmp
     assert prune_profile_scratch_dirs_once(profiles) == 0
     assert calls == [profiles]
     assert (profiles / ".last_profile_scratch_prune").exists()
+
+
+_RACE_CHILD = """
+import os, sys, time
+from pathlib import Path
+import hermes_constants as hc
+
+profiles, ready, go = sys.argv[1:4]
+
+def _slow_prune(root):
+    time.sleep(2.0)
+    return 1
+
+def _slow(fn):
+    def wrapper(*args, **kwargs):
+        time.sleep(0.2)
+        return fn(*args, **kwargs)
+    return wrapper
+
+# Slow every way of writing the stamp, widening the gap between checking the
+# throttle and claiming it, so a non-atomic check-then-claim loses reliably.
+Path.touch = _slow(Path.touch)
+os.utime = _slow(os.utime)
+hc.prune_profile_scratch_dirs = _slow_prune
+Path(ready).touch()
+while not os.path.exists(go):
+    pass
+print(hc.prune_profile_scratch_dirs_once(Path(profiles)), flush=True)
+"""
+
+
+def test_profile_scratch_janitor_admits_exactly_one_concurrent_process(tmp_path):
+    """Racing dispatcher processes released together: exactly one runs the destructive janitor."""
+    import hermes_constants
+
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    go = tmp_path / "go"
+    repo = str(Path(hermes_constants.__file__).resolve().parent)
+    env = {**os.environ, "PYTHONPATH": repo + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    children = []
+    for i in range(8):
+        ready = tmp_path / f"ready-{i}"
+        children.append((ready, subprocess.Popen(
+            [sys.executable, "-c", _RACE_CHILD, str(profiles), str(ready), str(go)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )))
+    deadline = time.monotonic() + 60
+    while not all(ready.exists() for ready, _ in children):
+        assert time.monotonic() < deadline, "race children never became ready"
+        time.sleep(0.01)
+    go.touch()
+
+    results = []
+    for _, proc in children:
+        out, err = proc.communicate(timeout=60)
+        assert proc.returncode == 0, err
+        results.append(int(out.strip()))
+
+    assert sorted(results) == [0] * 7 + [1]
+
+
+def test_profile_scratch_janitor_reruns_after_expired_or_future_stamp(tmp_path, monkeypatch):
+    """An expired stamp, or one dated ahead of the clock, never pins the janitor off."""
+    import hermes_constants
+
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    stamp = profiles / ".last_profile_scratch_prune"
+    calls = []
+    monkeypatch.setattr(hermes_constants, "prune_profile_scratch_dirs", lambda root: calls.append(root) or 1)
+
+    for offset in (-2 * 3600, 10 * 3600):
+        stamp.touch()
+        moved = time.time() + offset
+        os.utime(stamp, (moved, moved))
+        assert prune_profile_scratch_dirs_once(profiles) == 1
+        assert prune_profile_scratch_dirs_once(profiles) == 0
+
+    assert calls == [profiles, profiles]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory modes")

@@ -1006,6 +1006,7 @@ SCRATCH_DIR_MARKER_ENV = "HERMES_SCRATCH_DIR"
 SCRATCH_MAX_AGE_HOURS = 72
 _SCRATCH_PRUNE_STAMP = ".last_prune"
 _PROFILE_SCRATCH_PRUNE_STAMP = ".last_profile_scratch_prune"
+_PROFILE_SCRATCH_PRUNE_LOCK = ".profile_scratch_prune.lock"
 _SCRATCH_PRUNE_INTERVAL_SECONDS = 3600
 _scratch_pruned_once = False
 
@@ -1226,25 +1227,78 @@ def prune_profile_scratch_dirs(
     return removed
 
 
+@contextlib.contextmanager
+def _try_exclusive_file_lock(lock_path: Path):
+    """Yield True while holding a non-blocking cross-process lock on *lock_path*.
+
+    Yields False when another process holds it, the file cannot be opened, or
+    the platform has no file locking. The kernel drops the lock when its holder
+    exits, so a crashed janitor never leaves a stale lock behind.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    try:
+        import msvcrt
+    except ImportError:
+        msvcrt = None
+    if fcntl is None and msvcrt is None:
+        yield False
+        return
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError:
+        yield False
+        return
+    try:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
 def prune_profile_scratch_dirs_once(profiles_dir: Path | None = None) -> int:
     """Run the host-wide profile scratch janitor at most once per hour.
 
-    The stamp is held at the profiles root so separate one-shot dispatcher
-    processes share the same throttle without creating any profile homes.
+    Separate one-shot dispatcher processes race here, and the janitor deletes
+    files, so the hourly check-and-claim must be atomic across processes: it
+    runs under an exclusive lock at the profiles root, and a process that
+    cannot take the lock skips rather than waits. A stamp dated in the future
+    (clock moved backwards) counts as expired so it cannot pin the janitor off.
     """
     import time
     root = profiles_dir if profiles_dir is not None else get_default_hermes_root() / "profiles"
     stamp = root / _PROFILE_SCRATCH_PRUNE_STAMP
-    try:
-        if time.time() - stamp.stat().st_mtime < _SCRATCH_PRUNE_INTERVAL_SECONDS:
+    with _try_exclusive_file_lock(root / _PROFILE_SCRATCH_PRUNE_LOCK) as acquired:
+        if not acquired:
             return 0
-    except OSError:
-        pass
-    try:
-        stamp.touch()
-    except OSError:
-        return 0
-    return prune_profile_scratch_dirs(root)
+        now = time.time()
+        try:
+            age = now - stamp.lstat().st_mtime
+        except FileNotFoundError:
+            age = None
+        except OSError:
+            return 0
+        if age is not None and 0 <= age < _SCRATCH_PRUNE_INTERVAL_SECONDS:
+            return 0
+        try:
+            fd = os.open(stamp, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                os.utime(fd if os.utime in os.supports_fd else stamp, (now, now))
+            finally:
+                os.close(fd)
+        except OSError:
+            return 0
+        return prune_profile_scratch_dirs(root)
 
 
 def _prune_scratch_dir_once(scratch: Path) -> None:
