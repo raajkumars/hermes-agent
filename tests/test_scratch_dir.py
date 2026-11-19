@@ -5,11 +5,18 @@ import stat
 import subprocess
 import sys
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from hermes_constants import apply_scratch_tmp_env, get_scratch_dir, prune_scratch_dir
+from hermes_constants import (
+    apply_scratch_tmp_env,
+    get_scratch_dir,
+    prune_profile_scratch_dirs,
+    prune_profile_scratch_dirs_once,
+    prune_scratch_dir,
+)
 
 
 def test_scratch_env_follows_home_and_respects_user_tmpdir(tmp_path):
@@ -56,6 +63,152 @@ def test_prune_removes_only_stale_top_level_entries(tmp_path):
     os.utime(stale, (ancient, ancient))
     assert prune_scratch_dir(scratch) == 1
     assert not stale.exists() and fresh.exists()
+
+
+def test_profile_scratch_prune_reclaims_stale_entries_without_touching_non_profiles(tmp_path):
+    profiles = tmp_path / "profiles"
+    profile_scratch = profiles / "active" / "cache" / "scratch"
+    stale = profile_scratch / "stale"
+    stale.mkdir(parents=True)
+    (profiles / "active" / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    ignored = profiles / "stray" / "cache" / "scratch" / "stale"
+    ignored.mkdir(parents=True)
+    ancient = time.time() - 100 * 3600
+    os.utime(stale, (ancient, ancient))
+    os.utime(ignored, (ancient, ancient))
+
+    assert prune_profile_scratch_dirs(profiles) == 1
+    assert not stale.exists()
+    assert ignored.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+def test_profile_scratch_prune_does_not_follow_profile_home_symlink(tmp_path):
+    profiles = tmp_path / "profiles"
+    external = tmp_path / "external-profile"
+    stale = external / "cache" / "scratch" / "stale"
+    stale.mkdir(parents=True)
+    (external / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    (profiles / "linked").parent.mkdir()
+    (profiles / "linked").symlink_to(external, target_is_directory=True)
+    ancient = time.time() - 100 * 3600
+    os.utime(stale, (ancient, ancient))
+
+    assert prune_profile_scratch_dirs(profiles) == 0
+    assert stale.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+def test_profile_scratch_prune_does_not_follow_scratch_symlink(tmp_path):
+    profiles = tmp_path / "profiles"
+    profile = profiles / "active"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    external_scratch = tmp_path / "external-scratch"
+    stale = external_scratch / "stale"
+    stale.mkdir(parents=True)
+    (profile / "cache").mkdir()
+    (profile / "cache" / "scratch").symlink_to(external_scratch, target_is_directory=True)
+    ancient = time.time() - 100 * 3600
+    os.utime(stale, (ancient, ancient))
+
+    assert prune_profile_scratch_dirs(profiles) == 0
+    assert stale.exists()
+
+
+def test_profile_scratch_prune_stamp_throttles_separate_dispatcher_processes(tmp_path, monkeypatch):
+    """The profiles-root stamp survives a fresh dispatcher module process."""
+    import hermes_constants
+
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    calls = []
+    monkeypatch.setattr(hermes_constants, "prune_profile_scratch_dirs", lambda root: calls.append(root) or 3)
+
+    assert prune_profile_scratch_dirs_once(profiles) == 3
+    assert prune_profile_scratch_dirs_once(profiles) == 0
+    assert calls == [profiles]
+    assert (profiles / ".last_profile_scratch_prune").exists()
+
+
+_RACE_CHILD = """
+import os, sys, time
+from pathlib import Path
+import hermes_constants as hc
+
+profiles, ready, go = sys.argv[1:4]
+
+def _slow_prune(root):
+    time.sleep(2.0)
+    return 1
+
+def _slow(fn):
+    def wrapper(*args, **kwargs):
+        time.sleep(0.2)
+        return fn(*args, **kwargs)
+    return wrapper
+
+# Slow every way of writing the stamp, widening the gap between checking the
+# throttle and claiming it, so a non-atomic check-then-claim loses reliably.
+Path.touch = _slow(Path.touch)
+os.utime = _slow(os.utime)
+hc.prune_profile_scratch_dirs = _slow_prune
+Path(ready).touch()
+while not os.path.exists(go):
+    pass
+print(hc.prune_profile_scratch_dirs_once(Path(profiles)), flush=True)
+"""
+
+
+def test_profile_scratch_janitor_admits_exactly_one_concurrent_process(tmp_path):
+    """Racing dispatcher processes released together: exactly one runs the destructive janitor."""
+    import hermes_constants
+
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    go = tmp_path / "go"
+    repo = str(Path(hermes_constants.__file__).resolve().parent)
+    env = {**os.environ, "PYTHONPATH": repo + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    children = []
+    for i in range(8):
+        ready = tmp_path / f"ready-{i}"
+        children.append((ready, subprocess.Popen(
+            [sys.executable, "-c", _RACE_CHILD, str(profiles), str(ready), str(go)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )))
+    deadline = time.monotonic() + 60
+    while not all(ready.exists() for ready, _ in children):
+        assert time.monotonic() < deadline, "race children never became ready"
+        time.sleep(0.01)
+    go.touch()
+
+    results = []
+    for _, proc in children:
+        out, err = proc.communicate(timeout=60)
+        assert proc.returncode == 0, err
+        results.append(int(out.strip()))
+
+    assert sorted(results) == [0] * 7 + [1]
+
+
+def test_profile_scratch_janitor_reruns_after_expired_or_future_stamp(tmp_path, monkeypatch):
+    """An expired stamp, or one dated ahead of the clock, never pins the janitor off."""
+    import hermes_constants
+
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    stamp = profiles / ".last_profile_scratch_prune"
+    calls = []
+    monkeypatch.setattr(hermes_constants, "prune_profile_scratch_dirs", lambda root: calls.append(root) or 1)
+
+    for offset in (-2 * 3600, 10 * 3600):
+        stamp.touch()
+        moved = time.time() + offset
+        os.utime(stamp, (moved, moved))
+        assert prune_profile_scratch_dirs_once(profiles) == 1
+        assert prune_profile_scratch_dirs_once(profiles) == 0
+
+    assert calls == [profiles, profiles]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory modes")

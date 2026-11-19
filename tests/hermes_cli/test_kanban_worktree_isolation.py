@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -127,6 +128,49 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head == "wt/sibling"
+
+
+def test_missing_board_default_uses_shared_hermes_worktree(kanban_home, tmp_path, monkeypatch):
+    """No board default still yields one isolated worktree per task."""
+    shared = _make_repo(tmp_path)
+    monkeypatch.setattr(kbw, "_ensure_shared_hermes_upstream", lambda: shared)
+
+    class _Task:
+        id = "t_shared"
+        workspace_kind = "worktree"
+        workspace_path = None
+        branch_name = None
+
+    workspace, branch = kbw._resolve_worktree_workspace(cast(kb.Task, _Task()))
+
+    assert workspace == shared / ".worktrees" / "t_shared"
+    assert branch == "wt/t_shared"
+    assert (workspace / "README.md").read_text(encoding="utf-8") == "base\n"
+
+
+def test_shared_upstream_clone_is_idempotent_and_uses_local_reference(tmp_path, monkeypatch):
+    """A first clone is published once; later calls reuse it without fetching."""
+    source_parent = tmp_path / "source-parent"
+    source_parent.mkdir()
+    source = _make_repo(source_parent)
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(source), str(remote)],
+        check=True, capture_output=True, text=True,
+    )
+    shared = tmp_path / "repos" / "hermes-upstream"
+    monkeypatch.setattr(kbw, "_SHARED_HERMES_UPSTREAM", shared)
+    monkeypatch.setattr(kbw, "_HERMES_UPSTREAM_REMOTE", str(remote))
+    monkeypatch.setattr(kbw, "_local_hermes_checkout", lambda: source)
+
+    first = kbw._ensure_shared_hermes_upstream()
+    second = kbw._ensure_shared_hermes_upstream()
+
+    assert first == shared
+    assert second == shared
+    assert kbw._is_git_checkout(shared)
+    alternates = shared / ".git" / "objects" / "info" / "alternates"
+    assert alternates.read_text(encoding="utf-8").strip() == str(source / ".git" / "objects")
 
 
 
