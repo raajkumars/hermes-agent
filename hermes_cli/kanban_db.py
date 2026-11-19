@@ -725,6 +725,7 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    effective_priority: int = 0
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -782,7 +783,7 @@ _TASK_REQUIRED_COLUMNS = (
 )
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
-    "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
+    "effective_priority", "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract", "creator_task_id",
 )
@@ -896,6 +897,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     assignee             TEXT,
     status               TEXT NOT NULL,
     priority             INTEGER DEFAULT 0,
+    -- Scheduler-only monotonic high-water mark derived from this task and its
+    -- open descendants. ``priority`` remains the operator-owned value.
+    effective_priority   INTEGER NOT NULL DEFAULT 0,
     created_by           TEXT,
     created_at           INTEGER NOT NULL,
     started_at           INTEGER,
@@ -1385,7 +1389,7 @@ def create_task(
                 conn.execute(
                     """
                     INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
+                        id, title, body, assignee, status, priority, effective_priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
@@ -1393,10 +1397,10 @@ def create_task(
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract,
                         creator_task_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        task_id, title.strip(), body, assignee, task_status, priority,
+                        task_id, title.strip(), body, assignee, task_status, priority, max(0, int(priority or 0)),
                         created_by, now, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
@@ -1540,8 +1544,8 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 VALID_SORT_ORDERS: dict[str, str] = {
     "created": "created_at ASC, id ASC",
     "created-desc": "created_at DESC, id DESC",
-    "priority": "priority DESC, created_at ASC",
-    "priority-desc": "priority ASC, created_at ASC",
+    "priority": "effective_priority DESC, created_at ASC, id ASC",
+    "priority-desc": "effective_priority ASC, created_at ASC, id ASC",
     "status": "status ASC, created_at ASC",
     "assignee": "assignee ASC, created_at ASC",
     "title": "title ASC, id ASC",
@@ -1576,7 +1580,7 @@ def list_tasks(
             raise ValueError(f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}")
         query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
     else:
-        query += " ORDER BY priority DESC, created_at ASC"
+        query += " ORDER BY effective_priority DESC, created_at ASC, id ASC"
     if limit:
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
@@ -2171,6 +2175,63 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
+def _propagate_effective_priorities(conn: sqlite3.Connection) -> int:
+    """Raise open ancestors to the highest observed open-descendant priority.
+
+    The pass reads each task and edge once, then uses an iterative child-to-
+    parent worklist. ``done`` and ``archived`` tasks are hard traversal
+    boundaries: terminal children do not contribute and terminal parents are
+    neither updated nor traversed through. Values are clamped at zero and only
+    strict raises are persisted, so this derived scheduler value is monotonic.
+    """
+    rows = conn.execute(
+        "SELECT id, status, priority, effective_priority FROM tasks"
+    ).fetchall()
+    open_rows = {
+        row["id"]: row
+        for row in rows
+        if row["status"] not in ("done", "archived")
+    }
+    if not open_rows:
+        return 0
+
+    effective = {
+        task_id: max(
+            0,
+            int(row["priority"] or 0),
+            int(row["effective_priority"] or 0),
+        )
+        for task_id, row in open_rows.items()
+    }
+    parents: dict[str, list[str]] = {}
+    for edge in conn.execute("SELECT parent_id, child_id FROM task_links"):
+        parent_id, child_id = edge["parent_id"], edge["child_id"]
+        if parent_id in open_rows and child_id in open_rows:
+            parents.setdefault(child_id, []).append(parent_id)
+
+    pending = list(effective)
+    while pending:
+        child_id = pending.pop()
+        child_priority = effective[child_id]
+        for parent_id in parents.get(child_id, ()):
+            if child_priority > effective[parent_id]:
+                effective[parent_id] = child_priority
+                pending.append(parent_id)
+
+    updates = [
+        (candidate, task_id, candidate)
+        for task_id, candidate in effective.items()
+        if candidate > int(open_rows[task_id]["effective_priority"] or 0)
+    ]
+    if updates:
+        conn.executemany(
+            "UPDATE tasks SET effective_priority = ? "
+            "WHERE id = ? AND effective_priority < ?",
+            updates,
+        )
+    return len(updates)
+
+
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
@@ -2187,6 +2248,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
+        _propagate_effective_priorities(conn)
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
