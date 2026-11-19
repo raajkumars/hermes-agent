@@ -62,14 +62,17 @@ def _records(root: Path) -> list[tuple[Path, dict]]:
     for path in root.glob("*.json"):
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(record, dict):
-                raise ValueError(f"expected a JSON object, got {type(record).__name__}")
         except (OSError, ValueError) as exc:  # ValueError: corrupt JSON and invalid UTF-8 alike
             # Same rule as bot_chat_delivery/bot_live_delivery: one bad file never wedges the
             # dir or re-logs every tick — ERROR once per receipt per process, DEBUG after.
             level = logging.DEBUG if path in _warned_unreadable else logging.ERROR
             _warned_unreadable.add(path)
             logger.log(level, "Unreadable queued Bot DM %s: %s", path, exc)
+            continue
+        if not isinstance(record, dict):
+            level = logging.DEBUG if path in _warned_unreadable else logging.ERROR
+            _warned_unreadable.add(path)
+            logger.log(level, "Unreadable queued Bot DM %s: expected a JSON object, got %s", path, type(record).__name__)
             continue
         _warned_unreadable.discard(path)
         records.append((path, record))

@@ -205,7 +205,7 @@ def _fetch_portal_account(timeout: float):
     future = pool.submit(context.run, get_nous_portal_account_info, force_fresh=True)
     try:
         return future.result(timeout=timeout)
-    except BaseException:
+    except BaseException:  # noqa: BLE001 - cancellation/system exits must still release the pool
         future.add_done_callback(lambda f: f.exception())
         raise
     finally:
