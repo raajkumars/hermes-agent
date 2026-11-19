@@ -1513,7 +1513,7 @@ The client uses Python's standard-library `urllib.request.urlopen` and
 messages include the endpoint and exception but never the response body, task
 data, or credentials.
 
-### Run the hook
+### Usage
 
 Run the checked-out script against the newly deployed instance, after API
 readiness succeeds but before promotion or rollout completion:
@@ -1525,6 +1525,25 @@ python scripts/observability/validate_kanban_dependency_health.py \
   --timeout 10
 ```
 
+Omit `--board` to check the active board:
+
+```bash
+python scripts/observability/validate_kanban_dependency_health.py \
+  --api-url https://hermes.example.com
+```
+
+For a multi-board deployment, invoke the hook separately for every affected
+board. The first nonzero exit should fail the deployment job:
+
+```bash
+for board in production support; do
+  python scripts/observability/validate_kanban_dependency_health.py \
+    --api-url https://hermes.example.com \
+    --board "$board" \
+    --timeout 20 || exit $?
+done
+```
+
 The client currently sends no credential header. Run it only where the normal
 dashboard access boundary already permits the request, such as a deployment
 runner with an approved authenticated proxy or other controlled service path.
@@ -1532,15 +1551,27 @@ Do not make the entire dashboard public to accommodate this probe. A `401` or
 `403` is an integration failure and must remain fail-closed; configure the
 runner's approved access path instead of weakening dashboard authentication.
 
-### Exit codes and exact messages
+### Error Messages
 
 | Exit | Meaning | Output |
 |---|---|---|
 | `0` | The API returned a valid count of zero. | `PASS: no dependency-stranded Kanban tasks detected.` |
 | `1` | The API returned a positive count. | `FAIL: N dependency-stranded Kanban task(s) detected.` |
-| `2` | The API was unreachable, returned HTTP failure or invalid JSON, or violated the response schema. | `ERROR: could not read dependency health from URL: ...` or `ERROR: dependency health response from URL did not contain a non-negative integer dependency_stranded_task_count` |
+| `2` | `--timeout` was zero, negative, infinite, or not a number. | `ERROR: timeout must be a positive finite number of seconds` |
+| `2` | The API was unreachable, timed out, returned an HTTP failure, or returned invalid JSON. | `ERROR: could not read dependency health from <endpoint>: <exception>` |
+| `2` | The response omitted the count or returned a negative, boolean, or non-integer count. | `ERROR: dependency health response from <endpoint> did not contain a non-negative integer dependency_stranded_task_count` |
 
-`ERROR` output can include the endpoint and underlying exception, but never a
+In the exit `1` line, `N` is replaced with the returned integer. In transport
+and HTTP errors, `<endpoint>` is the fully constructed request URL and
+`<exception>` is Python's underlying exception text. For example, an
+unauthenticated request commonly prints:
+
+```text
+ERROR: could not read dependency health from https://hermes.example.com/api/plugins/kanban/health/dependencies?board=production: HTTP Error 401: Unauthorized
+```
+
+The HTTP reason phrase is supplied by the server, so it may differ while the
+message prefix and endpoint remain stable. `ERROR` output never includes a
 credential or response body. Treat all nonzero results as deployment failures.
 
 ### CI/CD integration
@@ -1581,6 +1612,32 @@ the job when any invocation fails.
 | `Connection refused`, DNS failure, or timeout | Wrong base URL, service not ready, network policy, or unhealthy deployment. | Check API readiness and runner-to-service connectivity; increase `--timeout` only when startup is legitimately slow. |
 | `did not contain a non-negative integer` | API/client version skew or a broken response contract. | Compare the deployed endpoint response with the two-field contract above; redeploy matching server and script revisions. |
 | Wrong board in the response | `--board` was omitted or points at the wrong board slug. | Pass the intended slug explicitly and verify the returned `board` field. |
+
+Use this decision tree before retrying the deployment:
+
+```text
+Hook result
+├─ exit 0 / PASS
+│  └─ Continue the rollout for this board.
+├─ exit 1 / FAIL
+│  ├─ Confirm the requested board slug.
+│  ├─ Inspect dependency diagnostics for terminal-parent todo children.
+│  └─ Repair the transition or edge, rerun the hook, and continue only on PASS.
+└─ exit 2 / ERROR
+   ├─ "timeout must be a positive finite number"?
+   │  └─ Supply a finite --timeout greater than zero.
+   ├─ HTTP 401 or 403?
+   │  └─ Restore the runner's approved authenticated access path.
+   ├─ HTTP 404?
+   │  └─ Verify the Kanban plugin is enabled and the deployed revision has the route.
+   ├─ Connection, DNS, or timeout exception?
+   │  └─ Verify readiness, URL, network policy, and service health.
+   └─ Invalid JSON or count-schema error?
+      └─ Deploy matching endpoint/client versions and verify the response contract.
+```
+
+Never bypass an exit `1` or `2`. After correcting the identified cause, rerun
+the same board invocation and require the exact `PASS` line before promotion.
 
 ### Acceptance criteria
 
