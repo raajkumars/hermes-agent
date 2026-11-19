@@ -925,6 +925,32 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON tasks(status, effective_priority DESC)"
     )
 
+    # ``effective_priority`` is a scheduler high-water mark. Guard the
+    # invariant at SQLite's write boundary so direct maintenance SQL and stale
+    # writers cannot bypass the application's guarded propagation update.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_effective_priority_insert
+        BEFORE INSERT ON tasks
+        WHEN typeof(NEW.effective_priority) != 'integer' OR NEW.effective_priority < 0
+        BEGIN
+            SELECT RAISE(ABORT, 'effective_priority must be a nonnegative integer');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_tasks_effective_priority_update
+        BEFORE UPDATE OF effective_priority ON tasks
+        WHEN typeof(NEW.effective_priority) != 'integer'
+             OR NEW.effective_priority < 0
+             OR NEW.effective_priority < OLD.effective_priority
+        BEGIN
+            SELECT RAISE(ABORT, 'effective_priority must be a nonnegative integer and cannot decrease');
+        END
+        """
+    )
+
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).
     if "run_id" not in _column_names(conn, "task_events"):
