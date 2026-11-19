@@ -830,7 +830,7 @@ def test_effective_priority_propagation_stops_at_terminal_boundaries_and_is_mono
         terminal_parent = kb.create_task(
             conn, title="terminal parent", priority=2, parents=[grandparent]
         )
-        leaf = kb.create_task(conn, title="leaf", priority=90, parents=[terminal_parent])
+        leaf = kb.create_task(conn, title="leaf", priority=-10, parents=[terminal_parent])
         terminal_child = kb.create_task(
             conn, title="terminal child", priority=99, parents=[grandparent]
         )
@@ -843,7 +843,7 @@ def test_effective_priority_propagation_stops_at_terminal_boundaries_and_is_mono
             (terminal_child,),
         )
         conn.execute(
-            "UPDATE tasks SET priority = -10, effective_priority = 42 WHERE id = ?",
+            "UPDATE tasks SET effective_priority = 42 WHERE id = ?",
             (leaf,),
         )
         conn.commit()
@@ -862,6 +862,54 @@ def test_effective_priority_propagation_stops_at_terminal_boundaries_and_is_mono
             leaf: 42,
             terminal_child: 99,
         }
+
+
+def test_effective_priority_write_guard_rejects_manual_decreases_across_inheritance_chain(
+    kanban_home,
+):
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="root", priority=1)
+        middle = kb.create_task(conn, title="middle", priority=2, parents=[root])
+        leaf = kb.create_task(conn, title="leaf", priority=3, parents=[middle])
+
+        # A manual raise is valid and must still propagate through the whole
+        # open inheritance chain.
+        conn.execute("UPDATE tasks SET effective_priority = 40 WHERE id = ?", (leaf,))
+        conn.commit()
+        assert kb.recompute_ready(conn) == 0
+        assert [
+            conn.execute(
+                "SELECT effective_priority FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()[0]
+            for task_id in (root, middle, leaf)
+        ] == [40, 40, 40]
+
+        # Equal writes are idempotent, while invalid manual overrides are
+        # rejected before SQLite changes or inserts a row.
+        conn.execute("UPDATE tasks SET effective_priority = 40 WHERE id = ?", (root,))
+        with pytest.raises(sqlite3.IntegrityError, match="cannot decrease"):
+            conn.execute("UPDATE tasks SET effective_priority = 39 WHERE id = ?", (root,))
+        with pytest.raises(sqlite3.IntegrityError, match="nonnegative integer"):
+            conn.execute("UPDATE tasks SET effective_priority = -1 WHERE id = ?", (leaf,))
+        with pytest.raises(sqlite3.IntegrityError, match="nonnegative integer"):
+            conn.execute(
+                "INSERT INTO tasks "
+                "(id, title, status, priority, effective_priority, created_at) "
+                "VALUES ('t_invalid', 'invalid', 'ready', 0, -1, 0)"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="nonnegative integer"):
+            conn.execute("UPDATE tasks SET effective_priority = 'urgent' WHERE id = ?", (leaf,))
+        with pytest.raises(sqlite3.IntegrityError, match="nonnegative integer"):
+            conn.execute(
+                "INSERT INTO tasks "
+                "(id, title, status, priority, effective_priority, created_at) "
+                "VALUES ('t_text', 'invalid text', 'ready', 0, 'urgent', 0)"
+            )
+
+        assert kb.get_task(conn, root).effective_priority == 40
+        assert kb.get_task(conn, leaf).effective_priority == 40
+        assert kb.get_task(conn, "t_invalid") is None
+        assert kb.get_task(conn, "t_text") is None
 
 
 def test_effective_priority_orders_lists_and_dispatch_lanes_before_limit(kanban_home):
