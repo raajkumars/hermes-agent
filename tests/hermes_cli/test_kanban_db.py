@@ -99,7 +99,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     migration adds those columns, or boards predating the column fail to
     open before migration can run.
 
-    Covers all four indexes that sit on additive columns:
+    Covers indexes that sit on additive columns, including effective priority:
     - ``tasks.session_id``       -> ``idx_tasks_session_id``    (#28447)
     - ``tasks.tenant``           -> ``idx_tasks_tenant``        (#16081)
     - ``tasks.idempotency_key``  -> ``idx_tasks_idempotency``   (#17805)
@@ -164,11 +164,13 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "effective_priority" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
+    assert "idx_tasks_status_effective_priority" in indexes
     assert "idx_events_run" in indexes
 
 
@@ -783,6 +785,98 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         # Stricter config limit (1) must keep it blocked (1 >= 1).
         assert kb.recompute_ready(conn, failure_limit=1) == 0
         assert kb.get_task(conn, t2).status == "blocked"
+
+
+def test_create_task_initializes_nonnegative_effective_priority(kanban_home):
+    with kbc.connect() as conn:
+        high = kb.create_task(conn, title="high", priority=41)
+        negative = kb.create_task(conn, title="negative", priority=-7)
+
+        values = {
+            row["id"]: row["effective_priority"]
+            for row in conn.execute(
+                "SELECT id, effective_priority FROM tasks WHERE id IN (?, ?)",
+                (high, negative),
+            )
+        }
+        assert values == {high: 41, negative: 0}
+        assert kb.get_task(conn, high).effective_priority == 41
+
+
+def test_recompute_ready_propagates_effective_priority_to_open_ancestors(kanban_home):
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="root", priority=1)
+        middle = kb.create_task(conn, title="middle", priority=2, parents=[root])
+        leaf = kb.create_task(conn, title="leaf", priority=91, parents=[middle])
+
+        assert kb.recompute_ready(conn) == 0
+        values = {
+            row["id"]: (row["priority"], row["effective_priority"])
+            for row in conn.execute(
+                "SELECT id, priority, effective_priority FROM tasks WHERE id IN (?, ?, ?)",
+                (root, middle, leaf),
+            )
+        }
+        assert values[root] == (1, 91)
+        assert values[middle] == (2, 91)
+        assert values[leaf] == (91, 91)
+
+
+def test_effective_priority_propagation_stops_at_terminal_boundaries_and_is_monotonic(
+    kanban_home,
+):
+    with kbc.connect() as conn:
+        grandparent = kb.create_task(conn, title="grandparent", priority=1)
+        terminal_parent = kb.create_task(
+            conn, title="terminal parent", priority=2, parents=[grandparent]
+        )
+        leaf = kb.create_task(conn, title="leaf", priority=90, parents=[terminal_parent])
+        terminal_child = kb.create_task(
+            conn, title="terminal child", priority=99, parents=[grandparent]
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'done', effective_priority = 77 WHERE id = ?",
+            (terminal_parent,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?",
+            (terminal_child,),
+        )
+        conn.execute(
+            "UPDATE tasks SET priority = -10, effective_priority = 42 WHERE id = ?",
+            (leaf,),
+        )
+        conn.commit()
+
+        assert kb._propagate_effective_priorities(conn) == 0
+        rows = {
+            row["id"]: row["effective_priority"]
+            for row in conn.execute(
+                "SELECT id, effective_priority FROM tasks WHERE id IN (?, ?, ?, ?)",
+                (grandparent, terminal_parent, leaf, terminal_child),
+            )
+        }
+        assert rows == {
+            grandparent: 1,
+            terminal_parent: 77,
+            leaf: 42,
+            terminal_child: 99,
+        }
+
+
+def test_effective_priority_orders_lists_and_dispatch_lanes_before_limit(kanban_home):
+    with kbc.connect() as conn:
+        inherited = kb.create_task(conn, title="inherited", assignee="worker", priority=1)
+        kb.create_task(conn, title="urgent child", priority=90, parents=[inherited])
+        direct = kb.create_task(conn, title="direct", assignee="worker", priority=50)
+
+        kb.recompute_ready(conn)
+
+        assert [task.id for task in kb.list_tasks(conn, status="ready", limit=1)] == [inherited]
+        assert [row["id"] for row in kbd._lane_rows(conn, "ready")[:2]] == [
+            inherited,
+            direct,
+        ]
 
 
 
