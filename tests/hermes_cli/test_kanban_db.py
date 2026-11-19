@@ -1062,6 +1062,32 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
     assert child_dir.exists(), "Non-scratch 'dir' child workspace is never deleted"
 
 
+def test_deferred_scratch_cleanup_records_audit_event(kanban_home):
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="scratch parent")
+        child = kb.create_task(conn, title="scratch child")
+        kb.link_tasks(conn, parent, child)
+        parent_ws = kbw.resolve_workspace(kb.get_task(conn, parent))
+        kbw.set_workspace_path(conn, parent, parent_ws)
+
+        kb.complete_task(conn, parent, result="handoff")
+        assert parent_ws.exists(), "deferred while child active"
+        kb.complete_task(conn, child, result="built")
+
+        cleanup_events = [
+            event for event in kb.list_events(conn, parent)
+            if event.kind == "workspace_cleanup"
+        ]
+
+    assert not parent_ws.exists()
+    assert len(cleanup_events) == 1
+    assert cleanup_events[0].payload == {
+        "workspace_kind": "scratch",
+        "workspace_path": str(parent_ws),
+        "outcome": "removed",
+    }
+
+
 
 
 def test_is_managed_scratch_path_rejects_kanban_metadata_subtrees(kanban_home):

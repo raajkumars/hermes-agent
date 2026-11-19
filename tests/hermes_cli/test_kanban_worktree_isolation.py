@@ -102,6 +102,39 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
             assert row["workspace_path"] is None
 
 
+def test_decompose_scratch_children_get_own_workspace(kanban_home):
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="build the feature", triage=True)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='scratch', "
+            "workspace_path='/kanban/workspaces/root' WHERE id = ?",
+            (root,),
+        )
+        conn.commit()
+
+        child_ids = decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "research", "assignee": "alice", "parents": []},
+                {"title": "implement", "assignee": "bob", "parents": []},
+            ],
+            author="decomposer",
+        )
+        assert child_ids is not None and len(child_ids) == 2
+
+        for cid in child_ids:
+            row = conn.execute(
+                "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+                (cid,),
+            ).fetchone()
+            assert row["workspace_kind"] == "scratch"
+            # Each child resolves <workspaces-root>/<child-id> at dispatch;
+            # no sibling may inherit the root's literal scratch directory.
+            assert row["workspace_path"] is None
+
+
 
 
 def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):

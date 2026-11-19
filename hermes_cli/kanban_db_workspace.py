@@ -127,6 +127,21 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+def _record_workspace_cleanup(
+    conn: sqlite3.Connection, task_id: str, kind: str, path: Path | str,
+) -> None:
+    """Persist a best-effort audit event after a workspace was actually removed."""
+    try:
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task_id, "workspace_cleanup", {
+                "workspace_kind": kind,
+                "workspace_path": str(path),
+                "outcome": "removed",
+            })
+    except Exception:
+        pass
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
@@ -158,7 +173,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # lingering worker never has its cwd deleted from under it.
         if kind == "worktree":
             _cleanup_worker_tmux(conn, task_id)
-            _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+            if _cleanup_worktree_workspace(task_id, path, row["branch_name"]):
+                _record_workspace_cleanup(conn, task_id, kind, path)
             _try_cleanup_parent_workspaces(conn, task_id)
             return
         wp = Path(path)
@@ -171,6 +187,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 release_lsp_clients(str(wp))
                 shutil.rmtree(wp, ignore_errors=True)
                 _kb._log.debug("Removed scratch workspace: %s", wp)
+                if not wp.exists():
+                    _record_workspace_cleanup(conn, task_id, kind, wp)
             else:
                 _kb._log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -290,6 +308,8 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 release_lsp_clients(str(wp))
                 shutil.rmtree(wp, ignore_errors=True)
                 _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                if not wp.exists():
+                    _record_workspace_cleanup(conn, parent_id, row["workspace_kind"], wp)
     except Exception:
         pass  # best-effort
 
