@@ -588,7 +588,9 @@ def _claude_code_organization_uuid() -> Optional[str]:
     """Best-effort Claude Code organization identity for the OAuth usage endpoint."""
     try:
         metadata_path = claude_code_credentials_path().parent.parent / ".claude.json"
-        value = (json.loads(metadata_path.read_text()).get("oauthAccount") or {}).get("organizationUuid")
+        value = (
+            json.loads(metadata_path.read_text(encoding="utf-8")).get("oauthAccount") or {}
+        ).get("organizationUuid")
         return value.strip() if isinstance(value, str) and value.strip() else None
     except (OSError, ValueError, AttributeError):
         return None

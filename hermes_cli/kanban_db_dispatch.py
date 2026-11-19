@@ -1858,7 +1858,10 @@ def _run_credential_probe(profile: str, *, timeout: float = 20.0) -> Optional[di
     strip_launch_profile_env(env, profile_home)
     cmd = [*_resolve_hermes_argv(), "-p", profile_arg, "doctor", "--check-active-provider"]
     try:
-        proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(
+            cmd, env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+        )
     except Exception:
         return None
     try:
