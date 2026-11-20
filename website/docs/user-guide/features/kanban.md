@@ -1429,6 +1429,297 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
 
+## Platform engineering runbook: dependency-health deployment hook
+
+Use this hook after every deployment that changes the Kanban dispatcher,
+dependency transitions, board storage, or dashboard plugin API. It prevents a
+rollout from being declared healthy while a `todo` card is stranded behind
+parents that are already terminal.
+
+### Hook architecture
+
+Register the hook as a required post-deployment pipeline step for every board a
+release can affect. Trigger it after process and API readiness succeeds but
+before promotion, traffic cutover, or rollout completion. Keep registration in
+the deployment workflow rather than in a long-running Hermes process: each run
+is an independent, fail-closed probe with a stable exit code, so the CI/CD
+system remains the owner of retries, timeouts, and release blocking.
+
+The check is deliberately remote and content-free:
+
+1. The deployment workflow invokes the checked-out
+   `scripts/observability/validate_kanban_dependency_health.py` once per board.
+2. The deployed Kanban plugin resolves the requested board and calls
+   `list_dependency_stranded_tasks()` against that board's SQLite database.
+3. `GET /api/plugins/kanban/health/dependencies` returns only the resolved board
+   slug and the number of stranded tasks; it never returns task titles, bodies,
+   comments, or identifiers.
+4. The client validates that response and maps it to a stable process exit code.
+   The deployment workflow blocks promotion on any nonzero result.
+
+Manage the hook and endpoint as one versioned contract. A release that changes
+the route or response schema must update the checked-out client and its contract
+tests in the same change. Multi-board deployments register one invocation per
+board; do not aggregate by opening SQLite directly or bypass a failing board.
+
+### API client details
+
+The reusable Python interface is:
+
+```python
+stranded_task_count(
+    *,
+    api_url: str,
+    board: Optional[str] = None,
+    timeout: float = 10.0,
+) -> int
+```
+
+It raises `DependencyHealthAPIError` for transport, HTTP, JSON-decoding, or
+schema failures. The command-line `main()` converts that exception to exit `2`;
+a positive returned count becomes exit `1`, and zero becomes exit `0`.
+
+Request schema:
+
+| Field | Location | Type | Required | Meaning |
+|---|---|---|---|---|
+| `api_url` | client argument | URL string | yes | Deployed Hermes base URL; a trailing slash is removed. |
+| `board` | query string | string | no | Board slug. Omit it to inspect the active board. The client URL-encodes it. |
+| `timeout` | client argument | positive finite seconds | no | `urlopen` timeout; defaults to `10.0`; invalid values fail before the request. |
+
+The request has no body. The current client sends no credential header, so the
+runner must reach the route through the approved dashboard access boundary.
+
+```http
+GET /api/plugins/kanban/health/dependencies?board=production
+```
+
+Successful response schema:
+
+```json
+{
+  "board": "production",
+  "dependency_stranded_task_count": 0
+}
+```
+
+| Field | Type | Client validation |
+|---|---|---|
+| `board` | string | Returned by the server for operator visibility; the current client does not use it to select the result. |
+| `dependency_stranded_task_count` | integer | Required, non-negative, and not a JSON boolean. |
+
+The client uses Python's standard-library `urllib.request.urlopen` and
+`json.load`. It does not open the runner's local Kanban database, and error
+messages include the endpoint and exception but never the response body, task
+data, or credentials.
+
+### Usage
+
+Run the checked-out script against the newly deployed instance, after API
+readiness succeeds but before promotion or rollout completion:
+
+```bash
+python scripts/observability/validate_kanban_dependency_health.py \
+  --api-url https://hermes.example.com \
+  --board production \
+  --timeout 10
+```
+
+Omit `--board` to check the active board:
+
+```bash
+python scripts/observability/validate_kanban_dependency_health.py \
+  --api-url https://hermes.example.com
+```
+
+For a multi-board deployment, invoke the hook separately for every affected
+board. The first nonzero exit should fail the deployment job:
+
+```bash
+for board in production support; do
+  python scripts/observability/validate_kanban_dependency_health.py \
+    --api-url https://hermes.example.com \
+    --board "$board" \
+    --timeout 20 || exit $?
+done
+```
+
+The client currently sends no credential header. Run it only where the normal
+dashboard access boundary already permits the request, such as a deployment
+runner with an approved authenticated proxy or other controlled service path.
+Do not make the entire dashboard public to accommodate this probe. A `401` or
+`403` is an integration failure and must remain fail-closed; configure the
+runner's approved access path instead of weakening dashboard authentication.
+
+### Error Messages
+
+| Exit | Meaning | Output |
+|---|---|---|
+| `0` | The API returned a valid count of zero. | `PASS: no dependency-stranded Kanban tasks detected.` |
+| `1` | The API returned a positive count. | `FAIL: N dependency-stranded Kanban task(s) detected.` |
+| `2` | `--timeout` was zero, negative, `inf`, or `nan`. | `ERROR: timeout must be a positive finite number of seconds` |
+| `2` | `--timeout` was not a number (for example `abc`); argparse rejects it before the script runs. | On stderr, the usage line followed by `validate_kanban_dependency_health.py: error: argument --timeout: invalid float value: 'abc'` |
+| `2` | The API was unreachable, timed out, returned an HTTP failure, or returned invalid JSON. | `ERROR: could not read dependency health from <endpoint>: <exception>` |
+| `2` | The response omitted the count or returned a negative, boolean, or non-integer count. | `ERROR: dependency health response from <endpoint> did not contain a non-negative integer dependency_stranded_task_count` |
+
+In the exit `1` line, `N` is replaced with the returned integer. In transport
+and HTTP errors, `<endpoint>` is the fully constructed request URL and
+`<exception>` is Python's underlying exception text. For example, an
+unauthenticated request commonly prints:
+
+```text
+ERROR: could not read dependency health from https://hermes.example.com/api/plugins/kanban/health/dependencies?board=production: HTTP Error 401: Unauthorized
+```
+
+Other common `<exception>` texts (errno wording is platform-dependent; Linux shown):
+
+| Cause | `<exception>` text |
+|---|---|
+| Request timeout | `timed out` |
+| HTTP 403 | `HTTP Error 403: Forbidden` |
+| HTTP 404 | `HTTP Error 404: Not Found` |
+| Connection refused | `<urlopen error [Errno 111] Connection refused>` |
+| DNS failure | `<urlopen error [Errno -2] Name or service not known>` |
+| Non-JSON body, such as a proxy login page | `Expecting value: line 1 column 1 (char 0)` |
+
+The HTTP reason phrase is supplied by the server, so it may differ while the
+message prefix and endpoint remain stable. `ERROR` output never includes a
+credential or response body. Treat all nonzero results as deployment failures.
+
+### CI/CD Integration Steps
+
+Make the hook a required post-deployment gate, not a best-effort observation.
+The pipeline has two distinct test stages:
+
+1. Before deployment, run the endpoint and client contract tests with the
+   repository's test runner:
+
+   ```bash
+   scripts/run_tests.sh \
+     tests/plugins/test_kanban_dependency_health_api.py \
+     tests/scripts/test_validate_kanban_dependency_health.py
+   ```
+
+   These tests cover the content-free endpoint schema, board query encoding,
+   zero and positive counts, invalid response handling, timeout validation, and
+   the `0`/`1`/`2` exit contract. A failure prevents deployment.
+2. Deploy the new revision and wait for both process and API readiness.
+3. Establish the runner's approved dashboard access path. The hook does not add
+   an authentication header, so authentication must be supplied by the existing
+   proxy or controlled service path rather than by exposing the dashboard.
+4. Run the checked-out hook once for every board the release can affect.
+5. Preserve the hook's exit status as the job status. Do not append `|| true`,
+   set `continue-on-error`, or otherwise translate exit `1` or `2` to success.
+6. Promote traffic or mark the rollout successful only after every board exits
+   `0`. Exit `1` requires repairing the dependency transition or rolling back;
+   exit `2` requires repairing reachability, access, timeout configuration, or
+   the endpoint/client contract before retrying.
+
+The script reads command-line arguments, not environment variables. The
+deployment job should map its pipeline configuration to these inputs:
+
+| Pipeline variable | Required | Purpose |
+|---|---|---|
+| `HERMES_API_URL` | yes | Base URL of the newly deployed Hermes API. Store it as a non-secret environment-specific CI variable. |
+| `HERMES_KANBAN_BOARDS` | yes | Space-delimited board slugs to validate; use one slug for a single-board deployment. |
+| `HERMES_HOOK_TIMEOUT` | no | Positive finite request timeout in seconds; default to `10` when unset. |
+
+No credential environment variable is consumed by the current client. Keep any
+proxy or service-path credentials in the CI platform's secret store and outside
+the hook command and logs.
+
+```yaml
+- name: Test dependency-health hook contract
+  run: |
+    scripts/run_tests.sh \
+      tests/plugins/test_kanban_dependency_health_api.py \
+      tests/scripts/test_validate_kanban_dependency_health.py
+
+- name: Validate deployed Kanban dependency health
+  env:
+    HERMES_API_URL: ${{ vars.HERMES_API_URL }}
+    HERMES_KANBAN_BOARDS: ${{ vars.HERMES_KANBAN_BOARDS }}
+    HERMES_HOOK_TIMEOUT: ${{ vars.HERMES_HOOK_TIMEOUT || '10' }}
+  run: |
+    test -n "$HERMES_API_URL"
+    test -n "$HERMES_KANBAN_BOARDS"
+    for board in $HERMES_KANBAN_BOARDS; do
+      python scripts/observability/validate_kanban_dependency_health.py \
+        --api-url "$HERMES_API_URL" \
+        --board "$board" \
+        --timeout "$HERMES_HOOK_TIMEOUT"
+    done
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| `FAIL: N ... detected` | Terminal parents exist but one or more children remain `todo`. | Inspect dependency diagnostics, repair the missed promotion or bad edge, then rerun. Do not override the gate without resolving the stranded cards. |
+| `HTTP Error 401` or `403` in an `ERROR` line | The runner did not use the approved dashboard access path. | Fix the authenticated proxy/service path. Do not expose the dashboard publicly. |
+| `HTTP Error 404` | The Kanban plugin API is not mounted, the plugin is disabled, or the deployed revision predates the endpoint. | Verify the bundled Kanban plugin is enabled and the deployment contains the endpoint. |
+| `Connection refused`, DNS failure, or timeout | Wrong base URL, service not ready, network policy, or unhealthy deployment. | Check API readiness and runner-to-service connectivity; increase `--timeout` only when startup is legitimately slow. |
+| `invalid float value` on stderr | `--timeout` was given a non-numeric value. | Pass a number of seconds, for example `--timeout 20`. |
+| `Expecting value: line 1 column 1 (char 0)` | A proxy answered the unauthenticated request with an HTML login page (HTTP 200), or the route returned non-JSON. | Treat it first as an access-path failure, as for `401`/`403`; if access is correct, check for version skew. |
+| `did not contain a non-negative integer` | API/client version skew or a broken response contract. | Compare the deployed endpoint response with the two-field contract above; redeploy matching server and script revisions. |
+| Wrong board in the response | `--board` was omitted or points at the wrong board slug. | Pass the intended slug explicitly and verify the returned `board` field. |
+
+Use this decision tree before retrying the deployment:
+
+```text
+Hook result
+├─ exit 0 / PASS
+│  └─ Continue the rollout for this board.
+├─ exit 1 / FAIL
+│  ├─ Confirm the requested board slug.
+│  ├─ Inspect dependency diagnostics for terminal-parent todo children.
+│  └─ Repair the transition or edge, rerun the hook, and continue only on PASS.
+└─ exit 2 / ERROR
+   ├─ "timeout must be a positive finite number" or "invalid float value"?
+   │  └─ Supply a numeric, finite --timeout greater than zero.
+   ├─ HTTP 401 or 403?
+   │  └─ Restore the runner's approved authenticated access path.
+   ├─ "Expecting value: line 1 column 1 (char 0)"?
+   │  ├─ Likely a proxy login page: restore the approved access path first.
+   │  └─ Access confirmed correct? Treat as version skew (below).
+   ├─ HTTP 404?
+   │  └─ Verify the Kanban plugin is enabled and the deployed revision has the route.
+   ├─ Connection refused, DNS failure, or "timed out"?
+   │  └─ Verify readiness, URL, network policy, and service health.
+   └─ Other invalid JSON or count-schema error?
+      └─ Deploy matching endpoint/client versions and verify the response contract.
+```
+
+Never bypass an exit `1` or `2`. After correcting the identified cause, rerun
+the same board invocation and require the exact `PASS` line before promotion.
+
+### Acceptance criteria
+
+The deployment integration is complete only when all of the following are
+verified in the target environment:
+
+- the endpoint and client contract test files pass through
+  `scripts/run_tests.sh` in the pre-deployment pipeline;
+- the deployed endpoint returns HTTP `200` with a string `board` and a
+  non-negative integer `dependency_stranded_task_count`, and no task content;
+- the hook exits `0` and prints the exact `PASS` line when the deployed board's
+  count is zero;
+- a controlled positive-count test exits `1`, prints the `FAIL` line, and
+  prevents promotion;
+- unreachable, unauthorized, malformed JSON, schema-invalid, and invalid
+  timeout tests exit `2`, print an `ERROR` line, and prevent promotion;
+- every affected board is invoked explicitly for a multi-board deployment, and
+  one failing board fails the whole deployment job;
+- the runner reaches the endpoint through the approved access boundary without
+  making the dashboard or task data public;
+- the production deployment workflow has no `continue-on-error`, `|| true`, or
+  equivalent bypass for this gate;
+- logs contain no task content, credential, session token, authorization
+  header, or response body; and
+- the exact deployed server revision and checked-out hook revision are
+  compatible, the final run exits `0` for every affected board, and only then
+  is the deployment recorded as successful.
+
 ## Out of scope
 
 Kanban is deliberately single-host. `~/.hermes/kanban.db` is a local SQLite file and the dispatcher spawns workers on the same machine. Running a shared board across two hosts is not supported — there's no coordination primitive for "worker X on host A, worker Y on host B," and the crash-detection path assumes PIDs are host-local. If you need multi-host, run an independent board per host and use `delegate_task` / a message queue to bridge them.
