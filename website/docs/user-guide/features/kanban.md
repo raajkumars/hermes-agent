@@ -1586,33 +1586,70 @@ The HTTP reason phrase is supplied by the server, so it may differ while the
 message prefix and endpoint remain stable. `ERROR` output never includes a
 credential or response body. Treat all nonzero results as deployment failures.
 
-### CI/CD integration
+### CI/CD Integration Steps
 
 Make the hook a required post-deployment gate, not a best-effort observation.
-A typical pipeline order is:
+The pipeline has two distinct test stages:
 
-1. Deploy the new revision.
-2. Wait for process and API readiness.
-3. Establish the approved dashboard access path for the runner.
-4. Run the hook against each deployed board that the release can affect.
-5. Promote or mark the rollout successful only when every invocation exits `0`.
-6. On exit `1`, stop promotion and repair the dependency transition or roll
-   back. On exit `2`, stop promotion and repair API reachability, access, or the
-   response contract before retrying.
+1. Before deployment, run the endpoint and client contract tests with the
+   repository's test runner:
+
+   ```bash
+   scripts/run_tests.sh \
+     tests/plugins/test_kanban_dependency_health_api.py \
+     tests/scripts/test_validate_kanban_dependency_health.py
+   ```
+
+   These tests cover the content-free endpoint schema, board query encoding,
+   zero and positive counts, invalid response handling, timeout validation, and
+   the `0`/`1`/`2` exit contract. A failure prevents deployment.
+2. Deploy the new revision and wait for both process and API readiness.
+3. Establish the runner's approved dashboard access path. The hook does not add
+   an authentication header, so authentication must be supplied by the existing
+   proxy or controlled service path rather than by exposing the dashboard.
+4. Run the checked-out hook once for every board the release can affect.
+5. Preserve the hook's exit status as the job status. Do not append `|| true`,
+   set `continue-on-error`, or otherwise translate exit `1` or `2` to success.
+6. Promote traffic or mark the rollout successful only after every board exits
+   `0`. Exit `1` requires repairing the dependency transition or rolling back;
+   exit `2` requires repairing reachability, access, timeout configuration, or
+   the endpoint/client contract before retrying.
+
+The script reads command-line arguments, not environment variables. The
+deployment job should map its pipeline configuration to these inputs:
+
+| Pipeline variable | Required | Purpose |
+|---|---|---|
+| `HERMES_API_URL` | yes | Base URL of the newly deployed Hermes API. Store it as a non-secret environment-specific CI variable. |
+| `HERMES_KANBAN_BOARDS` | yes | Space-delimited board slugs to validate; use one slug for a single-board deployment. |
+| `HERMES_HOOK_TIMEOUT` | no | Positive finite request timeout in seconds; default to `10` when unset. |
+
+No credential environment variable is consumed by the current client. Keep any
+proxy or service-path credentials in the CI platform's secret store and outside
+the hook command and logs.
 
 ```yaml
-- name: Validate Kanban dependency promotion
+- name: Test dependency-health hook contract
+  run: |
+    scripts/run_tests.sh \
+      tests/plugins/test_kanban_dependency_health_api.py \
+      tests/scripts/test_validate_kanban_dependency_health.py
+
+- name: Validate deployed Kanban dependency health
   env:
     HERMES_API_URL: ${{ vars.HERMES_API_URL }}
+    HERMES_KANBAN_BOARDS: ${{ vars.HERMES_KANBAN_BOARDS }}
+    HERMES_HOOK_TIMEOUT: ${{ vars.HERMES_HOOK_TIMEOUT || '10' }}
   run: |
-    python scripts/observability/validate_kanban_dependency_health.py \
-      --api-url "$HERMES_API_URL" \
-      --board production
+    test -n "$HERMES_API_URL"
+    test -n "$HERMES_KANBAN_BOARDS"
+    for board in $HERMES_KANBAN_BOARDS; do
+      python scripts/observability/validate_kanban_dependency_health.py \
+        --api-url "$HERMES_API_URL" \
+        --board "$board" \
+        --timeout "$HERMES_HOOK_TIMEOUT"
+    done
 ```
-
-Do not append `|| true`, use `continue-on-error`, or translate exit `1`/`2` to
-success. For multi-board deployments, invoke the script once per board and fail
-the job when any invocation fails.
 
 ### Troubleshooting
 
@@ -1661,15 +1698,27 @@ the same board invocation and require the exact `PASS` line before promotion.
 The deployment integration is complete only when all of the following are
 verified in the target environment:
 
-- the endpoint returns HTTP `200` and exactly the expected content-free fields;
-- the hook exits `0` and prints the exact `PASS` line for a zero count;
-- a controlled positive-count response exits `1` and blocks the pipeline;
-- an unreachable endpoint and malformed/schema-invalid response exit `2` and
-  block the pipeline;
-- board selection is exercised when the deployment hosts more than one board;
-- runner access works without making dashboard or task data public;
-- CI treats every nonzero exit as a failed required gate; and
-- no task content, credential, session token, or response body appears in logs.
+- the endpoint and client contract test files pass through
+  `scripts/run_tests.sh` in the pre-deployment pipeline;
+- the deployed endpoint returns HTTP `200` with a string `board` and a
+  non-negative integer `dependency_stranded_task_count`, and no task content;
+- the hook exits `0` and prints the exact `PASS` line when the deployed board's
+  count is zero;
+- a controlled positive-count test exits `1`, prints the `FAIL` line, and
+  prevents promotion;
+- unreachable, unauthorized, malformed JSON, schema-invalid, and invalid
+  timeout tests exit `2`, print an `ERROR` line, and prevent promotion;
+- every affected board is invoked explicitly for a multi-board deployment, and
+  one failing board fails the whole deployment job;
+- the runner reaches the endpoint through the approved access boundary without
+  making the dashboard or task data public;
+- the production deployment workflow has no `continue-on-error`, `|| true`, or
+  equivalent bypass for this gate;
+- logs contain no task content, credential, session token, authorization
+  header, or response body; and
+- the exact deployed server revision and checked-out hook revision are
+  compatible, the final run exits `0` for every affected board, and only then
+  is the deployment recorded as successful.
 
 ## Out of scope
 
