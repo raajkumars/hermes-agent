@@ -45,6 +45,23 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def _init_durable_review_worktree(kanban_home: Path, workspace: Path) -> tuple[Path, Path]:
+    source = kanban_home / "source-repo"
+    _init_git_repo(source)
+    mirror = kanban_home / "kanban" / "durable-refs" / "fixture.git"
+    mirror.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "clone", "--bare", str(source), str(mirror)],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    )
+    review = workspace / "review-t_fixture"
+    subprocess.run(
+        ["git", f"--git-dir={mirror}", "worktree", "add", "--detach", str(review), "main"],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    )
+    return mirror, review
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
@@ -1031,6 +1048,249 @@ def test_request_review_rollback_discards_staged_copies(kanban_home):
 
 
 
+def test_shared_scratch_survives_until_all_decomposed_children_are_terminal(kanban_home):
+    """One completed child must not reap a scratch path still used by a sibling."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="scratch parent")
+        first = kb.create_task(conn, title="first shared child")
+        second = kb.create_task(conn, title="second shared child")
+        kb.link_tasks(conn, parent, first)
+        kb.link_tasks(conn, parent, second)
+
+        parent_ws = kbw.resolve_workspace(kb.get_task(conn, parent))
+        kbw.set_workspace_path(conn, parent, parent_ws)
+        kbw.set_workspace_path(conn, first, parent_ws)
+        kbw.set_workspace_path(conn, second, parent_ws)
+
+        kb.complete_task(conn, parent, result="handoff")
+        assert parent_ws.exists(), "parent defers while children are live"
+
+        kb.complete_task(conn, first, result="first complete")
+        assert parent_ws.exists(), "live sibling keeps the shared workspace"
+        assert not [
+            event for event in kb.list_events(conn, first)
+            if event.kind == "workspace_cleanup"
+        ]
+
+        kb.complete_task(conn, second, result="second complete")
+        cleanup_by_task = {
+            task_id: [
+                event for event in kb.list_events(conn, task_id)
+                if event.kind == "workspace_cleanup"
+            ]
+            for task_id in (parent, first, second)
+        }
+
+    assert not parent_ws.exists(), "last shared workspace user reaps the scratch path"
+    for cleanup in cleanup_by_task.values():
+        assert len(cleanup) == 1
+        assert cleanup[0].payload == {
+            "workspace": str(parent_ws), "kind": "scratch", "outcome": "removed",
+        }
+
+
+def test_running_task_keeps_shared_scratch_until_its_own_completion(kanban_home):
+    """A child completion cannot wipe a root's active shared workspace."""
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="active root")
+        child = kb.create_task(conn, title="completed child")
+        root_ws = kbw.resolve_workspace(kb.get_task(conn, root))
+        kbw.set_workspace_path(conn, root, root_ws)
+        kbw.set_workspace_path(conn, child, root_ws)
+        kb.claim_task(conn, root)
+
+        kb.complete_task(conn, child, result="child complete")
+        assert root_ws.exists(), "running root keeps the shared scratch workspace"
+        assert not [
+            event for event in kb.list_events(conn, child)
+            if event.kind == "workspace_cleanup"
+        ]
+
+        kb.complete_task(conn, root, result="root complete", force=True)
+        cleanup_by_task = {
+            task_id: [
+                event for event in kb.list_events(conn, task_id)
+                if event.kind == "workspace_cleanup"
+            ]
+            for task_id in (root, child)
+        }
+
+    assert not root_ws.exists()
+    for cleanup in cleanup_by_task.values():
+        assert len(cleanup) == 1
+        assert cleanup[0].payload == {
+            "workspace": str(root_ws), "kind": "scratch", "outcome": "removed",
+        }
+
+
+def test_scratch_cleanup_is_fail_closed_when_audit_fanout_fails(kanban_home, monkeypatch):
+    """A missing cleanup event must preserve the shared workspace."""
+    with kbc.connect() as conn:
+        root = kb.create_task(conn, title="audited root")
+        peer = kb.create_task(conn, title="audited peer")
+        root_ws = kbw.resolve_workspace(kb.get_task(conn, root))
+        kbw.set_workspace_path(conn, root, root_ws)
+        kbw.set_workspace_path(conn, peer, root_ws)
+        kb.complete_task(conn, peer, result="peer complete")
+
+        append_event = kb._append_event
+
+        def fail_cleanup_event(conn, task_id, kind, payload, **kwargs):
+            if kind == "workspace_cleanup_planned":
+                raise sqlite3.OperationalError("audit unavailable")
+            return append_event(conn, task_id, kind, payload, **kwargs)
+
+        monkeypatch.setattr(kb, "_append_event", fail_cleanup_event)
+        kb.complete_task(conn, root, result="root complete")
+
+        assert root_ws.exists()
+        for task_id in (root, peer):
+            assert not [
+                event for event in kb.list_events(conn, task_id)
+                if event.kind == "workspace_cleanup"
+            ]
+
+
+def test_scratch_cleanup_keeps_durable_plan_if_post_delete_bookkeeping_fails(kanban_home, monkeypatch):
+    """A post-rmtree failure cannot erase the attribution committed before deletion."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="planned cleanup")
+        workspace = kbw.resolve_workspace(kb.get_task(conn, task_id))
+        kbw.set_workspace_path(conn, task_id, workspace)
+
+        def prune_timeout(_mirrors):
+            raise subprocess.TimeoutExpired("git worktree prune", 30)
+
+        monkeypatch.setattr(kbw, "_prune_removed_review_worktrees", prune_timeout)
+        kb.complete_task(conn, task_id, result="done")
+        planned = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "workspace_cleanup_planned"
+        ]
+        removed = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "workspace_cleanup"
+        ]
+
+    assert not workspace.exists()
+    assert len(planned) == 1
+    assert len(removed) == 1
+
+
+def test_scratch_cleanup_plan_survives_final_event_failure(kanban_home, monkeypatch):
+    """Deletion remains attributable when the final outcome event cannot commit."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="final audit failure")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, task_id, workspace)
+        append_event = kb._append_event
+
+        def fail_final_event(conn, event_task_id, kind, payload, **kwargs):
+            if kind == "workspace_cleanup":
+                raise sqlite3.OperationalError("final audit unavailable")
+            return append_event(conn, event_task_id, kind, payload, **kwargs)
+
+        monkeypatch.setattr(kb, "_append_event", fail_final_event)
+        kb.complete_task(conn, task_id, result="done")
+        planned = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "workspace_cleanup_planned"
+        ]
+        removed = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "workspace_cleanup"
+        ]
+
+    assert not workspace.exists()
+    assert len(planned) == 1
+    assert removed == []
+
+
+def test_scratch_cleanup_unregisters_safe_mirror_backed_review_worktree(kanban_home):
+    """Known durable review worktrees are removed through Git before scratch rmtree."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="review cleanup")
+        workspace = kbw.resolve_workspace(kb.get_task(conn, task_id))
+        kbw.set_workspace_path(conn, task_id, workspace)
+        mirror, review = _init_durable_review_worktree(kanban_home, workspace)
+
+        kb.complete_task(conn, task_id, result="verified")
+        cleanup = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "workspace_cleanup"
+        ]
+
+    listed = subprocess.run(
+        ["git", f"--git-dir={mirror}", "worktree", "list", "--porcelain"],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    ).stdout
+    assert not workspace.exists()
+    assert str(review) not in listed, "cleanup must not leave a stale mirror worktree registration"
+    assert len(cleanup) == 1
+
+
+@pytest.mark.parametrize("nested_kind", ["unknown_repo", "bare_repo"])
+def test_scratch_cleanup_preserves_unknown_nested_git_work(nested_kind, kanban_home):
+    """Unknown normal and bare repositories fail closed."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title=f"unsafe nested {nested_kind}")
+        workspace = kbw.resolve_workspace(kb.get_task(conn, task_id))
+        kbw.set_workspace_path(conn, task_id, workspace)
+        if nested_kind == "unknown_repo":
+            _init_git_repo(workspace / "nested-clone")
+        else:
+            source = kanban_home / "bare-source"
+            _init_git_repo(source)
+            subprocess.run(
+                ["git", "clone", "--bare", str(source), str(workspace / "nested.git")],
+                check=True, capture_output=True, text=True, encoding="utf-8",
+            )
+
+        kb.complete_task(conn, task_id, result="verified")
+        cleanup = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "workspace_cleanup"
+        ]
+
+    assert workspace.exists(), "unproven nested Git work must survive task completion"
+    assert cleanup == []
+
+
+def test_scratch_cleanup_salvages_unreachable_mirror_tip(kanban_home):
+    """A clean unpublished review commit is archived before its scratch tree is removed."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="salvage review tip")
+        workspace = kbw.resolve_workspace(kb.get_task(conn, task_id))
+        kbw.set_workspace_path(conn, task_id, workspace)
+        mirror, review = _init_durable_review_worktree(kanban_home, workspace)
+        (review / "unique.txt").write_text("unique\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(review), "add", "unique.txt"],
+            check=True, capture_output=True, text=True, encoding="utf-8",
+        )
+        subprocess.run(
+            ["git", "-C", str(review), "-c", "user.name=Kanban Test",
+             "-c", "user.email=kanban@example.com", "commit", "-m", "unique"],
+            check=True, capture_output=True, text=True, encoding="utf-8",
+        )
+        unique_head = subprocess.run(
+            ["git", "-C", str(review), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True, encoding="utf-8",
+        ).stdout.strip()
+
+        kb.complete_task(conn, task_id, result="verified")
+
+    archive = subprocess.run(
+        ["git", f"--git-dir={mirror}", "for-each-ref", "--format=%(objectname)",
+         f"refs/archive/workspace-cleanup/{task_id}/"],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    ).stdout.splitlines()
+    assert not workspace.exists()
+    assert unique_head in archive
+
+
 def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_path):
     """A non-scratch ('dir') child completing must still sweep its scratch parent.
 
@@ -1055,11 +1315,19 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
         assert parent_ws.exists(), "deferred while dir child active"
 
         kb.complete_task(conn, child, result="built")
+        cleanup = [
+            event for event in kb.list_events(conn, parent)
+            if event.kind == "workspace_cleanup"
+        ]
 
     assert not parent_ws.exists(), (
         "A 'dir' child completing must trigger the parent scratch sweep"
     )
     assert child_dir.exists(), "Non-scratch 'dir' child workspace is never deleted"
+    assert len(cleanup) == 1
+    assert cleanup[0].payload == {
+        "workspace": str(parent_ws), "kind": "scratch", "outcome": "removed",
+    }
 
 
 

@@ -46,6 +46,15 @@ _ACTIVE_CHILDREN_SQL = (
     "LIMIT 1"
 )
 
+# A decomposed child may inherit its parent's scratch path. The first child to
+# complete has no children of its own, so the direct-child check alone would
+# remove a still-live sibling's shared workspace.
+_ACTIVE_WORKSPACE_PEERS_SQL = (
+    "SELECT id, workspace_path FROM tasks "
+    "WHERE id != ? AND status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+    "AND workspace_path IS NOT NULL AND workspace_path != ''"
+)
+
 _WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?"
 
 
@@ -62,6 +71,197 @@ def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProce
 
 def _has_active_children(conn: sqlite3.Connection, task_id: str) -> bool:
     return conn.execute(_ACTIVE_CHILDREN_SQL, (task_id,)).fetchone() is not None
+
+
+def _has_active_workspace_peer(conn: sqlite3.Connection, task_id: str, path: str) -> bool:
+    """Whether another live task names the same workspace path."""
+    try:
+        wanted = Path(path).expanduser().resolve(strict=False)
+    except OSError:
+        return True  # Preserve on an unresolvable path rather than guessing.
+    for row in conn.execute(_ACTIVE_WORKSPACE_PEERS_SQL, (task_id,)):
+        try:
+            candidate = Path(row["workspace_path"]).expanduser().resolve(strict=False)
+        except OSError:
+            continue
+        if _path_key(candidate) == _path_key(wanted):
+            return True
+    return False
+
+
+def _workspace_sharers(conn: sqlite3.Connection, path: Path | str) -> list[str]:
+    """All tasks naming *path*, including terminal peers, by resolved identity."""
+    wanted = Path(path).expanduser().resolve(strict=False)
+    sharers: list[str] = []
+    rows = conn.execute(
+        "SELECT id, workspace_path FROM tasks "
+        "WHERE workspace_path IS NOT NULL AND workspace_path != ''"
+    )
+    for row in rows:
+        try:
+            candidate = Path(row["workspace_path"]).expanduser().resolve(strict=False)
+        except OSError:
+            continue
+        if _path_key(candidate) == _path_key(wanted):
+            sharers.append(row["id"])
+    return sharers
+
+
+def _nested_git_checkouts(path: Path) -> Optional[list[Path]]:
+    """Return checkout roots, or ``None`` when traversal/bare-repo state is uncertain."""
+    checkouts: list[Path] = []
+    walk_errors: list[OSError] = []
+    for current, dirs, files in os.walk(path, onerror=walk_errors.append):
+        current_path = Path(current)
+        if current_path != path and {"HEAD", "objects", "refs"}.issubset(set(files) | set(dirs)):
+            return None  # Nested bare/unknown repository: never treat it as ordinary files.
+        if ".git" in dirs or ".git" in files:
+            checkouts.append(current_path)
+        if ".git" in dirs:
+            dirs.remove(".git")
+    return None if walk_errors else checkouts
+
+
+def _durable_refs_root() -> Optional[Path]:
+    try:
+        return (_kb.kanban_home() / "kanban" / "durable-refs").resolve(strict=False)
+    except OSError:
+        return None
+
+
+def _archive_component(value: str) -> str:
+    return "".join(char if char.isalnum() or char in "._-" else "-" for char in value).strip(".-") or "unknown"
+
+
+def _validated_nested_review_worktrees(path: Path) -> Optional[list[tuple[Path, Path, str]]]:
+    """Validate nested Git state before a scratch tree is removed.
+
+    Only linked worktrees backed by Hermes' durable bare mirrors qualify.
+    Standalone clones, bare repositories, dirty trees, and uncertain traversal
+    fail closed. Clean tips are archived before their checkout is removed.
+    """
+    try:
+        from hermes_cli.worktree_ops import _worktree_is_dirty
+    except Exception:
+        return None
+    durable_root = _durable_refs_root()
+    if durable_root is None:
+        return None
+    nested = _nested_git_checkouts(path)
+    if nested is None:
+        return None
+    validated: list[tuple[Path, Path, str]] = []
+    for checkout in nested:
+        common = _git_common_dir(checkout)
+        git_dir = _git_dir(checkout)
+        if common is None or git_dir is None or common == git_dir:
+            return None
+        try:
+            common_resolved = common.resolve(strict=False)
+            if common_resolved == durable_root or not common_resolved.is_relative_to(durable_root):
+                return None
+        except (OSError, ValueError):
+            return None
+        bare = subprocess.run(
+            ["git", f"--git-dir={common_resolved}", "rev-parse", "--is-bare-repository"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, check=False,
+        )
+        if bare.returncode != 0 or bare.stdout.strip() != "true":
+            return None
+        if _worktree_is_dirty(str(checkout)):
+            return None
+        head = _git(checkout, "rev-parse", "--verify", "HEAD", timeout=30)
+        if head.returncode != 0 or not head.stdout.strip():
+            return None
+        validated.append((checkout, common_resolved, head.stdout.strip()))
+    return validated
+
+
+def _salvage_nested_review_worktrees(path: Path) -> Optional[set[Path]]:
+    """Archive every nested review tip before scratch deletion.
+
+    The archive ref is durable proof and preserves even an unpublished clean
+    commit. Unknown repositories and dirty worktrees remain fail-closed.
+    """
+    validated = _validated_nested_review_worktrees(path)
+    if validated is None:
+        return None
+    mirrors: set[Path] = set()
+    workspace_label = _archive_component(path.name)
+    for checkout, common, head in validated:
+        ref = (
+            f"refs/archive/workspace-cleanup/{workspace_label}/"
+            f"{_archive_component(checkout.name)}-{head[:12]}"
+        )
+        update = subprocess.run(
+            ["git", f"--git-dir={common}", "update-ref", ref, head],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, check=False,
+        )
+        verify = subprocess.run(
+            ["git", f"--git-dir={common}", "rev-parse", "--verify", ref],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, check=False,
+        )
+        current = _git(checkout, "rev-parse", "--verify", "HEAD", timeout=30)
+        if (
+            update.returncode != 0
+            or verify.returncode != 0
+            or verify.stdout.strip() != head
+            or current.returncode != 0
+            or current.stdout.strip() != head
+        ):
+            return None
+        mirrors.add(common)
+    return mirrors
+
+
+def _prune_removed_review_worktrees(mirrors: set[Path]) -> None:
+    for common in mirrors:
+        result = subprocess.run(
+            ["git", f"--git-dir={common}", "worktree", "prune", "--expire", "now"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, check=False,
+        )
+        if result.returncode != 0:
+            _kb._log.warning(
+                "Scratch was removed but durable mirror worktree pruning failed for %s: %s",
+                common, (result.stderr or result.stdout or "").strip(),
+            )
+
+
+def _remove_scratch_with_audit(conn: sqlite3.Connection, path: Path) -> bool:
+    """Remove managed scratch only after every sharer receives durable intent.
+
+    A committed plan event precedes filesystem mutation, so even a later
+    process/SQLite failure cannot leave an unattributed deletion. Successful
+    removal then fans out the existing ``workspace_cleanup`` outcome event.
+    """
+    payload = {"workspace": str(path), "kind": "scratch", "outcome": "removed"}
+    plan_payload = {"workspace": str(path), "kind": "scratch", "outcome": "planned"}
+    try:
+        with _kb.write_txn(conn):
+            sharers = _workspace_sharers(conn, path)
+            if not sharers:
+                return False
+            for sharer_id in sharers:
+                _kb._append_event(conn, sharer_id, "workspace_cleanup_planned", plan_payload)
+        mirrors = _salvage_nested_review_worktrees(path)
+        if mirrors is None:
+            raise RuntimeError("nested Git state is not safely removable")
+        shutil.rmtree(path)
+        try:
+            _prune_removed_review_worktrees(mirrors)
+        except Exception as exc:
+            _kb._log.warning("Scratch removed but mirror pruning failed for %s: %s", path, exc)
+        with _kb.write_txn(conn):
+            for sharer_id in sharers:
+                _kb._append_event(conn, sharer_id, "workspace_cleanup", payload)
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        _kb._log.warning("Could not remove audited scratch workspace %s: %s", path, exc)
+        return False
+    return True
 
 
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
@@ -145,12 +345,11 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # See #33774.
             _try_cleanup_parent_workspaces(conn, task_id)
             return
-        # Defer while any child is not yet terminal so it can still read
-        # handoff artifacts from this workspace.
-        if _has_active_children(conn, task_id):
+        # Defer while a child or another task sharing this workspace is not yet
+        # terminal so it can still read handoff artifacts from the workspace.
+        if _has_active_children(conn, task_id) or _has_active_workspace_peer(conn, task_id, path):
             _kb._log.debug(
-                "Deferring %s workspace cleanup for task %s: "
-                "active children still need workspace at %s",
+                "Deferring %s workspace cleanup for task %s: live task still needs workspace at %s",
                 kind, task_id, path,
             )
             return
@@ -169,8 +368,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # See #28818.
             if _is_managed_scratch_path(wp):
                 release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Removed scratch workspace: %s", wp)
+                if _remove_scratch_with_audit(conn, wp):
+                    _kb._log.debug("Removed scratch workspace: %s", wp)
             else:
                 _kb._log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -280,6 +479,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 or row["workspace_kind"] not in _REMOVABLE_KINDS
                 or not row["workspace_path"]
                 or _has_active_children(conn, parent_id)
+                or _has_active_workspace_peer(conn, parent_id, row["workspace_path"])
             ):
                 continue
             if row["workspace_kind"] == "worktree":
@@ -288,8 +488,8 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
                 release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                if _remove_scratch_with_audit(conn, wp):
+                    _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
 
